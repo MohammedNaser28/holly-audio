@@ -14,6 +14,7 @@
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use holly_usb::HollyControl;
 
@@ -23,6 +24,15 @@ use crate::{
     ConnStatus, HeartInfo, OpenFn, POLL_INTERVAL, Snapshot, StatusSource, classify_claim,
     device_gone,
 };
+
+/// Wall-clock stamp for [`Snapshot::received_at`] — integer UNIX seconds.
+/// App-side origin information; never device data and never invented.
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// The in-flight noise write — which NC byte is being changed. This is the
 /// pending-type of [`Snapshot::pending_set`] (serde for the JSON snapshot
@@ -158,6 +168,12 @@ pub struct Core {
     heart: Option<HeartInfo>,
     /// A SET that was accepted but not yet executed (latest-wins).
     pending: Option<NoiseWrite>,
+    /// UNIX-epoch seconds of the last successful poll (wall clock, set by
+    /// the actor — app-side metadata, never device data). `None` until the
+    /// first successful GET; cleared when the claim is lost. Lives on the
+    /// Core (not inside `snapshot()`) so the emit-on-change dedup stays
+    /// byte-stable between polls.
+    updated: Option<u64>,
     /// Last composed snapshot (emit-on-change dedup base).
     last: Option<Snapshot>,
 }
@@ -172,6 +188,7 @@ impl Core {
             detail: None,
             heart: None,
             pending: None,
+            updated: None,
             last: None,
         };
         // Baseline BEFORE anything ran: a subscriber joining right after
@@ -196,6 +213,7 @@ impl Core {
             detail: self.detail.clone(),
             heart: self.heart.clone(),
             pending_set: self.pending,
+            received_at: self.updated,
         }
     }
 
@@ -250,6 +268,7 @@ impl Core {
         self.detail = None;
         self.heart = None;
         self.pending = None;
+        self.updated = None;
         self.device = None; // never double-holding
         self.emit();
         match (self.factory)() {
@@ -282,9 +301,21 @@ impl Core {
         };
         match source.poll() {
             Ok(heart) => {
+                // Stamp wall-clock only when device-visible content moved,
+                // or on the session's first success: `emit` dedups on full
+                // snapshot equality, so re-stamping every poll would push a
+                // fresh 1 Hz snapshot even with an identical heart. A stable
+                // device keeps the stamp that received its current verdict
+                // (footer semantics: "state received at T").
+                let changed = self.heart.as_ref() != Some(&heart)
+                    || self.status != ConnStatus::Connected
+                    || self.detail.is_some();
                 self.status = ConnStatus::Connected;
                 self.heart = Some(heart);
                 self.error_clear();
+                if changed || self.updated.is_none() {
+                    self.updated = Some(unix_secs());
+                }
             }
             Err(e) if device_gone(&e) => {
                 // Drop the claim first (Drop restores interface state),
@@ -292,6 +323,7 @@ impl Core {
                 self.device = None;
                 self.pending = None;
                 self.heart = None;
+                self.updated = None;
                 self.status = ConnStatus::NotFound;
                 self.error_set(e.to_string());
             }
@@ -325,6 +357,7 @@ impl Core {
                 self.device = None;
                 self.pending = None;
                 self.heart = None;
+                self.updated = None;
                 self.status = ConnStatus::NotFound;
                 self.error_set(e.to_string());
                 self.emit();
@@ -353,12 +386,18 @@ impl Core {
         };
         match source.poll() {
             Ok(heart) => {
-                // Keep status Error + detail; heart = the fresh read.
+                // Keep status Error + detail; heart = the fresh read. Stamp
+                // only on change — same cadence rule as poll_and_emit.
+                let changed = self.heart.as_ref() != Some(&heart);
                 self.heart = Some(heart);
+                if changed || self.updated.is_none() {
+                    self.updated = Some(unix_secs());
+                }
             }
             Err(e) if device_gone(&e) => {
                 self.device = None;
                 self.heart = None;
+                self.updated = None;
                 self.status = ConnStatus::NotFound;
                 self.error_set(e.to_string());
             }

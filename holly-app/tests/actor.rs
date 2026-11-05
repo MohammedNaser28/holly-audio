@@ -411,24 +411,27 @@ fn refresh_works_while_disconnected() {
 
 /// The real thread loop wired end to end (start_with_factory): commands in,
 /// snapshots out, the SET path flows through the actual 1 s loop.
-/// Scripted reply budget: polls while idle use E1; the SET consumes one more
-/// E1 (fresh GET) + ack; after the SET the remaining polls read E3.
+///
+/// Script order mirrors the actor's ACTUAL pop sequence, not a wished-for
+/// cadence: the SET executes on the first loop batch after the command
+/// arrives (immediately after connect), so its fresh GET/ACK sit at pops
+/// #2/#3. The pre-2026-11-05 ordering queued them behind 8 idle polls; the
+/// SET then popped a leftover E1 (`CmdMismatch got 0x1f, want 0x13`) and the
+/// nc=off assertion only "passed" via the reopen session's E3 replay — no
+/// device verdict was ever observed. HEART_E3 at pop #4 is the SET's
+/// verification poll, i.e. the verdict itself.
 #[test]
 fn thread_loop_end_to_end() {
     let session1 = MockShared::default();
-    for _ in 0..8 {
-        session1.push_reply(HEART_E1);
-    }
+    session1.push_reply(HEART_E1); // connect-time poll (nc on)
     session1.push_reply(HEART_E1); // fresh GET inside set_noise
-    session1.push_reply(SET_ACK_OK);
-    let session2 = MockShared::default();
-    for _ in 0..8 {
-        session2.push_reply(HEART_E3);
+    session1.push_reply(SET_ACK_OK); // SET ack
+    session1.push_reply(HEART_E3); // post-SET verification poll → nc off
+    for _ in 0..4 {
+        session1.push_reply(HEART_E3); // idle polls (nc off, unchanged)
     }
-    session2.push_reply(HEART_E3); // post-SET verification poll
 
-    let handle =
-        holly_app::start_with_factory(factory_of(VecDeque::from([Ok(session1), Ok(session2)])));
+    let handle = holly_app::start_with_factory(factory_of(VecDeque::from([Ok(session1.clone())])));
     let rx = handle.subscribe();
 
     // Wait for Connected (idle ticks run CONNECTING->CONNECTED within ~2 s).
@@ -445,25 +448,51 @@ fn thread_loop_end_to_end() {
     }
     assert!(got_connected, "never reached Connected; stream stalled");
 
-    // Toggle through the handle; the connect-loop session (session1) holds
-    // the claim, so the SET consumes ITS fresh-GET/ack pair; the actor's
-    // poll afterwards reads the next scripted reply — E3 (nc off).
+    // Toggle through the handle. The SET consumes the fresh-GET/ack pair and
+    // the actor then polls the DEVICE (E3), so subscribers see ITS verdict —
+    // with the pending state published before it, never after.
     handle.set_noise(false);
-    let mut saw_off = false;
-    for _ in 0..15 {
+    let mut verdict = None;
+    let mut pending_seen = false;
+    for _ in 0..10 {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(s)
                 if s.status == ConnStatus::Connected
-                    && s.heart.as_ref().is_some_and(|h| !h.noise_switch) =>
+                    && s.heart.as_ref().is_some_and(|h| !h.noise_switch)
+                    && s.pending_set.is_none() =>
             {
-                saw_off = true;
+                verdict = Some(s);
+                break;
+            }
+            Ok(s) if s.pending_set == Some(NoiseWrite::Switch(false)) => {
+                pending_seen = true;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    let verdict = verdict.expect("device verdict nc=off never arrived");
+    assert!(
+        pending_seen,
+        "pending state must appear before the device verdict"
+    );
+    assert_eq!(verdict.heart.as_ref().unwrap().noise_level, 0, "E3 level");
+
+    // Mid-loop death: the next poll surfaces a transport error (device
+    // gone) → NotFound; the factory is exhausted, so it stays NotFound.
+    session1.push_error(Error::Usb(std::io::Error::other("scripted: unplugged")));
+    let mut saw_gone = false;
+    for _ in 0..5 {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(s) if s.status == ConnStatus::NotFound => {
+                saw_gone = true;
                 break;
             }
             Ok(_) => {}
             Err(_) => {}
         }
     }
-    assert!(saw_off, "device verdict nc=off never arrived");
+    assert!(saw_gone, "device-gone never surfaced as NotFound");
 }
 
 /// JSON shape of the machine-readable snapshot — the published contract any
@@ -481,6 +510,7 @@ fn snapshot_json_shape() {
         detail: None,
         heart: Some(heart),
         pending_set: Some(NoiseWrite::Switch(true)),
+        received_at: None,
     };
     let value: serde_json::Value = serde_json::to_value(&snap).expect("serializable");
 
@@ -513,7 +543,8 @@ fn snapshot_json_shape() {
             "tx4_mute": null,
             "raw": [0, 1, 0, 93, 0, 0, 1, 0, 3, 0, 0, 0, 3, 0, 2, 0, 0]
         },
-        "pending_set": {"switch": true}
+        "pending_set": {"switch": true},
+        "received_at": null
     });
     assert_eq!(value, expected, "published JSON shape changed");
 }
@@ -533,6 +564,7 @@ fn view_model_connected_shape() {
         detail: None,
         heart: Some(heart),
         pending_set: Some(NoiseWrite::Switch(false)),
+        received_at: None,
     });
     assert_eq!(vm.banner, None);
     assert_eq!(vm.banner_text, None);

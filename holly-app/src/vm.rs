@@ -103,6 +103,9 @@ pub struct ViewModel {
     /// EQ level (§5 field `eqLevel`).
     pub eq_level: Option<u8>,
     pub reverb: Option<ReverbVm>,
+    /// Echo of [`Snapshot::received_at`] (actor-stamped wall clock) for the
+    /// footer's "last reply" display. App metadata, not device data.
+    pub updated: Option<u64>,
 }
 
 /// Pure transform: one current Snapshot => the full display model.
@@ -124,6 +127,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
             voice_level: None,
             eq_level: None,
             reverb: None,
+            updated: None,
         },
         ConnStatus::NotFound => ViewModel {
             banner: Some(Banner::NotFound),
@@ -189,6 +193,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                     enabled: heart.reverb_switch,
                     level: heart.reverb_level,
                 }),
+                updated: s.received_at,
             }
         }
     }
@@ -211,6 +216,7 @@ fn disconnected_core() -> ViewModel {
         voice_level: None,
         eq_level: None,
         reverb: None,
+        updated: None,
     }
 }
 
@@ -265,6 +271,7 @@ mod tests {
             detail: detail.map(str::to_string),
             heart,
             pending_set: pending,
+            received_at: None,
         }
     }
 

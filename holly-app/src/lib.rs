@@ -24,6 +24,7 @@ use serde::Serialize;
 use holly_usb::{Error, HeartInfo, HollyControl, Transport};
 
 pub mod actor;
+pub mod demo;
 pub mod vm;
 
 pub use actor::{Command, Core, DeviceHandle, Hub, NoiseWrite, start, start_with_factory};
@@ -75,6 +76,10 @@ pub struct Snapshot {
     /// request wins). This is pending-state information the frontend only
     /// ever RENDERS — never invents.
     pub pending_set: Option<NoiseWrite>,
+    /// UNIX-epoch seconds of the last successful GET in this session
+    /// (actor-stamped; footer presentation + staleness display). `None`
+    /// until the first poll succeeds, cleared on disconnect.
+    pub received_at: Option<u64>,
 }
 
 impl Snapshot {
