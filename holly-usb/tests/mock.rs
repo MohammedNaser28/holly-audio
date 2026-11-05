@@ -238,3 +238,35 @@ fn set_noise_level_comes_from_device_state() {
     assert_eq!(set_tx[8], 0x03); // level, straight from the heart reply
     assert_eq!(set_tx[9], 0xEF);
 }
+
+/// Task-4a stale-cache regression: an *earlier* `get_heart_info` result must
+/// never leak into a later SET frame. Script: GET reply A (level 0), then a
+/// different, newer GET reply B (level 3), then the ack. `set_noise` must
+/// issue its own GET (reply B) and take the level from that fresh reply —
+/// under the removed cache the SET would have carried A's level 0.
+#[test]
+fn set_noise_uses_fresh_state_not_cached() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // reply A: level 0, NC on
+    let mut state_b = HEART_RX_E1;
+    state_b[13] = 0x00; // payload[6] = noiseSwitch 01 -> 00
+    state_b[14] = 0x03; // payload[7] = noiseLevel 00 -> 03
+    mock.push_reply(state_b); // reply B: the state the SET must be built from
+    mock.push_reply(SET_ACK_E2);
+
+    let mut c = control(mock);
+    // Older call: caches level 0 under the pre-4a implementation.
+    let cached = c.get_heart_info().expect("reply A must parse");
+    assert!(cached.noise_switch && cached.noise_level == 0);
+
+    c.set_noise(false).expect("ack must be accepted");
+    let written = c.transport().written();
+    // writes: poll A, poll B (fresh, inside set_noise), SET frame.
+    let set_tx = &written[written.len() - 1];
+    assert_eq!(set_tx[4], cmd::SET_NOISE);
+    assert_eq!(set_tx[7], 0x00); // isOpen = off
+    assert_eq!(
+        set_tx[8], 0x03,
+        "SET level must come from the fresh GET (reply B), not the cached reply A"
+    );
+}

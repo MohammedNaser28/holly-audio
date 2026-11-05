@@ -30,23 +30,24 @@ pub const CONTROL_IFACE: u8 = 0;
 /// (verified against nusb v0.2.9 sources, linux_usbfs `LinuxInterface::drop`:
 /// `release_interface` + `attach_kernel_driver`), so external resources are
 /// restored without rework in this crate.
+///
+/// No observable device state is cached: every SET frame is built from a
+/// fresh GET issued *inside* the SET call, so a state change made by the
+/// device itself (TX button) or another client can never be written back
+/// over. (Task 4a: the earlier `noise_level` cache is removed — it was only
+/// consumed by `set_noise` and was stale-state risk.) [wire
+/// captures/2026-11-05-set-noise.txt: heart replies carried the level; the
+/// SET frame echoes the fetch from *that* capture's immediately preceding
+/// GET]
 #[derive(Debug)]
 pub struct HollyControl<T: Transport> {
     transport: T,
-    /// Last observed NC level — SET_NOISE must re-send the current level
-    /// (its payload is `[isOpen, level]`, `UsbMessengerV2.java:172-173`),
-    /// and inventing a level is forbidden; it is only ever taken from the
-    /// device's own report.
-    noise_level: Option<u8>,
 }
 
 impl<T: Transport> HollyControl<T> {
     /// Wrap a transport (claimed IF0) into a control handle.
     pub fn new(transport: T) -> Self {
-        Self {
-            transport,
-            noise_level: None,
-        }
+        Self { transport }
     }
 
     /// Read-only status poll: `cmd 31 GET_HEART_INFO` [wire
@@ -55,25 +56,26 @@ impl<T: Transport> HollyControl<T> {
     pub fn get_heart_info(&mut self) -> Result<HeartInfo, Error> {
         let request = Frame::new(cmd::GET_HEART_INFO, Vec::new());
         let reply = self.exchange(request)?;
-        let info = HeartInfo::from_payload(&reply.payload)?;
-        self.noise_level = Some(info.noise_level);
-        Ok(info)
+        HeartInfo::from_payload(&reply.payload)
     }
 
     /// Toggle noise cancellation. Payload `[isOpen, level]` [code
-    /// UsbMessengerV2.java:172-173]; the level comes from the device's own
-    /// state (prefer the cached one from the last `get_heart_info`, fetch one
-    /// otherwise — a level is never made up). Device ack is a 1-byte status,
-    /// `0x00` = success (`ProSetNoise.receiveData`) [wire
-    /// captures/2026-11-05-set-noise.txt E2/E4]; nonzero status is surfaced
-    /// as [`Error::Rejected`] — its real-world shape has never been captured
-    /// (docs/protocol.md open question 5), so nothing is assumed beyond
-    /// "not zero means not success".
+    /// UsbMessengerV2.java:172-173]. The level always comes from a **fresh**
+    /// `get_heart_info()` issued here — nothing is cached across calls, so a
+    /// state change by the device (TX button) or another client between two
+    /// of our own calls can never be overwritten by a stale SET frame.
+    /// (The SET frame carries only `[isOpen, level]` — no other SET-command
+    /// fields exist in this frame, per the [wire] capture shape
+    /// `13 00 02 {isOpen} {level} EF` in captures/2026-11-05-set-noise.txt.)
+    /// Device ack is a 1-byte status, `0x00` = success
+    /// (`ProSetNoise.receiveData`) [wire captures/2026-11-05-set-noise.txt
+    /// E2/E4]; nonzero status is surfaced as [`Error::Rejected`] — its
+    /// real-world shape has never been captured (docs/protocol.md
+    /// open question 5), so nothing is assumed beyond "not zero means not
+    /// success".
     pub fn set_noise(&mut self, enabled: bool) -> Result<(), Error> {
-        let level = match self.noise_level {
-            Some(level) => level,
-            None => self.get_heart_info()?.noise_level,
-        };
+        // The SET frame's fields derive from this fresh reply only.
+        let level = self.get_heart_info()?.noise_level;
         let request = Frame::new(cmd::SET_NOISE, vec![u8::from(enabled), level]);
         let reply = self.exchange(request)?;
         match reply.payload.as_slice() {
