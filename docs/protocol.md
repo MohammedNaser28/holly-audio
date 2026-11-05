@@ -203,11 +203,11 @@ Consumer crates in this workspace:
 - `holly-usb` — transport only: VID/PID enumeration + IF0 claim (nusb),
   `SET_REPORT`/`GET_REPORT` of 64-byte feature reports, `get_heart_info()`
   and `set_noise(bool)` with the capture tool's abort gates. UAC interfaces
-  never claimed; udev rule at `packaging/99-hollyland.rules`.
+  never claimed; udev rule at `packaging/70-hollyland.rules`.
 - `holly-cli` (`holly` binary) — the three commands only (`status`, `nc`,
   `watch`; no OTA/reboot/pairing/reset vocabulary, enforced by the clap
   schema). Exit codes: 0 ok, 1 other, 2 not found, 3 permission denied
-  (points at `packaging/99-hollyland.rules`), 4 protocol/ack error.
+  (points at `packaging/70-hollyland.rules`), 4 protocol/ack error.
   `nc` applies then verifies with a fresh GET; `watch` polls via a
   function boundary (`Watcher::poll`) meant to be replaced by an
   EP 0x81 reader later.

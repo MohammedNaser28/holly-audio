@@ -117,6 +117,28 @@ First live GET/SET round-trips through holly-usb/nusb (the
   do", post-restore switch `true`. **The Task-1 SET_NOISE [wire] vector
   is now exercised by the crate itself on the real wire.**
 
+## Device access (udev rule)
+
+Non-root claiming of IF0 needs write access to the dongle's
+`/dev/bus/usb` node: `packaging/70-hollyland.rules`
+(TAG+="uaccess", MODE="0660"). The file name must sort **before** systemd's
+`73-seat-late.rules`, whose line
+`TAG=="uaccess|xaccess-*", ENV{MAJOR}!="", RUN{builtin}+="uaccess"`
+(systemd main, fetched 2026-11-05) is the only invoker of the `uaccess`
+builtin — a `99-`-prefixed rule file assigns the tag after that runner has
+already passed by, which is why the original `99-hollyland.rules` produced
+TAG `:uaccess:` in the udev database but no ACL on the node (observed live
+2026-11-05, twice); the same builtin demonstrably worked for `/dev/snd`
+nodes whose tag comes from `70-uaccess.rules`. Install and verify:
+
+```sh
+sudo rm -f /etc/udev/rules.d/99-hollyland.rules
+sudo cp packaging/70-hollyland.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger --action=add /sys/bus/usb/devices/<node>   # or replug
+getfacl /dev/bus/usb/<bus>/<dev>   # expect user:<you>:rw- and a mask line
+```
+
 ## Open questions (to resolve in Phase 2, evidence required)
 
 | Question | How it will be answered |

@@ -9,7 +9,7 @@
 # Usage:  tools/crash_test.sh          (dongle plugged in; no VM passthrough)
 #
 # Run WITHOUT sudo: the probe binary needs only the udev-rule grant
-# (packaging/99-hollyland.rules) and cargo must run as the invoking user —
+# (packaging/70-hollyland.rules) and cargo must run as the invoking user —
 # rustup has no toolchain configured for root. If accidentally started as
 # root, the script re-execs itself as the original user instead of failing
 # late at `cargo build` (observed 2026-11-05: rustup "no default toolchain").
@@ -113,6 +113,21 @@ echo "killed probe with SIGKILL (no Drop handler ran)"
 sleep 1
 
 print_state "AFTER SIGKILL (task: does usbhid come back to IF0? audio still bound?)"
+
+# ---- re-claim check (the actual recovery question) ---------------------------
+# A SIGKILLed claim holder left IF0 unclaimed; holly-cli's `status` is a
+# fresh open+claim+GET cycle. Whether it SUCCEEDS here is the observed
+# result this script reports — none of it is pre-assumed.
+echo "--- RECLAIM (holly status right after the kill) ---"
+hstatus="$(cargo run --quiet -p holly-cli -- status 2>&1)"
+hcode=$?
+if [ "$hcode" = "0" ]; then
+    echo "re-claim SUCCEEDED (exit 0); output:"
+    echo "$hstatus" | sed 's/^/    /'
+else
+    echo "re-claim FAILED (exit $hcode); output:"
+    echo "$hstatus" | sed 's/^/    /'
+fi
 
 echo "== done =="
 echo "Report this whole stdout + whether audio capture from the dongle still"

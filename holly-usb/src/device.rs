@@ -98,7 +98,7 @@ impl HollyControl<NusbTransport> {
     /// this crate does; the UAC interfaces are untouched.
     ///
     /// Requires write access to the `/dev/bus/usb` node — install
-    /// `packaging/99-hollyland.rules` (MODE 0660 + uaccess) so this works
+    /// `packaging/70-hollyland.rules` (MODE 0660 + uaccess) so this works
     /// without root.
     pub fn open() -> Result<Self, Error> {
         for info in nusb::list_devices()

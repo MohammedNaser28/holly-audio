@@ -16,7 +16,7 @@ use serde::Serialize;
 pub const EXIT_OTHER: i32 = 1;
 /// No dongle 3547:0407 on the bus.
 pub const EXIT_NOT_FOUND: i32 = 2;
-/// `/dev/bus/usb` write access denied → install packaging/99-hollyland.rules.
+/// `/dev/bus/usb` write access denied → install packaging/70-hollyland.rules.
 pub const EXIT_PERMISSION: i32 = 3;
 /// Frame decode/gate failure, or the device rejected/acked wrong.
 pub const EXIT_PROTOCOL: i32 = 4;
@@ -134,7 +134,7 @@ impl From<&Error> for Failure {
         {
             // actionable, points at the repo's own rule file
             line = "permission denied writing /dev/bus/usb — install \
-                    packaging/99-hollyland.rules (sudo cp packaging/99-hollyland.rules \
+                    packaging/70-hollyland.rules (sudo cp packaging/70-hollyland.rules \
                     /etc/udev/rules.d/ && sudo udevadm control --reload, then replug \
                     or 'sudo udevadm trigger --action=add /sys/bus/usb/devices/<node>')"
                 .to_string();
