@@ -3,7 +3,9 @@
 //! Scope discipline (project rule): this file knows NOTHING about the
 //! device beyond what `holly_app::vm::ViewModel` carries. Every device-rule
 //! string, readability decision, and pending-state rule comes from the VM;
-//! the only write action is the NC toggle forwarding `DeviceHandle::set_noise`.
+//! the only write actions are the NC switch toggle (`set_noise`) and the NC
+//! level buttons (`set_noise_level`, cmd 19's second byte — wire-exercised
+//! in captures/2026-11-05-noise-level-medium.txt).
 //!
 //! gpui API provenance (hard rule: nothing written from memory): every call
 //! below was verified against the vendored gpui 0.2.2 source
@@ -27,13 +29,18 @@ use std::thread;
 
 use futures::{StreamExt, channel::mpsc::unbounded};
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, Entity, FocusHandle, KeyBinding, Render,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    App, Application, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, KeyBinding,
+    Render, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
+    rgb, size,
 };
 use holly_app::DeviceHandle;
-use holly_app::vm::{Banner, BatteryClass, ReverbVm, TxVm, ViewModel, view_model};
+use holly_app::NoiseWrite;
+use holly_app::vm::{Banner, BatteryClass, NcVm, ReverbVm, TxVm, ViewModel, view_model};
 
-actions!(holly, [ToggleNoise, Refresh, Quit]);
+actions!(
+    holly,
+    [ToggleNoise, NcLow, NcMedium, NcStrong, Refresh, Quit]
+);
 
 // ---- presentation palette --------------------------------------------------
 // Presentation-only colors: no device meaning, chosen here (the VM exposes
@@ -65,11 +72,57 @@ fn onoff(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
 
+/// Level button labels: 0/1/2 map to the APK's own value names
+/// (`device_noise_level_low/normal/strong` resources, [code
+/// HLDevice6302Activity.java:1593/:1610/:1626-1631]; presentation strings).
+fn level_label(level: u8) -> &'static str {
+    match level {
+        0 => "low",
+        1 => "medium",
+        2 => "strong",
+        _ => "unknown",
+    }
+}
+
+/// Per-level-button decision — the ONLY button logic in the UI, pure and
+/// unit-tested. A button is ACTIVE when the device reports this level with
+/// the switch verified on; PENDING when an in-flight Level write targets it;
+/// otherwise IDLE. Buttons are Idle whenever the verified switch state is
+/// not `on`: the APK's level presses always send `isOpen=true` [code], and a
+/// level write while off has never been sent/observed [wire] — so the row
+/// stays inert until the toggle turns NC on. (Rationale with holly-usb:
+/// `set_noise_level` preserves the switch byte, like the APK's own switch.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelBtn {
+    Active,
+    Pending,
+    Idle,
+}
+
+fn level_button(level: u8, nc: &NcVm) -> LevelBtn {
+    if nc.state != Some(true) {
+        return LevelBtn::Idle;
+    }
+    if nc.level == Some(level) {
+        return LevelBtn::Active;
+    }
+    if nc.pending == Some(NoiseWrite::Level(level)) {
+        return LevelBtn::Pending;
+    }
+    LevelBtn::Idle
+}
+
 /// The ONLY place "what does a click mean" is decided, shared by mouse and
 /// keyboard paths. `None` = disabled: no heart ever arrived, so there is no
 /// verified state to toggle against (UI must not invent a success).
-fn toggle_target(pending: Option<bool>, state: Option<bool>) -> Option<bool> {
-    Some(!pending.unwrap_or(state?))
+/// Pending wins over state, but ONLY a Switch write changes the toggle's
+/// target semantics: an in-flight Level write is orthogonal (the flip is
+/// computed from the verified state and simply goes out after it).
+fn toggle_target(pending: Option<NoiseWrite>, state: Option<bool>) -> Option<bool> {
+    match pending {
+        Some(NoiseWrite::Switch(pending_on)) => Some(!pending_on),
+        _ => Some(!state?),
+    }
 }
 
 /// One window model; the whole app for v1.
@@ -93,6 +146,29 @@ impl AppModel {
         }
     }
 
+    /// One level press: only when the verified switch is on and this level is
+    /// not already the device's (no duplicate SETs for the active button).
+    /// `set_noise_level` preserves the switch, mirroring the APK's switch
+    /// path; a pending Level for another value is REPLACED here (holly-app's
+    /// pump is latest-wins), which is the intended "change my mind" flow.
+    fn set_nc_level(&mut self, level: u8, _: &mut Context<Self>) {
+        if level_button(level, &self.vm.nc) == LevelBtn::Idle {
+            self.device.set_noise_level(level);
+        }
+    }
+
+    fn on_nc_low(&mut self, _: &NcLow, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_nc_level(0, cx);
+    }
+
+    fn on_nc_medium(&mut self, _: &NcMedium, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_nc_level(1, cx);
+    }
+
+    fn on_nc_strong(&mut self, _: &NcStrong, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_nc_level(2, cx);
+    }
+
     fn on_nc_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_nc(&ToggleNoise, window, cx);
     }
@@ -108,9 +184,9 @@ impl AppModel {
             .items_center()
             .child("Hollyland 6108 — control surface")
             .child(
-                div()
-                    .text_color(rgb(COL_MUTED))
-                    .child("space: toggle NC · r: reconnect · ctrl+q: quit"),
+                div().text_color(rgb(COL_MUTED)).child(
+                    "space: toggle NC · 1/2/3: low/medium/strong · r: reconnect · ctrl+q: quit",
+                ),
             )
     }
 
@@ -139,10 +215,82 @@ impl AppModel {
         )
     }
 
-    /// The singular writable row. Disabled (non-clickable look) whenever the
-    /// VM has no verified NC state; pending display comes ONLY from
-    /// `vm.nc.pending` (actor-reported), never from the click.
-    fn render_nc(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    /// The NC panel: toggle row + the three level buttons, laid out as ONE
+    /// row stack. Pending display comes ONLY from `vm.nc.pending`
+    /// (actor-reported), never from a click.
+    fn render_nc(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.render_nc_row(cx))
+            .child(self.render_nc_levels(cx))
+    }
+
+    /// Per-level button. The wrap div keeps them visually one row even when
+    /// the whole panel is idle.
+    /// Level buttons row: one button per APK value 0/1/2. The decision per
+    /// button = [`level_button`]; the click + keyboard bindings share it.
+    fn render_nc_levels(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut row = div().flex().gap_2();
+        for (level, action) in [(0, "1: low"), (1, "2: medium"), (2, "3: strong")] {
+            row = row.child(self.nc_level_btn(level, action, cx));
+        }
+        row
+    }
+
+    /// One level button: active/pending/idle styling from [`level_button`],
+    /// the write goes through the actor only when the decision allows it
+    /// (that shared decision is also what the 1/2/3 keyboard bindings call).
+    fn nc_level_btn(
+        &mut self,
+        level: u8,
+        key_hint: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let enabled = self.vm.nc.state == Some(true);
+        let decision = level_button(level, &self.vm.nc);
+        let (border, bg) = match decision {
+            LevelBtn::Active => (COL_ACCENT, COL_ACCENT),
+            LevelBtn::Pending => (COL_PENDING, COL_PANEL_DIM),
+            LevelBtn::Idle => (COL_BORDER, COL_PANEL_DIM),
+        };
+        // Text stays readable on the active accent background.
+        let fg = match decision {
+            LevelBtn::Active => COL_BG,
+            _ if enabled => COL_TEXT,
+            _ => COL_MUTED,
+        };
+        let label = format!("{} {} ({level})", key_hint, level_label(level));
+
+        div()
+            .id(ElementId::named_usize("nc-level-btn", level as usize))
+            .px_4()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(border))
+            .bg(rgb(bg))
+            .text_color(rgb(fg))
+            .map(|btn| {
+                if enabled {
+                    btn.hover(|s| s.cursor_pointer())
+                } else {
+                    btn
+                }
+            })
+            .child(label)
+            .on_click(
+                cx.listener(move |this, _: &ClickEvent, _: &mut Window, cx| {
+                    this.set_nc_level(level, cx);
+                }),
+            )
+    }
+
+    /// The toggle ROW. Disabled (non-clickable look) whenever the VM has no
+    /// verified NC state; pending display comes ONLY from `vm.nc.pending`
+    /// (actor-reported), never from the click.
+    fn render_nc_row(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let enabled = self.vm.nc.state.is_some();
         let pending = self.vm.nc.pending;
         let state = self.vm.nc.state;
@@ -155,13 +303,24 @@ impl AppModel {
             (COL_ACCENT, COL_PANEL)
         };
 
-        let right = match (pending, state) {
-            (Some(target), Some(actual)) => {
-                format!("pending → {} (still {})", onoff(target), onoff(actual))
+        let level = self.vm.nc.level;
+        let state_part = match (state, level) {
+            (Some(actual), Some(l)) => {
+                format!("{} · level {} ({})", onoff(actual), l, level_label(l))
             }
-            (Some(target), None) => format!("pending → {} (no verified state)", onoff(target)),
-            (None, Some(actual)) => onoff(actual).to_string(),
-            (None, None) => "—".to_string(),
+            (Some(actual), None) => onoff(actual).to_string(),
+            (None, _) => "—".to_string(),
+        };
+        let right = match pending {
+            Some(NoiseWrite::Switch(t)) => {
+                format!("pending → switch {} · device still: {state_part}", onoff(t))
+            }
+            Some(NoiseWrite::Level(l)) => format!(
+                "pending → level {} ({}) · device still: {state_part}",
+                l,
+                level_label(l)
+            ),
+            None => state_part,
         };
 
         div()
@@ -188,7 +347,7 @@ impl AppModel {
                     div()
                         .text_color(rgb(COL_MUTED))
                         .text_sm()
-                        .child("the only certified control (SET_NOISE, cmd 19)"),
+                        .child("SET_NOISE (cmd 19) — switch toggle [wire E2/E4] · level writes wire-exercised 2026-11-05"),
                 ),
             )
             .child(
@@ -278,6 +437,9 @@ impl Render for AppModel {
             .text_color(rgb(COL_TEXT))
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::toggle_nc))
+            .on_action(cx.listener(Self::on_nc_low))
+            .on_action(cx.listener(Self::on_nc_medium))
+            .on_action(cx.listener(Self::on_nc_strong))
             .on_action(cx.listener(Self::refresh))
             .child(self.render_header())
             .children(self.render_banner())
@@ -300,6 +462,9 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("space", ToggleNoise, None),
+            KeyBinding::new("1", NcLow, None),
+            KeyBinding::new("2", NcMedium, None),
+            KeyBinding::new("3", NcStrong, None),
             KeyBinding::new("r", Refresh, None),
             KeyBinding::new("ctrl-q", Quit, None),
         ]);
@@ -378,8 +543,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::toggle_target;
-
+    use super::{LevelBtn, NoiseWrite, level_button, toggle_target};
+    use holly_app::vm::NcVm;
     /// The toggle's entire decision logic, exercised on all pending/state
     /// combinations. Disabled whenever no verified state exists; pending
     /// (actor-reported in-flight SET) wins over the displayed state, which
@@ -392,11 +557,80 @@ mod tests {
         // Verified states.
         assert_eq!(toggle_target(None, Some(true)), Some(false));
         assert_eq!(toggle_target(None, Some(false)), Some(true));
-        // Pending overrides displayed state (double-click stability).
-        assert_eq!(toggle_target(Some(false), Some(true)), Some(true));
-        assert_eq!(toggle_target(Some(true), Some(false)), Some(false));
+        // Pending switch overrides displayed state (double-click stability).
+        assert_eq!(
+            toggle_target(Some(NoiseWrite::Switch(false)), Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            toggle_target(Some(NoiseWrite::Switch(true)), Some(false)),
+            Some(false)
+        );
         // Pending equal to current state folds to the opposite — matches
         // the pending-snapshot semantics (pending == the value being SET).
-        assert_eq!(toggle_target(Some(true), Some(true)), Some(false));
+        assert_eq!(
+            toggle_target(Some(NoiseWrite::Switch(true)), Some(true)),
+            Some(false)
+        );
+        // An in-flight Level write is orthogonal to the switch: the target
+        // is computed purely from the verified state.
+        assert_eq!(
+            toggle_target(Some(NoiseWrite::Level(2)), Some(true)),
+            Some(false)
+        );
+        assert_eq!(
+            toggle_target(Some(NoiseWrite::Level(0)), Some(false)),
+            Some(true)
+        );
+    }
+
+    fn nc(level: Option<u8>, state: Option<bool>, pending: Option<NoiseWrite>) -> NcVm {
+        NcVm {
+            state,
+            level,
+            pending,
+            last_error: None,
+        }
+    }
+
+    /// Level buttons: active/pending/idle matrix (the entire visual+write
+    /// decision set for the 1/2/3 row).
+    #[test]
+    fn level_button_matrix() {
+        // switch not verified on → always Idle (never writes with a
+        // never-observed off-state level semantics).
+        for st in [None, Some(false)] {
+            assert_eq!(level_button(2, &nc(Some(2), st, None)), LevelBtn::Idle);
+            assert_eq!(
+                level_button(2, &nc(Some(2), st, Some(NoiseWrite::Level(2)))),
+                LevelBtn::Idle,
+                "pending does not rescue a switch-off row"
+            );
+        }
+        // switch on: the device's current level is ACTIVE (click = no-op).
+        assert_eq!(
+            level_button(1, &nc(Some(1), Some(true), None)),
+            LevelBtn::Active
+        );
+        // other levels idle or pending only via an exact Level match.
+        assert_eq!(
+            level_button(2, &nc(Some(1), Some(true), None)),
+            LevelBtn::Idle
+        );
+        assert_eq!(
+            level_button(2, &nc(Some(1), Some(true), Some(NoiseWrite::Level(2)))),
+            LevelBtn::Pending
+        );
+        // an in-flight SWITCH flip does not mark level buttons pending.
+        assert_eq!(
+            level_button(2, &nc(Some(0), Some(true), Some(NoiseWrite::Switch(false)))),
+            LevelBtn::Idle
+        );
+        // unknown level values are never Active (only 0/1/2 known).
+        assert_eq!(
+            level_button(5, &nc(Some(5), Some(true), None)),
+            LevelBtn::Active,
+            "device-reported odd level shows as active (read truth) — press path blocks via set_nc_level"
+        );
     }
 }

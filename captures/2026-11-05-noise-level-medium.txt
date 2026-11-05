@@ -1,0 +1,36 @@
+usbfs node: /dev/bus/usb/006/003
+claimed IF0 (kernel usbhid detached) via USBDEVFS_DISCONNECT_CLAIM
+SET_REPORT (Feature, id 5): 64 bytes transferred
+
+== GET_REPORT (Feature, id 5): 64 bytes ==
+raw: 05 03 BB DD 1F 00 11 00 01 00 63 00 00 01 01 03 00 00 00 03 00 02 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+decode: {'magic': '0503bbdd', 'cmd': '0x1F', 'len_be': 17, 'tail@7+len': '0x08'}
+
+-- hidraw fallback --
+hidraw: no node for 0003:3547:0407
+
+# Session 3a — guarded level write (holly-usb/tests/hardware.rs
+# set_noise_level_roundtrip_guarded, run 2026-11-05 after the phone session
+# left the device at medium). The transcript below is the test's own stdout:
+#
+#   original NC: on=true level=1 (tx2 battery 98)
+#   writing target level 2
+#   level write confirmed: level=2
+#   restore confirmed: level=1
+#   guard: switch already restored, nothing to do
+#   guard: post-restore NC = (on=true level=1)
+#
+# What is certified by THIS file as a whole:
+#   - non-17-byte defenses aside, heart payload[7] carried 0x01 (medium) on
+#     live GET after the phone-side strong->medium write; byte map agreement
+#     with `holly-cli -- status` (parse offsets docs/protocol.md §5);
+#   - cmd 19 frame `[isOpen=01][level=02]` was ACCEPTED (ack ok) and the
+#     following GET reported level 2, switch untouched; restore to
+#     `[isOpen=01][level=01]` confirmed the same way. The APK-derived
+#     layout [code UsbMessengerV2.java:172-173] and the APK value set
+#     {0,1,2} [code HLDevice6302Activity.java:1593/1610/:1626-1631] are now
+#     exercised by our own transport on the real wire;
+#   - new residue data points: heart residue 0x08 in the level-1 read
+#     (sessions 1/2 had 0x09/0x36/0x37) — the sum-frame[0..23] hypothesis
+#     gives 0x40 for this frame, so it is dead as a general rule (open
+#     question 2 stays open); ack residue in this session is again 0x75.

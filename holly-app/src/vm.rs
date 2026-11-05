@@ -8,6 +8,7 @@
 
 use serde::Serialize;
 
+use crate::actor::NoiseWrite;
 use crate::{ConnStatus, Snapshot};
 
 /// Banner the UI should show (or `None` while clean/connected).
@@ -63,9 +64,16 @@ pub struct NcVm {
     /// The device's current NC state (the ONLY value a toggle may display
     /// as actual state; changes only via snapshots).
     pub state: Option<bool>,
+    /// The device's current level byte (§5 offset 7, wire-observed values
+    /// so far: 0 and 1 — captures/2026-11-05-*.txt). Drives which level
+    /// button is ACTIVE; read-only.
+    pub level: Option<u8>,
     /// The actor-reported in-flight/pending SET, latest-wins. UI shows
-    /// "pending" only from THIS field — never optimistically.
-    pub pending: Option<bool>,
+    /// "pending" only from THIS field — never optimistically. The enum says
+    /// WHICH byte is in flight (switch flip or level write), so each control
+    /// greys against its own target (`NoiseWrite::Switch` for the toggle,
+    /// `NoiseWrite::Level` for a level button).
+    pub pending: Option<NoiseWrite>,
     /// Message from the last failed SET, when one is being shown.
     pub last_error: Option<String>,
 }
@@ -109,6 +117,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
             tx4: None,
             nc: NcVm {
                 state: None,
+                level: None,
                 pending: None,
                 last_error: None,
             },
@@ -170,6 +179,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 tx4: tail_tx(heart.tx4_status, heart.tx4_battery, heart.tx4_mute),
                 nc: NcVm {
                     state: Some(heart.noise_switch),
+                    level: Some(heart.noise_level),
                     pending: s.pending_set,
                     last_error: None,
                 },
@@ -194,6 +204,7 @@ fn disconnected_core() -> ViewModel {
         tx4: None,
         nc: NcVm {
             state: None,
+            level: None,
             pending: None,
             last_error: None,
         },
@@ -246,7 +257,7 @@ mod tests {
     fn snap(
         status: ConnStatus,
         heart: Option<HeartInfo>,
-        pending: Option<bool>,
+        pending: Option<NoiseWrite>,
         detail: Option<&str>,
     ) -> Snapshot {
         Snapshot {
@@ -354,22 +365,44 @@ mod tests {
     /// the actor; the toggle may only ever be driven by these two fields.
     #[test]
     fn nc_passthrough() {
-        let vm = view_model(&snap(ConnStatus::Connected, Some(e1()), Some(false), None));
+        let vm = view_model(&snap(
+            ConnStatus::Connected,
+            Some(e1()),
+            Some(NoiseWrite::Switch(false)),
+            None,
+        ));
         assert_eq!(
             vm.nc,
             NcVm {
                 state: Some(true),
-                pending: Some(false),
+                level: Some(0),
+                pending: Some(NoiseWrite::Switch(false)),
                 last_error: None
             }
         );
 
-        // NC off heart + pending on → both visible simultaneously.
+        // NC off heart + pending switch flip → both visible simultaneously.
         let mut off = e1();
         off.noise_switch = false;
-        let vm = view_model(&snap(ConnStatus::Connected, Some(off), Some(true), None));
+        let vm = view_model(&snap(
+            ConnStatus::Connected,
+            Some(off),
+            Some(NoiseWrite::Switch(true)),
+            None,
+        ));
         assert_eq!(vm.nc.state, Some(false));
-        assert_eq!(vm.nc.pending, Some(true));
+        assert_eq!(vm.nc.pending, Some(NoiseWrite::Switch(true)));
+
+        // Level write pending with switch-on heart: state stays the device's,
+        // the pending carries the target byte only.
+        let vm = view_model(&snap(
+            ConnStatus::Connected,
+            Some(e1()),
+            Some(NoiseWrite::Level(2)),
+            None,
+        ));
+        assert_eq!(vm.nc.state, Some(true));
+        assert_eq!(vm.nc.pending, Some(NoiseWrite::Level(2)));
     }
 
     #[test]

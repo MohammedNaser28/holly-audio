@@ -87,14 +87,26 @@ docs/protocol.md until captured.
   the capture. The UI control would be a toggle + numeric; both land in ONE
   SET frame per the APK.
 
-### 2.4 NC level (the second byte of SET_NOISE) — partial
+### 2.4 NC level (the second byte of SET_NOISE) — SHIPPED 2026-11-05
 
-- SET_NOISE [wire] already carries `{isOpen, level}` and our `set_noise(on)`
-  sends `level` from a **fresh GET** deliberately unmodified.
-- Writing a DIFFERENT level value still needs: observed level ≠ 0 in a
-  capture (what values does the app use?). Until then, the GUI must keep
-  only the boolean toggle — the level knob stays hidden even though the
-  transport is certified. Range semantics = docs/protocol.md open question 4.
+- Evidence closed in `captures/2026-11-05-noise-level-medium.txt`:
+  nonzero level (1) read [wire] after a phone-side write, then a
+  guarded write of level 2 verified by fresh GETs, restore to 1
+  confirmed — value set 0/1/2 matches the APK's strong/medium/low
+  [code `HLDevice6302Activity.java:1593/:1610/:1626-1631`]; §5 notes
+  the byte is a per-value enum, not a free scale.
+- Shipped chain: holly-usb `set_noise_level(u8)` (fresh GET + SET
+  `{isOpen from fresh GET, level}`, ack gates identical to
+  `set_noise`), mock tests with the live level-1 heart + APK frame
+  bytes, guarded hardware test `set_noise_level_roundtrip_guarded`;
+  holly-app `Command::SetNoiseLevel` + `NoiseWrite {Switch, Level}`
+  pending representation; the gpui row shows switch toggle (space) +
+  low/medium/strong buttons (keys 1/2/3). Buttons stay idle unless the
+  verified switch is ON — a level write with NC off has never been
+  sent/observed [wire] (the APK always sends `isOpen=true` in level
+  presses), so that combination is deliberately not expressible here.
+- NOT shipped: any level outside 0/1/2, or level presets for other
+  Hollyland products (their byte meanings were never captured).
 
 ### 2.5 TX mute — SET_TX_MUTE cmd 22
 

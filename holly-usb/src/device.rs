@@ -90,6 +90,38 @@ impl<T: Transport> HollyControl<T> {
             }),
         }
     }
+
+    /// Write the NC **level** (the second byte of cmd 19's payload) while
+    /// keeping the switch as the fresh GET just reported. Same frame shape as
+    /// [`HollyControl::set_noise`], `[isOpen, level]` [code
+    /// UsbMessengerV2.java:172-173]; the app's own level buttons always send
+    /// the switch *on* (`setNoiseLevel(2, true)` strong, `(1, true)` medium,
+    /// `(0, true)` low — for this product `HLDevice6302Activity.java:1593,
+    /// :1610, :1626-1631`), so 0/1/2 is the only value set the APK uses
+    /// [code]; larger values have never been observed on any wire and are
+    /// the caller's responsibility, not assumed here. The switch state is
+    /// preserved instead of forced on so a restore can always write back the
+    /// exact pre-test pair (switch, level) without a hidden ON.
+    /// Ack gating is identical to `set_noise` (`00` = success; anything else
+    /// surfaces as `Rejected`/`BadAck` — no zero-shaped retry).
+    pub fn set_noise_level(&mut self, level: u8) -> Result<(), Error> {
+        // isOpen derives from THIS fresh reply only — same freshness rule as
+        // set_noise ("device changed it while we were waiting" hazard).
+        let noise_switch = self.get_heart_info()?.noise_switch;
+        let request = Frame::new(cmd::SET_NOISE, vec![u8::from(noise_switch), level]);
+        let (reply, raw) = self.exchange(request)?;
+        match reply.payload.as_slice() {
+            [0x00] => Ok(()),
+            [status] => Err(Error::Rejected {
+                status: *status,
+                raw,
+            }),
+            other => Err(Error::BadAck {
+                len: other.len(),
+                raw,
+            }),
+        }
+    }
 }
 
 impl HollyControl<NusbTransport> {

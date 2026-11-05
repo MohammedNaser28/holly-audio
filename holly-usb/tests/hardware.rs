@@ -103,7 +103,6 @@ fn set_noise_roundtrip_guarded() {
         ctl: Some(ctl),
         original: original.noise_switch,
     };
-
     let opposite = !original.noise_switch;
     guard
         .ctl()
@@ -164,4 +163,136 @@ fn open_fails_cleanly_without_device() {
             let _ = c.get_heart_info();
         }
     }
+}
+
+/// Drop guard for the LEVEL test: restores BOTH NC bytes on every exit path
+/// (diffs come from a fresh GET). Order matters: restore the LEVEL byte
+/// first (`set_noise_level` keeps the switch as the fresh GET reports), THEN
+/// the switch (`set_noise` keeps whatever level the fresh GET then reports —
+/// which is by then the restored original). Errors log, never raise.
+struct NcRestoreGuard {
+    ctl: Option<HollyControl<NusbTransport>>,
+    orig_switch: bool,
+    orig_level: u8,
+}
+
+impl NcRestoreGuard {
+    fn ctl(&mut self) -> &mut HollyControl<NusbTransport> {
+        self.ctl
+            .as_mut()
+            .expect("guard.ctl() may be called only while Some")
+    }
+}
+
+impl Drop for NcRestoreGuard {
+    fn drop(&mut self) {
+        let Some(ctl) = self.ctl.as_mut() else {
+            return;
+        };
+        match ctl.get_heart_info() {
+            Err(e) => eprintln!("guard: state poll failed, cannot restore: {e:?}"),
+            Ok(info) => {
+                if info.noise_level != self.orig_level {
+                    eprintln!(
+                        "guard: level {} != original {} — restoring level",
+                        info.noise_level, self.orig_level
+                    );
+                    if let Err(e) = ctl.set_noise_level(self.orig_level) {
+                        eprintln!(
+                            "guard: LEVEL RESTORE FAILED ({e:?}) — device left at level {}",
+                            info.noise_level
+                        );
+                    }
+                }
+                match ctl.get_heart_info() {
+                    Ok(info) => {
+                        if info.noise_switch != self.orig_switch {
+                            eprintln!(
+                                "guard: switch {} != original {} — restoring switch",
+                                info.noise_switch, self.orig_switch
+                            );
+                            if let Err(e) = ctl.set_noise(self.orig_switch) {
+                                eprintln!(
+                                    "guard: SWITCH RESTORE FAILED ({e:?}) — device left at switch {}",
+                                    info.noise_switch
+                                );
+                            }
+                        } else {
+                            eprintln!("guard: switch already restored, nothing to do");
+                        }
+                    }
+                    Err(e) => eprintln!("guard: second state poll failed: {e:?}"),
+                }
+                match ctl.get_heart_info() {
+                    Ok(post) => eprintln!(
+                        "guard: post-restore NC = (on={} level={})",
+                        post.noise_switch, post.noise_level
+                    ),
+                    Err(e) => eprintln!("guard: post-restore GET failed: {e:?}"),
+                }
+            }
+        }
+    }
+}
+
+/// Guarded SET_NOISE-LEVEL write on real hardware (the second byte of cmd 19):
+/// read the original pair, write a different APK-certified level value, verify
+/// via a fresh GET, restore the original level. The switch must come through
+/// untouched. Failure of any leg aborts loudly — no retries.
+///
+/// Target choice: only values the APK itself presents for this product
+/// (`HLDevice6302Activity.java:1593/:1610/:1626-1631` — strong 2, medium 1,
+/// low 0); the test writes whichever of {1, 2} differs from the current level,
+/// so the round trip always includes a real state change.
+///
+/// Run manually with: cargo test -p holly-usb --test hardware -- --ignored --nocapture
+#[test]
+#[ignore = "mutates device state; run after confirming the dongle is plugged in"]
+fn set_noise_level_roundtrip_guarded() {
+    let _dev = device_lock();
+    let mut ctl = HollyControl::open().expect("open + claim IF0");
+    let original = ctl.get_heart_info().expect("state poll failed");
+    assert_eq!(original.raw.len(), 17, "certified 17-byte payload shape");
+    eprintln!(
+        "original NC: on={} level={} (tx2 battery {})",
+        original.noise_switch, original.noise_level, original.tx2_battery
+    );
+
+    // Pick an APK-known target level that differs from the observed one.
+    let target = if original.noise_level == 1 { 2 } else { 1 };
+    eprintln!("writing target level {target}");
+
+    let mut guard = NcRestoreGuard {
+        ctl: Some(ctl),
+        orig_switch: original.noise_switch,
+        orig_level: original.noise_level,
+    };
+
+    guard
+        .ctl()
+        .set_noise_level(target)
+        .expect("level SET failed");
+    let after = guard.ctl().get_heart_info().expect("post-SET GET failed");
+    assert_eq!(
+        after.noise_level, target,
+        "device must report the written level"
+    );
+    assert_eq!(
+        after.noise_switch, original.noise_switch,
+        "level SET must leave the switch untouched"
+    );
+    assert_eq!(after.raw.len(), 17, "reply shape unchanged");
+    eprintln!("level write confirmed: level={}", after.noise_level);
+
+    // Explicit restore leg (the guard double-covers, incl. mid-run panics).
+    guard
+        .ctl()
+        .set_noise_level(original.noise_level)
+        .expect("restore level SET failed");
+    let restored = guard.ctl().get_heart_info().expect("restore GET failed");
+    assert_eq!(
+        restored.noise_level, original.noise_level,
+        "level did not return to original; guard will retry on exit"
+    );
+    eprintln!("restore confirmed: level={}", restored.noise_level);
 }

@@ -26,7 +26,7 @@ use holly_usb::{Error, HeartInfo, HollyControl, Transport};
 pub mod actor;
 pub mod vm;
 
-pub use actor::{Command, Core, DeviceHandle, Hub, start, start_with_factory};
+pub use actor::{Command, Core, DeviceHandle, Hub, NoiseWrite, start, start_with_factory};
 
 /// Default poll interval for the connected state (1 s, per spec).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -74,7 +74,7 @@ pub struct Snapshot {
     /// A SET the actor accepted and is executing / will execute (latest
     /// request wins). This is pending-state information the frontend only
     /// ever RENDERS — never invents.
-    pub pending_set: Option<bool>,
+    pub pending_set: Option<NoiseWrite>,
 }
 
 impl Snapshot {
@@ -117,8 +117,14 @@ pub fn device_gone(e: &Error) -> bool {
 pub trait StatusSource {
     /// One GET_HEART_INFO round trip.
     fn poll(&mut self) -> Result<HeartInfo, Error>;
-    /// One SET_NOISE round trip (fresh GET inside, per holly-usb's set_noise).
+    /// One SET_NOISE switch round trip (fresh GET inside, per holly-usb's
+    /// set_noise).
     fn set_noise(&mut self, on: bool) -> Result<(), Error>;
+    /// One SET_NOISE level round trip (fresh GET inside; switch preserved —
+    /// per holly-usb's set_noise_level, the transport for the APK's
+    /// HLDevice6302Activity level buttons [code, wire-exercised in
+    /// captures/2026-11-05-noise-level-medium.txt]).
+    fn set_noise_level(&mut self, level: u8) -> Result<(), Error>;
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {
@@ -128,6 +134,10 @@ impl<T: Transport> StatusSource for HollyControl<T> {
 
     fn set_noise(&mut self, on: bool) -> Result<(), Error> {
         HollyControl::set_noise(self, on)
+    }
+
+    fn set_noise_level(&mut self, level: u8) -> Result<(), Error> {
+        HollyControl::set_noise_level(self, level)
     }
 }
 

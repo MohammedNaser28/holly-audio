@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use holly_app::vm::view_model;
-use holly_app::{Command, ConnStatus, Core, Hub, OpenFn, Snapshot, StatusSource, vm};
+use holly_app::{Command, ConnStatus, Core, Hub, NoiseWrite, OpenFn, Snapshot, StatusSource, vm};
 use holly_usb::{Error, HollyControl, Transport};
 
 const REPORT: usize = 64;
@@ -301,7 +301,7 @@ fn set_coalesces_to_latest() {
     // Pending became visible in the stream BEFORE execution: the pending
     // emission precedes the fresh-GET/SET/verify sequence.
     let stream = drain(&mut rx);
-    let seq: Vec<(ConnStatus, Option<bool>)> = stream
+    let seq: Vec<(ConnStatus, Option<NoiseWrite>)> = stream
         .iter()
         .map(|s| (s.status.clone(), s.pending_set))
         .collect();
@@ -310,9 +310,12 @@ fn set_coalesces_to_latest() {
         vec![
             (ConnStatus::NotFound, None),
             (ConnStatus::Connecting, None),
-            (ConnStatus::Connected, None),       // first heart poll
-            (ConnStatus::Connected, Some(true)), // pending BEFORE the SET
-            (ConnStatus::Connected, None),       // device verdict after the SET
+            (ConnStatus::Connected, None), // first heart poll
+            (
+                ConnStatus::Connected,
+                Some(NoiseWrite::Switch(true)) // pending BEFORE the SET
+            ),
+            (ConnStatus::Connected, None), // device verdict after the SET
         ]
     );
 }
@@ -477,7 +480,7 @@ fn snapshot_json_shape() {
         status: ConnStatus::Connected,
         detail: None,
         heart: Some(heart),
-        pending_set: Some(true),
+        pending_set: Some(NoiseWrite::Switch(true)),
     };
     let value: serde_json::Value = serde_json::to_value(&snap).expect("serializable");
 
@@ -510,7 +513,7 @@ fn snapshot_json_shape() {
             "tx4_mute": null,
             "raw": [0, 1, 0, 93, 0, 0, 1, 0, 3, 0, 0, 0, 3, 0, 2, 0, 0]
         },
-        "pending_set": true
+        "pending_set": {"switch": true}
     });
     assert_eq!(value, expected, "published JSON shape changed");
 }
@@ -529,7 +532,7 @@ fn view_model_connected_shape() {
         status: ConnStatus::Connected,
         detail: None,
         heart: Some(heart),
-        pending_set: Some(false),
+        pending_set: Some(NoiseWrite::Switch(false)),
     });
     assert_eq!(vm.banner, None);
     assert_eq!(vm.banner_text, None);
@@ -541,7 +544,7 @@ fn view_model_connected_shape() {
     assert_eq!(vm.nc.state, Some(true));
     assert_eq!(
         vm.nc.pending,
-        Some(false),
+        Some(NoiseWrite::Switch(false)),
         "actor-reported pending passes through"
     );
     assert_eq!(vm.voice_level, Some(3));
@@ -557,4 +560,64 @@ fn view_model_connected_shape() {
 
 fn no_tail_txs(vm: &vm::ViewModel) -> bool {
     vm.tx3.is_none() && vm.tx4.is_none()
+}
+
+/// The level write path through the actor: a mixed batch collapses to ONE
+/// `set_noise_level` SET carrying the LAST requested level; the fresh GET
+/// inside (holly-usb) supplies the CURRENT switch state; the post-SET poll
+/// reports the DEVICE's verdict. Scripted heart clones match E1 with only
+/// payload[7] (noise level) changed — the level byte itself.
+#[test]
+fn set_noise_level_coalesces_to_latest() {
+    let session = MockShared::default();
+    session.push_reply(HEART_E1); // connect poll (nc on, level 0)
+    session.push_reply(HEART_E1); // fresh GET inside set_noise_level
+    session.push_reply(SET_ACK_OK); // ack
+    let mut verdict = HEART_E1;
+    verdict[14] = 0x02; // payload[7] = noiseLevel 00 -> 02 (strong)
+    session.push_reply(verdict); // actor's verification poll
+
+    let (mut core, mut rx) = core_of(VecDeque::from([Ok(session.clone())]));
+    core.tick();
+    assert_eq!(core.snapshot().status, ConnStatus::Connected);
+
+    core.pump([
+        Command::SetNoiseLevel(0),
+        Command::SetNoise(true),
+        Command::SetNoiseLevel(2), // latest-wins: only THIS write goes out
+    ]);
+
+    // writes = [GET poll, GET fresh, SET, verify-GET]; the ONLY SET carries
+    // `{isOpen 01, level 02}` — APK strong [code HLDevice6302Activity:1593],
+    // shape [wire E2/E4].
+    let written = session.written();
+    assert_eq!(written.len(), 4);
+    assert_eq!(written[2][4], 0x13, "SET_NOISE");
+    assert_eq!(written[2][6], 0x02, "payload len 2");
+    assert_eq!(written[2][7], 0x01, "isOpen from the fresh GET");
+    assert_eq!(written[2][8], 0x02, "level = latest request (strong)");
+    assert_eq!(written[3][4], 0x1F, "verification GET");
+
+    let final_snap = core.snapshot();
+    assert_eq!(final_snap.status, ConnStatus::Connected);
+    let heart = final_snap.heart.expect("connected");
+    assert!(heart.noise_switch, "switch verdict stays the device's");
+    assert_eq!(heart.noise_level, 2, "device verdict: level 2");
+    assert_eq!(final_snap.pending_set, None);
+
+    let stream = drain(&mut rx);
+    let pendings: Vec<Option<NoiseWrite>> = stream.iter().map(|s| s.pending_set).collect();
+    let last_pending = pendings.last().copied().flatten();
+    assert_eq!(last_pending, None, "verdict snapshot clears pending");
+    let seq: Vec<Option<NoiseWrite>> = pendings;
+    let some_count = seq.iter().filter(|p| p.is_some()).count();
+    assert_eq!(
+        some_count, 1,
+        "pending must appear exactly once in the stream"
+    );
+    assert_eq!(
+        seq.iter().find(|p| p.is_some()).copied().flatten(),
+        Some(NoiseWrite::Level(2)),
+        "the single pending is the winning Level(2)"
+    );
 }

@@ -12,3 +12,8 @@
 # captures/ are the evidence files we keep and cite in docs/protocol.md).
 /captures/raw/
 __pycache__/
+
+# Android-x86 image + QEMU scratch disk (osfiles for APK runs): huge local
+# binaries, NEVER commit — see tools/qemu-android.sh usage.
+android-x86-9.0-r2.iso
+tools/android-x86.qcow2

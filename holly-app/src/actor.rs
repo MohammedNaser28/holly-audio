@@ -17,16 +17,39 @@ use std::sync::{Arc, Mutex};
 
 use holly_usb::HollyControl;
 
+use serde::Serialize;
+
 use crate::{
     ConnStatus, HeartInfo, OpenFn, POLL_INTERVAL, Snapshot, StatusSource, classify_claim,
     device_gone,
 };
 
+/// The in-flight noise write — which NC byte is being changed. This is the
+/// pending-type of [`Snapshot::pending_set`] (serde for the JSON snapshot
+/// test): RENAMES are for serialization only; the variants carry exactly what
+/// the corresponding holly-usb operation sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoiseWrite {
+    /// `set_noise(on)`: the flips to this value; the level byte is whatever
+    /// the fresh GET inside holly-usb reports.
+    Switch(bool),
+    /// `set_noise_level(l)`: the level byte goes to `l`; the switch stays
+    /// as the fresh GET reports (holly-usb preserves, replacing the APK's
+    /// always-on form — its level buttons send `isOpen=true`);
+    /// `HLDevice6302Activity.java:1593/:1610/:1626-1631`.
+    Level(u8),
+}
+
 /// Commands the UI/frontend may send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    /// Request an NC toggle. Coalesces to the latest.
+    /// Request an NC switch flip. Coalesces to the latest.
     SetNoise(bool),
+    /// Request an NC level write. Coalesces to the latest (inter-command:
+    /// a later Level replaces an earlier Switch in the same batch and vice
+    /// versa — one SET goes out per batch, always the newest intent).
+    SetNoiseLevel(u8),
     /// Force one fresh poll/reconnect attempt now.
     Refresh,
 }
@@ -95,6 +118,10 @@ impl DeviceHandle {
         let _ = self.tx.send(Command::SetNoise(on));
     }
 
+    pub fn set_noise_level(&self, level: u8) {
+        let _ = self.tx.send(Command::SetNoiseLevel(level));
+    }
+
     pub fn refresh(&self) {
         let _ = self.tx.send(Command::Refresh);
     }
@@ -130,7 +157,7 @@ pub struct Core {
     detail: Option<String>,
     heart: Option<HeartInfo>,
     /// A SET that was accepted but not yet executed (latest-wins).
-    pending: Option<bool>,
+    pending: Option<NoiseWrite>,
     /// Last composed snapshot (emit-on-change dedup base).
     last: Option<Snapshot>,
 }
@@ -182,32 +209,34 @@ impl Core {
         }
     }
 
-    /// Process ONE batch of queued commands with coalescing (latest-wins
-    /// for SetNoise).
+    /// Process ONE batch of queued commands with coalescing (latest-wins:
+    /// within the batch, any noise write — switch or level — replaces its
+    /// predecessor; only the newest SET goes out).
     pub fn pump<I: IntoIterator<Item = Command>>(&mut self, cmds: I) {
         let mut refresh = false;
-        let mut nc: Option<bool> = None;
+        let mut nc: Option<NoiseWrite> = None;
         for cmd in cmds {
             match cmd {
                 Command::Refresh => refresh = true,
-                Command::SetNoise(on) => nc = Some(on),
+                Command::SetNoise(on) => nc = Some(NoiseWrite::Switch(on)),
+                Command::SetNoiseLevel(l) => nc = Some(NoiseWrite::Level(l)),
             }
         }
         if self.device.is_none() {
             // Requests while disconnected are dropped (UI disables its
-            // toggle when no heart exists); refresh doubles as an
+            // controls when no heart exists); refresh doubles as an
             // immediate reconnect attempt.
             if refresh || nc.is_some() {
                 self.open_attempt();
             }
             return;
         }
-        if let Some(on) = nc {
+        if let Some(nc) = nc {
             // Pending visible in the snapshot stream BEFORE the blocking
             // SET runs — humans see it if the 3 s control budget stalls.
-            self.pending = Some(on);
+            self.pending = Some(nc);
             self.emit();
-            self.execute_set(on);
+            self.execute_set(nc);
         } else if refresh {
             self.poll_and_emit();
         }
@@ -278,11 +307,15 @@ impl Core {
 
     /// One SET round trip — the single in-flight SET — then a fresh poll
     /// so subscribers always see the DEVICE's verdict.
-    fn execute_set(&mut self, on: bool) {
+    fn execute_set(&mut self, nc: NoiseWrite) {
         let Some(source) = self.device.as_mut() else {
             return;
         };
-        match source.set_noise(on) {
+        let result = match nc {
+            NoiseWrite::Switch(on) => source.set_noise(on),
+            NoiseWrite::Level(level) => source.set_noise_level(level),
+        };
+        match result {
             Ok(()) => {
                 self.pending = None;
                 self.error_clear();

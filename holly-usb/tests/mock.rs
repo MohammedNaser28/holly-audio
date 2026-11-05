@@ -21,6 +21,19 @@ const HEART_RX_E1: [u8; 64] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+/// Live RX (2026-11-05, session 3): the phone app set the A6108 NC level from
+/// strong (2) to medium (1) offline-side and the dongle was replugged — the
+/// GET now answers with `noise_level = 1`, `noise_switch = 01`, battery
+/// 0x63 = 99. Nonzero level byte on the [wire]:
+/// captures/2026-11-05-noise-level-medium.txt. Residue 0x08 (third distinct
+/// heart residue; docs/protocol.md open question 2).
+const HEART_RX_LEVEL_MED: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x63, 0x00, 0x00, 0x01, 0x01, 0x03,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 /// E3 RX: identical payload except offset 6 — noiseSwitch 01 -> 00.
 const HEART_RX_E3: [u8; 64] = [
     0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x00, 0x00, 0x03,
@@ -223,7 +236,7 @@ fn heart_toggle_flips_only_noise_switch() {
 /// never a made-up value: after a 17-byte state poll with level 3, the SET
 /// payload's second byte must be that 3.
 #[test]
-fn set_noise_level_comes_from_device_state() {
+fn set_noise_carries_devices_current_level() {
     let mut mock = MockTransport::new();
     let mut state = HEART_RX_E1;
     state[14] = 0x03; // payload[7] = noiseLevel = 3
@@ -272,4 +285,115 @@ fn set_noise_uses_fresh_state_not_cached() {
         set_tx[8], 0x03,
         "SET level must come from the fresh GET (reply B), not the cached reply A"
     );
+}
+
+/// The certified level-1 heart reply (session 3, live) parses with
+/// noise_level = 1 and every other field in its certified slots.
+#[test]
+fn heart_level_med_reply_parses() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_LEVEL_MED);
+    let mut c = control(mock);
+
+    let info = c.get_heart_info().expect("level-1 reply must parse");
+    assert!(info.noise_switch);
+    assert_eq!(info.noise_level, 1);
+    assert_eq!(info.tx2_battery, 0x63); // 0x63 = 99
+    assert_eq!(info.voice_level, 3);
+    assert_eq!(info.eq_level, 3);
+    assert_eq!(info.reverb_level, 2);
+}
+
+/// set_noise_level(1) (medium) against the live level-1 state (`isOpen` from
+/// the fresh GET = 01): TX must be the APK-computed medium frame
+/// `05 03 AA DD 13 00 02 01 01 EF` [code UsbMessengerV2.java:172-173 with the
+/// level buttons in HLDevice6302Activity.java:1610], byte-exact to the
+/// shape E2 established [wire].
+#[test]
+fn set_noise_level_medium_roundtrip() {
+    const SET_MED_TX: [u8; 64] = [
+        0x05, 0x03, 0xAA, 0xDD, 0x13, 0x00, 0x02, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    ];
+
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_LEVEL_MED); // state fetch (switch on, level 1)
+    mock.push_reply(SET_ACK_E2); // ack (status byte, residue shape [wire E2])
+    let mut c = control(mock);
+
+    c.set_noise_level(1).expect("ack 00 must be accepted");
+
+    let written = c.transport().written();
+    assert_eq!(&written[0], &HEART_TX, "op must issue its own GET first");
+    assert_eq!(&written[1], &SET_MED_TX, "level SET must be the APK frame");
+}
+
+/// Strong (level 2) is the APK's third value (HLDevice6302Activity.java:1593);
+/// with the same switch-on state the only TX difference is the level byte.
+#[test]
+fn set_noise_level_strong_deltas_only_level_byte() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_LEVEL_MED);
+    mock.push_reply(SET_ACK_E2);
+    let mut c = control(mock);
+
+    c.set_noise_level(2).expect("ack 00 must be accepted");
+    let set_tx = &c.transport().written()[1];
+    assert_eq!(set_tx[4], cmd::SET_NOISE);
+    assert_eq!(set_tx[6], 0x02);
+    assert_eq!(set_tx[7], 0x01); // switch preserved from the fresh GET
+    assert_eq!(set_tx[8], 0x02); // strong
+}
+
+/// Freshness rule parity with set_noise: `isOpen` comes from the reply issued
+/// INSIDE set_noise_level, never from an earlier poll. Script replies A
+/// (switch on) then B (switch off, level 0), then the ack; the SET frame must
+/// carry B's isOpen.
+#[test]
+fn set_noise_level_uses_fresh_switch_state() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // A: switch on, level 0
+    mock.push_reply(HEART_RX_E3); // B: switch off, level 0
+    mock.push_reply(SET_ACK_E2);
+    let mut c = control(mock);
+
+    let stale = c.get_heart_info().expect("reply A must parse");
+    assert!(stale.noise_switch);
+
+    c.set_noise_level(2).expect("ack must be accepted");
+    let set_tx = &c.transport().written()[2]; // poll A, poll B, SET
+    assert_eq!(set_tx[7], 0x00, "isOpen must come from reply B, not A");
+    assert_eq!(set_tx[8], 0x02);
+}
+
+/// `set_noise_level` shares set_noise's ack gates: nonzero status = Rejected,
+/// wrong ack length = BadAck. Reason: the ack shape has only ever been seen
+/// as `[00]` [wire E2/E4]; treating anything else as success would invent.
+#[test]
+fn set_noise_level_rejects_abnormal_acks() {
+    // nonzero status
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_LEVEL_MED);
+    let mut ack = SET_ACK_E2;
+    ack[7] = 0x02;
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_noise_level(1).expect_err("nonzero ack must fail");
+    assert!(
+        matches!(err, Error::Rejected { status: 0x02, .. }),
+        "{err:?}"
+    );
+
+    // two-byte ack (echo shape) must not be accepted
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_LEVEL_MED);
+    let mut ack = SET_ACK_E2;
+    ack[6] = 0x02; // payload len 2
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_noise_level(1).expect_err("2-byte ack must fail");
+    assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
 }

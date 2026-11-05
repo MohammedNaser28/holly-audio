@@ -195,6 +195,26 @@ with the rig's physical state — [wire] upgrade of the whole single-TX field
 map. The 17-byte length also proves the resource layout claim: no length
 padding, `off` = `payload[0..16]` contiguous bytes.
 
+Live capture [wire] (`captures/2026-11-05-noise-level-medium.txt`, session
+3): after a phone-side noise-level change (strong → medium) and a replug,
+the heart replied `noiseLevel = 0x01` at offset 7 with
+`noiseSwitch = 0x01`, battery `0x63` — the first NONZERO NC level byte ever
+observed on our wire, parsed by `holly-cli -- status` agnostic to the
+capture (`Noise cancel: on (level 1)`). Low = 0 (session 1/2 baseline,
+median/medium = 1, strong = 2 are the APK values [code
+`HLDevice6302Activity.java:1593/:1610/:1626-1631`]; only 0 and 1 are
+wire-observed so far, 2 was sent once by the guarded test below.
+SET_NOISE's second payload byte is not a scale — it is a per-value enum.
+
+Level-write wire exercise [wire] (same file, session 3a): the guarded
+hardware test (`holly-usb/tests/hardware.rs ::
+set_noise_level_roundtrip_guarded`) sent `{isOpen 01, level 02}`,
+the ack succeeded, the next heart reported `noiseLevel = 02` with the
+switch untouched, and the restore to `{01, 01}` was confirmed by a fresh
+GET — holly-usb's level write path is [wire]-certified for the values 1
+and 2 (restore flow to level 0 additionally stays [wire]-certified
+through `set_noise`, which never invents a level).
+
 ## 6. Provenance note
 
 Consumer crates in this workspace:
@@ -237,12 +257,16 @@ Consumer crates in this workspace:
    The post-payload residue byte is observed across captures now: `0x09`
    (heart, session 1), `0x37/0x36/0x37` (heart, session 2 — alternating exactly
    with the flipped `noiseSwitch` byte, and equal to `sum(frame[0..23]) mod 256`
-   there), `0x75` (both SET ACKs, constant). The sum formula fails for the ACKs
-   (predicts `0xB4`) and session 1 (predicts `0x39`), so no rule is settled —
-   collect its values in every capture until it can be named precisely (checksum
-   candidate / per-frame counter; no holly-proto change until proven).
+   there), `0x08` (heart, session 3 — the level-1 reply; the sum formula
+   predicts `0x40` for that frame, so it is DEAD as a general rule),
+   `0x75` (every SET ACK so far, incl. the level-write acks).
+   No settled rule exists — collect its values in every capture until it can
+   be named precisely (checksum candidate / per-frame counter; no holly-proto
+   change until proven).
 3. [code→wire] `deviceType.ordinal()` mapping (TX1 vs TX2 vs RX) for SN/MAC/mute commands.
-4. [code→wire] Value ranges for voiceLevel (gain), noiseLevel, eqLevel, speaker, light.
+4. [code→wire] Value ranges for voiceLevel (gain), eqLevel, speaker, light.
+   (noiseLevel is CLOSED for this product: 0/1/2 [code], 0 and 1 read [wire],
+   1→2 written and verified [wire] — see §5.)
 5. [code→wire] Error ACK shape for SET commands: never captured yet (all SETs
    succeeded). `ProSetNoise.receiveData` implies `data[0] != 0` = setStatus
    false, but whether the device ever replies after a rejected SET, with what
