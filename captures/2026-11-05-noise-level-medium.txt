@@ -61,3 +61,17 @@ hidraw: no node for 0003:3547:0407
 #   Residue note: 0x36 here vs 0x08 in session 3a (both ON-state hearts) —
 #   sum(frame[0..23]) predicts 0x3A for this frame (0x40 for 3a): no rule.
 #   Battery drift: 99 -> 98 -> (user read) 95 -> 0x5E = 94 across ~1 h.
+
+# Session 3c — closure of the display-space questions (no wire read).
+#   User replugged the dongle, cross-checked `holly-cli -- status` against
+#   the phone app, and confirmed both renderings:
+#   - voice: phone bar numeral "4" == our `Voice: level 3` — the bar draws
+#     numerals 1..6 over a 0-based wire index 0..5 [code
+#     CustomScaleSeekBar.java:177-178] ("you indexed zero, no problem").
+#   - NC: phone "medium" == wire `level 1` — identity mapping low=0 /
+#     medium=1 / strong=2 [code HLDevice6302Activity.java:1791-1793]
+#     ("indexed zero the noise").
+#   No frames this session (dongle was in the phone during the app check);
+#   both mapping claims are [code]-cited in docs/protocol.md §5.1 and the
+#   wire-side state values were already [wire]-established in sessions
+#   1-3b. User attestation only — do not upgrade these lines to [wire].
