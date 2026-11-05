@@ -1,0 +1,13 @@
+# Hollyland wireless-mic USB-C receiver dongle (3547:0407, model 6108).
+# Evidence: inputs/lsusb-v.txt [descriptor], docs/device.md.
+#
+# Grants non-root access to the usbfs device node so holly-usb (nusb) can
+# claim IF0 (the HID control interface) without sudo. MODE grants rw for the
+# owning user/group; TAG+="uaccess" additionally grants the *active seat
+# user* access via logind (ACL). IF1/IF2 (UAC audio) share the same node —
+# but claiming is per-interface, so this rule does not enable claiming them.
+#
+# Install: sudo cp packaging/99-hollyland.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && replug the dongle.
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="3547", ATTR{idProduct}=="0407", MODE="0660", TAG+="uaccess"

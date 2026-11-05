@@ -172,7 +172,8 @@ fn command_names_cover_known_opcodes() {
 ///
 /// First live proof points this test pins:
 ///   - reply preamble is `05 03 BB DD` (device→host `BB`, not the host `AA`)
-///   - length field `00 11` = 17 payload bytes, big-endian
+///   - length field `00 11` = 17 payload bytes (hi=0: BE encode and the
+///     APK's `hi*16+lo` decode coincide; see decode() in src)
 ///   - NO `0xEF` terminator in the reply (would-be tail byte is `0x09`)
 #[test]
 fn decode_live_device_reply_get_heart_info() {

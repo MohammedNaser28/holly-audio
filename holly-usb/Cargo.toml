@@ -1,0 +1,13 @@
+[package]
+name = "holly-usb"
+version.workspace = true
+edition.workspace = true
+description = "Hollyland 6108 USB control transport (nusb) — certified SET/GET paths"
+
+[dependencies]
+holly-proto = { path = "../holly-proto" }
+nusb = "0.2.9"
+thiserror = "2"
+
+[dev-dependencies]
+# none: mock transport is in-crate so CI tests need no extra deps

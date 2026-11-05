@@ -75,18 +75,25 @@ RX framing (device → host), measured: `captures/2026-11-05-hearinfo-first-wire
 | SET-command ACK | same `05 03 BB DD` shape, cmd echo, 1-byte payload `00` = success; **status only — the TX payload is not echoed back**. No error-shape reply observed so far (all SETs succeeded); non-zero ACK as error is [code]-only (`ProSetNoise.receiveData` reads `data[0]`) until captured | `captures/2026-11-05-set-noise.txt` E2/E4 [wire] |
 | State-change congruence | SET_NOISE (`[0,0]` → off, `[1,0]` → on) flipped `noiseSwitch` (§5 payload offset 6) `01→00→01`; every other payload byte stayed constant; final state == start state | same capture E1/E3/E5 [wire] |
 
-The `hi * 16 + lo` length-decode quirk (`ProtocolV2.parse`, `ProtocolV2.java:157`)
-is **observationally dead**: the report-5 payload budget is 63 bytes, so the BE
-high byte is always 0 and `0*16 + lo == hi*256 + lo` for every frame that can
-physically exist. Same for the 160-byte OTA frames (payload ≤ 152 < 256). app and the device behave identically on all reachable frames;
-`holly-proto` encodes/decodes plain BE. [code+wire analysis]
+The `hi * 16 + lo` length-decode quirk (`ProtocolV2.parse`,
+`ProtocolV2.java:157`, with `USBUtils.toInt(byte)` = `b & 255`,
+`USBUtils.java:7-8`) is part of the APK-defined receive path and is **preserved
+verbatim in `holly-proto` — it is NOT proven dead**. Every wire frame observed
+so far sends `len_hi = 0` (payload ≤ 63 fits the 63-byte report budget; ≤ 152
+the 160-byte OTA budget), and for `hi == 0` the two formulas coincide
+(`0*16 + lo == 0*256 + lo`). That coincidence is an observation, not a proof
+about frames with `hi > 0`: removing the quirk would require a capture with
+payload > 255 bytes showing plain BE behavior. Encoding stays big-endian:
+that is what `getData()` does (and the wire confirms TX frames like
+`13 00 02`). [code+wire]
 
 RX-side quirks to verify on the wire (findable bugs in the app, not our choices):
-- `ProtocolV2.parse` computes payload length as `data[5]*16 + data[6]` — base-16
-  arithmetic decompiled at `ProtocolV2.java:157`; if the device sends true
-  big-endian high/low bytes (like `getData()` writes), any frame with
-  payload > 15 bytes would be misparsed by this formula. Needs [wire] evidence
-  before `holly-proto` copies either behavior.
+- `ProtocolV2.parse` computes payload length as `hi*16 + lo` where
+  `hi = USBUtils.toInt(data[5])`, `lo = USBUtils.toInt(data[6])` —
+  decompiled at `ProtocolV2.java:157`. This agrees with `getData()`'s
+  big-endian encoding while `hi == 0` (every frame observed); the formulas
+  diverge only for payload ≥ 256 bytes. `holly-proto` carries the APK formula
+  verbatim in `decode()`. [code — see §2 quirk paragraph]
 - OTA commands (26/27/28) read a 1-byte payload at offset 5; DFU data/verify
   (29/30) read at offset 9 (`ProtocolV2.parse` `ProtocolV2.java:136-149`). [code]
 
@@ -190,6 +197,15 @@ padding, `off` = `payload[0..16]` contiguous bytes.
 
 ## 6. Provenance note
 
+Consumer crates in this workspace:
+- `holly-proto` — pure framing (encode/decode), zero deps. Decode carries the
+  APK's `hi*16 + lo` length formula verbatim (§2 quirk paragraph).
+- `holly-usb` — transport only: VID/PID enumeration + IF0 claim (nusb),
+  `SET_REPORT`/`GET_REPORT` of 64-byte feature reports, `get_heart_info()`
+  and `set_noise(bool)` with the capture tool's abort gates. UAC interfaces
+  never claimed; udev rule at `packaging/99-hollyland.rules`.
+
+
 - Sources live in `re/apk/` (decompiled Hollyland 3.1.0, jadx). That directory
   must never be committed — it itself contains Hollyland-owned code we must not
   redistribute (see project hard rules). Only this doc and original
@@ -200,10 +216,13 @@ padding, `off` = `payload[0..16]` contiguous bytes.
 
 ## Open questions
 
-1. ~~`*16` decode vs `intToByte2` encode~~ **RESOLVED 2026-11-05 [wire]**: reply
-   payload of 17 bytes observed (`00 11` BE); the two formulas coincide for
-   every physically representable frame (payload budget 63 or 152 bytes < 256,
-   so BE hi-byte is always 0). Quirk is dead code; `holly-proto` uses plain BE.
+1. `*16` decode vs `intToByte2` encode: **kept as APK-defined — not resolved
+   dead**. `holly-proto` decodes with the exact `hi*16 + lo` formula
+   (`ProtocolV2.java:157`, `USBUtils.toInt` = `b & 255`) and encodes BE like
+   `getData()`. All observed frames carry `len_hi = 0`, where the two agree;
+   divergence only matters for payload > 255 bytes, never yet observed
+   (single-report budget is 63 bytes). Any simplification away from the APK
+   formula requires a [wire] capture with payload > 255 bytes first.
 2. [wire→ partially resolved] Device-originated frame preamble **is** the same
    `05 03` shape but with `BB`: reply = `05 03 BB DD` (measured
    `captures/2026-11-05-hearinfo-first-wire.txt`, GET_REPORT leg). Whether

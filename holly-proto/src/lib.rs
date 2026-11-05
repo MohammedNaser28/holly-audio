@@ -237,7 +237,15 @@ impl Frame {
             });
         }
         let command = buf[4];
-        let len = ((buf[5] as usize) << 8) | (buf[6] as usize);
+        // Payload length decode is APK-exact, NOT true big-endian:
+        //   ProtocolV2.java:157: `int i = (USBUtils.toInt(bArr[0]) * 16)
+        //   + USBUtils.toInt(bArr[1]);` with USBUtils.toInt(byte) = `b & 255`
+        //   (USBUtils.java:7-8). So i = hi*16 + lo.
+        // Every observed frame carries hi = 0 (payload ≤ 63 < 256 budget),
+        // where hi*16 + lo == hi*256 + lo — coincidence, not equivalence.
+        // Per project rule this formula is preserved verbatim until a capture
+        // with payload > 255 bytes proves which formula the device speaks.
+        let len = (buf[5] as usize) * 16 + (buf[6] as usize);
         if !from_device {
             // host→device frames carry the getData() terminator: tail byte at
             // 7+len must exist, so demand 7+len+1 bytes total.
