@@ -1,0 +1,9 @@
+[package]
+name = "holly-proto"
+version.workspace = true
+edition.workspace = true
+description = "Hollyland 6108 USB HID framing/protocol (I/O-free, evidence-traced)"
+
+# No dependencies on purpose: this crate only encodes/decodes Buffers, so it can
+# be unit-tested without hardware or USB access.
+[dependencies]

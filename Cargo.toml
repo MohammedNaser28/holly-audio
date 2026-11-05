@@ -1,0 +1,18 @@
+# Workspace: hollyaudio-desktop
+#
+# Crates:
+#   holly-proto  — pure framing/parsing (no I/O), unit-tested against observed behavior
+#   holly-usb    — device I/O (nusb)           [planned, after captures confirm protocol]
+#   holly-cli    — clap CLI on top of holly-usb [planned]
+#   holly-gui    — Tauri v2 + React            [planned, last]
+[workspace]
+resolver = "2"
+members = ["holly-proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+# Desktop control-plane crate: small binaries, fast startup.
+lto = "thin"

@@ -1,0 +1,12 @@
+# Build artifacts
+/target/
+
+# Re-enginering working area: decompiled Hollyland APK output and extracted
+# bundles. NEVER commit — original code only in this repo (hard rule).
+/re/
+*.xapk
+
+# Capture tooling scratch space (raw pcaps stay local; exported *.jsonl in
+# captures/ are the evidence files we keep and cite in docs/protocol.md).
+/captures/raw/
+__pycache__/

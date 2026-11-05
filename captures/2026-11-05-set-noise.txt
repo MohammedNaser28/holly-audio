@@ -1,0 +1,79 @@
+# SET_NOISE toggle capture (Task 1) - SET-path round trip [wire]
+# Date: 2026-11-05, host: Arch Linux, node /dev/bus/usb/006/002 (sysfs 6-1)
+# Tool: tools/capture_set_noise.py (same transport as the first capture:
+#   IF0 claimed via USBDEVFS_DISCONNECT_CLAIM with bInterfaceClass=03 verified
+#   first; SET_REPORT(0x21,9,0x0305,64,3000ms) + GET_REPORT(0xA1,1,0x0305,64,1000ms))
+# Sequence per task spec: base -> toggle -> confirm -> restore -> confirm.
+# End state == start state (flow aborts otherwise; all gates passed).
+# Battery note: 0x5D = 93% this session (was 99% in the first capture; drain).
+
+### E1 baseline GET_HEART_INFO
+TX:
+05 03 AA DD 1F 00 00 EF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+RX:
+05 03 BB DD 1F 00 11 00 01 00 5D 00 00 01 00 03 00 00 00 03 00 02 00 00
+37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+#   TX: cmd 31 poll: 05 03 AA DD 1F 00 00 EF... (empty payload, EF at offset 7)
+#   RX: 05 03 BB DD 1F 00 11 <payload 17 bytes> then residue 0x37 (open q)
+#     payload: 00 01 00 5D 00 00 01 00 03 00 00 00 03 00 02 00 00
+#       tx1Status=00 tx2Status=01 tx2Battery=0x5D(93) noiseSwitch=01 noiseLevel=00
+
+### E2 SET_NOISE toggle (isOpen=0, level=0)
+TX:
+05 03 AA DD 13 00 02 00 00 EF 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+RX:
+05 03 BB DD 13 00 01 00 75 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+#   TX: 05 03 AA DD 13 00 02 <isOpen=00> <level=00> EF  (UsbMessengerV2.java:173)
+#   RX: 05 03 BB DD 13 00 01 <00> then residue 0x75
+#     ACK payload is ONE byte: 0x00 = set-success. The device echoes NEITHER
+#     isOpen NOR level - status only, matching ProSetNoise.receiveData
+#     (data[0]==0 -> setStatus=true) [code+wire].
+#     No non-zero (error) ACK shape was observed in this session.
+
+### E3 GET_HEART_INFO after toggle
+TX:
+05 03 AA DD 1F 00 00 EF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+RX:
+05 03 BB DD 1F 00 11 00 01 00 5D 00 00 00 00 03 00 00 00 03 00 02 00 00
+36 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+#   RX payload identical to E1 except offset 6: noiseSwitch 01 -> 00
+#     (noiseLevel stays 00). Toggle took effect with level preserved.
+
+### E4 SET_NOISE restore (isOpen=1, level=0)
+TX:
+05 03 AA DD 13 00 02 01 00 EF 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+RX:
+05 03 BB DD 13 00 01 00 75 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+#   TX same shape with <isOpen=01>. ACK identical to E2's: payload 00.
+
+### E5 GET_HEART_INFO final check
+TX:
+05 03 AA DD 1F 00 00 EF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+RX:
+05 03 BB DD 1F 00 11 00 01 00 5D 00 00 01 00 03 00 00 00 03 00 02 00 00
+37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+#   RX payload byte-identical to E1 (noiseSwitch=01 restored, battery same).
+#
+# Residue-byte observations (byte right after payload, meaning UNKNOWN):
+#   E1=0x37 E2=E4=0x75 E3=0x36 E5=0x37 (first capture's heart reply: 0x09)
+#   Within this session the heart residue alternates 37/36/37 tracking the
+#   flipped byte and equals sum(frame[0..23]) mod 256 - but the same formula
+#   gives 0xB4 for the ACKs (seen 0x75) and 0x39 for session 1 (seen 0x09).
+#   Hypothesis noted; NOT settled. No holly-proto change.

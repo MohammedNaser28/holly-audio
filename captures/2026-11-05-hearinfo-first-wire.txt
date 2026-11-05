@@ -1,0 +1,41 @@
+# First successful [wire] exchange with the Hollyland 6108 dongle (3547:0407)
+# Date: 2026-11-05, host: Arch Linux, node /dev/bus/usb/006/002
+# Tool: tools/probe_hearinfo.py (usbfs CONTROL path; arm: controlTransfer-compatible)
+# Flow: USBDEVFS_DISCONNECT_CLAIM(IF0) -> SET_REPORT(Feature id 5) -> GET_REPORT(Feature id 5)
+#
+# TX frame (what the host sent, 64 bytes; app-identical to HollyAudio:
+# controlTransfer(0x21, 9, 0x0305, 0, buf, 3000ms)):
+05 03 AA DD 1F 00 00 EF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+#   05 03 AA DD   magic (host->device)
+#   1F            cmd 31 = GET_HEART_INFO
+#   00 00         payload length (BE) = 0 (so no payload bytes; encode quirk:
+#                 getData() copied intToByte2(0) = 00 00 explicitly here)
+#   EF            terminator at offset 7 (payload_len=0)
+#
+# RX reply ( received immediately after, 64 bytes; controlTransfer-compatible
+# GET_REPORT leg: controlTransfer(0xA1, 1, 0x0305, 0, buf, 1000ms) ):
+05 03 BB DD 1F 00 11 00 01 00 63 00 00 01 00 03 00 00 00 03 00 02 00 00
+09 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+#   05 03 BB DD   magic (device->host response variant! BB, not AA)
+#   1F            cmd echo of request
+#   00 11         payload length (BE) = 17
+#   payload (17 bytes):
+#     off  0-1:   tx1Status=00 (not connected), tx2Status=01 (connected)
+#     off  2-3:   tx1Battery=00, tx2Battery=0x63=99
+#     off  4-5:   mute statuses = 00 (unmuted)
+#     off  6:     noiseSwitchStatus=01 (NC on)
+#     off  7:     noiseLevel=00
+#     off  8:     voiceLevel=03
+#     off  9:     voiceMode=00
+#     off 10:     shutdownTime=00
+#     off 11:     lightStatus=00
+#     off 12:     eqLevel=03
+#     off 13:     reverbSwitchStatus=00
+#     off 14:     reverbLevel=02
+#     off 15-16:  txIdentifyStatus=00, signalMode=00
+#   NO 0xEF terminator in the reply: byte at offset 7+17 is 0x09 (unexplained
+#   residue - be aware ProtocolV2.parse() never validates magic or terminator,
+#   it just takes data[7..7+len)).
