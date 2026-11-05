@@ -200,11 +200,14 @@ Live capture [wire] (`captures/2026-11-05-noise-level-medium.txt`, session
 the heart replied `noiseLevel = 0x01` at offset 7 with
 `noiseSwitch = 0x01`, battery `0x63` — the first NONZERO NC level byte ever
 observed on our wire, parsed by `holly-cli -- status` agnostic to the
-capture (`Noise cancel: on (level 1)`). Low = 0 (session 1/2 baseline,
-median/medium = 1, strong = 2 are the APK values [code
-`HLDevice6302Activity.java:1593/:1610/:1626-1631`]; only 0 and 1 are
-wire-observed so far, 2 was sent once by the guarded test below.
-SET_NOISE's second payload byte is not a scale — it is a per-value enum.
+capture (`Noise cancel: on (level 1)`). Low = 0 (session 1/2 baseline)
+[wire], 1 read [wire] (session 3) and written+verified [wire]
+(session 3a), 2 written+verified [wire] (session 3a) AND live-read
+[wire] (session 3b, phone session) — the APK's allowed set is 0/1/2
+[code `HLDevice6302Activity.java:1593/:1610/:1626-1631`].
+SET_NOISE's second payload byte is not a
+scale — it is a per-value enum. Session 3b additionally shows
+switch=OFF/preserved-level reads matching the APK switch path.
 
 Level-write wire exercise [wire] (same file, session 3a): the guarded
 hardware test (`holly-usb/tests/hardware.rs ::
@@ -259,6 +262,9 @@ Consumer crates in this workspace:
    with the flipped `noiseSwitch` byte, and equal to `sum(frame[0..23]) mod 256`
    there), `0x08` (heart, session 3 — the level-1 reply; the sum formula
    predicts `0x40` for that frame, so it is DEAD as a general rule),
+   `0x36` (heart, session 3b — ON at level 2; the sum formula predicts
+   `0x3A`; note session 2's E3 residue was also 0x36 but in a different
+   state, so the byte is not simply state-tracking either),
    `0x75` (every SET ACK so far, incl. the level-write acks).
    No settled rule exists — collect its values in every capture until it can
    be named precisely (checksum candidate / per-frame counter; no holly-proto

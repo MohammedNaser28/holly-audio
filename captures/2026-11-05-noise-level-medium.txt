@@ -34,3 +34,30 @@ hidraw: no node for 0003:3547:0407
 #     (sessions 1/2 had 0x09/0x36/0x37) — the sum-frame[0..23] hypothesis
 #     gives 0x40 for this frame, so it is dead as a general rule (open
 #     question 2 stays open); ack residue in this session is again 0x75.
+
+# Session 3b — post-commit re-checks (probe_hearinfo.py, GET-only):
+#   (a) the user's own `holly-cli -- status` output pasted after our session:
+#       TX1 disconnected / TX2 connected (95%), `Noise cancel: off (level 1)`.
+#       That is the first live observation of the combination
+#       switch=OFF with level=1 — direct reader-side confirmation that a
+#       switch flip preserves the level byte (APK path
+#       HLDevice6302Activity.java:620-646 sends {noiseType, z} [code];
+#       E1->E3 in session 2 showed the same at level 0).
+#   (b) seconds later this probe read the device as ON at LEVEL 2:
+#
+#   05 03 BB DD 1F 00 11 00 01 00 5E 00 00 01 02 03 00 00 00 03 00 02
+#   00 00 36 (+ 56 zero pad)
+#
+#   payload: tx1 off, tx2 on, tx2 battery 0x5E = 94, tx1 mute 0, tx2 mute 0,
+#   noiseSwitch 01, noiseLevel 02 (STRONG), voice 3/0, shutdown 0,
+#   light on (0x00 inverted), eq 3, reverb off/level 2, identify 0, signal 0,
+#   residue 0x36.
+#   Interpretation: the state changed OFF(level 1) -> ON(level 2) between
+#   the two reads — consistent with a phone-app strong press in that window
+#   (the only local writers are our own tools; none ran between the reads).
+#   Either way this is the first PHONE-SESSION live read of level 2; level
+#   values seen on this wire now span 0/1(2) without any tool-induced
+#   uncertainty about the value set.
+#   Residue note: 0x36 here vs 0x08 in session 3a (both ON-state hearts) —
+#   sum(frame[0..23]) predicts 0x3A for this frame (0x40 for 3a): no rule.
+#   Battery drift: 99 -> 98 -> (user read) 95 -> 0x5E = 94 across ~1 h.
