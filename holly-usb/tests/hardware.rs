@@ -2,12 +2,25 @@
 //! --test hardware -- --ignored` (and the dongle plugged in, udev rule
 //! installed, QEMU VM not holding the device).
 //!
-//! Read-only by design: only GET_HEART_INFO is issued here. SET_NOISE is
-//! NOT exercised on hardware by these tests; the state-toggling round trip
-//! lives in tools/capture_set_noise.py with its explicit
-//! restore-and-verify gates.
+//! `open_and_read_heart_info` is read-only (GET_HEART_INFO only). The
+//! Task-4b `set_noise_roundtrip_guarded` DOES exercise SET_NOISE on
+//! hardware, guarded: it restores the original state on every exit path.
 
 use holly_usb::{HollyControl, NusbTransport};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// The single physical dongle must not be claimed twice at once: the test
+/// harness runs tests in parallel threads, and two concurrent IF0 claims
+/// collide with EBUSY (observed 2026-11-05: set_noise_roundtrip_guarded
+/// failed with `interface is busy (errno 16)` while
+/// open_and_read_heart_info held the claim). Poisoning only cascades
+/// within one run; every `cargo test` invocation is a fresh process.
+fn device_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Drop guard (Task 4b): on any exit path — normal return, failed assert,
 /// or panic unwind — poll the device afresh and set NC back to the state it
@@ -71,6 +84,7 @@ impl Drop for NoiseRestoreGuard {
 #[test]
 #[ignore = "mutates device state; run after confirming the dongle is plugged in"]
 fn set_noise_roundtrip_guarded() {
+    let _dev = device_lock(); // serialize: one claim of the dongle at a time
     let mut ctl = HollyControl::open().expect("open + claim IF0");
     let original = ctl.get_heart_info().expect("state poll failed");
     // SAFETY GATE: only proceed on the certified 17-byte payload shape; any
@@ -123,6 +137,7 @@ fn set_noise_roundtrip_guarded() {
 #[test]
 #[ignore = "needs the 3547:0407 dongle plugged in and udev uaccess"]
 fn open_and_read_heart_info() {
+    let _dev = device_lock(); // serialize: one claim of the dongle at a time
     let mut c = HollyControl::open().expect("dongle open+claim IF0");
     let info = c.get_heart_info().expect("GET_HEART_INFO on real wire");
     println!("HeartInfo: {info:#?}");
@@ -135,6 +150,7 @@ fn open_and_read_heart_info() {
 #[test]
 #[ignore = "needs the 3547:0407 dongle plugged in and udev uaccess"]
 fn open_fails_cleanly_without_device() {
+    let _dev = device_lock(); // this test also claims IF0 when the dongle is attached
     // Nothing to assert on the error kind beyond it being produced: when no
     // dongle is present, this must be Error::NotFound, not a panic.
     match HollyControl::open() {
