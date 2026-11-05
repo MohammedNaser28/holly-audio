@@ -63,8 +63,9 @@ pub enum Error {
     /// status shape. The 1-byte `00`-success shape is [wire]
     /// (captures/2026-11-05-set-noise.txt E2/E4); any other length is not
     /// assumed valid — error shapes were never captured (open question 5).
+    /// `raw` is the full 64-byte reply frame as received, for diagnostics.
     #[error("SET ack payload has unexpected length {len} (expected 1 status byte)")]
-    BadAck { len: usize },
+    BadAck { len: usize, raw: [u8; 64] },
 
     /// The device echoed a different command in its reply than was sent —
     /// abort gate from the capture tooling (no retry loop is performed).
@@ -82,9 +83,10 @@ pub enum Error {
     /// (`ProSetNoise.receiveData` treats `data[0] == 0` as success) [code].
     /// NOTE: no error-shaped ack has ever been captured (docs/protocol.md
     /// open question 5) — this variant exists to *not* swallow unobserved
-    /// behavior, not to claim its shape is known.
+    /// behavior, not to claim its shape is known. `raw` is the full 64-byte
+    /// reply frame as received, for diagnostics.
     #[error("device rejected the SET (status {status:#04x})")]
-    Rejected { status: u8 },
+    Rejected { status: u8, raw: [u8; 64] },
 
     /// Device sent a heart-info payload shorter than the app's own gating
     /// would need for the single-TX field set (17 bytes observed on the wire).

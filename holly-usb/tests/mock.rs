@@ -119,7 +119,10 @@ fn set_noise_rejects_nonzero_ack() {
     let mut c = control(mock);
 
     let err = c.set_noise(false).expect_err("nonzero ack must fail");
-    assert!(matches!(err, Error::Rejected { status: 0x01 }), "{err:?}");
+    assert!(
+        matches!(err, Error::Rejected { status: 0x01, .. }),
+        "{err:?}"
+    );
 }
 
 /// ack payload with a length other than 1 is rejected (no shape assumption):

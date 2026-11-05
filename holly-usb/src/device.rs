@@ -55,7 +55,7 @@ impl<T: Transport> HollyControl<T> {
     /// payload; reply payload is parsed with the APK's incremental gates.
     pub fn get_heart_info(&mut self) -> Result<HeartInfo, Error> {
         let request = Frame::new(cmd::GET_HEART_INFO, Vec::new());
-        let reply = self.exchange(request)?;
+        let (reply, _raw) = self.exchange(request)?;
         HeartInfo::from_payload(&reply.payload)
     }
 
@@ -77,11 +77,17 @@ impl<T: Transport> HollyControl<T> {
         // The SET frame's fields derive from this fresh reply only.
         let level = self.get_heart_info()?.noise_level;
         let request = Frame::new(cmd::SET_NOISE, vec![u8::from(enabled), level]);
-        let reply = self.exchange(request)?;
+        let (reply, raw) = self.exchange(request)?;
         match reply.payload.as_slice() {
             [0x00] => Ok(()),
-            [status] => Err(Error::Rejected { status: *status }),
-            other => Err(Error::BadAck { len: other.len() }),
+            [status] => Err(Error::Rejected {
+                status: *status,
+                raw,
+            }),
+            other => Err(Error::BadAck {
+                len: other.len(),
+                raw,
+            }),
         }
     }
 }
@@ -122,22 +128,26 @@ impl<T: Transport> HollyControl<T> {
     /// 2. frame decode validity (holly-proto, APK-exact),
     /// 3. command echo equality (the capture tool's abort gate).
     ///
+    /// Returns the decoded frame AND the untouched raw 64-byte reply (the
+    /// raw copy lets callers attach full-frame diagnostics — e.g. hex
+    /// printing at --verbosity — to gate failures like [`Error::Rejected`]).
+    ///
     /// No retries anywhere: a transport error or gate failure is returned as
     /// `Err` immediately. The three gates replicate the abort-and-stop
     /// behavior of `tools/capture_set_noise.py` (`parse_reply`).
-    fn exchange(&mut self, request: Frame) -> Result<Frame, Error> {
+    fn exchange(&mut self, request: Frame) -> Result<(Frame, [u8; 64]), Error> {
         let buf = request.encode_buf()?;
         self.transport.report_out(&buf)?;
 
-        let reply = self.transport.report_in()?;
-        if reply[..4] != REPLY_HEADER {
+        let raw = self.transport.report_in()?;
+        if raw[..4] != REPLY_HEADER {
             // Not `05 03 BB DD`. Byte 2 decides the abort reason: `AA` means
             // the device echoed our TX direction (never observed on the
             // wire); anything else is an unknown magic — both are aborts
             // (capture tool's parse gate, no retry).
-            return Err(Error::UnknownDirection { found: reply[2] });
+            return Err(Error::UnknownDirection { found: raw[2] });
         }
-        let reply = Frame::decode(&reply)?;
+        let reply = Frame::decode(&raw)?;
         // Decode is direction-agnostic (it validates AA frames' 0xEF tail and
         // BB replies taillessly); the gate above fixed the direction, and
         // this call re-asserts length/shape only.
@@ -147,7 +157,7 @@ impl<T: Transport> HollyControl<T> {
                 want: request.command,
             });
         }
-        Ok(reply)
+        Ok((reply, raw))
     }
 
     /// Borrow the transport (e.g. for tests or byte-level inspection).

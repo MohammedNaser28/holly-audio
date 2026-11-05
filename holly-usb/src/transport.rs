@@ -83,7 +83,7 @@ impl Transport for NusbTransport {
                 SET_TIMEOUT,
             )
             .wait()
-            .map_err(usb_err)?;
+            .map_err(transfer_err)?;
         Ok(())
     }
 
@@ -102,7 +102,7 @@ impl Transport for NusbTransport {
                 GET_TIMEOUT,
             )
             .wait()
-            .map_err(usb_err)?;
+            .map_err(transfer_err)?;
 
         // The device has always answered with the full 64-byte report in both
         // captures [wire]; a short answer is still buffered into the 64-byte
@@ -114,9 +114,36 @@ impl Transport for NusbTransport {
     }
 }
 
-/// Map any nusb device/transfer error into the crate's [`Error::Usb`].
-pub(crate) fn usb_err(err: impl std::fmt::Debug) -> std::io::Error {
-    std::io::Error::other(format!("{err:?}"))
+/// Map a nusb operation (non-transfer) error into an [`std::io::Error`],
+/// PRESERVING its [`nusb::ErrorKind`] as far as std carries a matching kind —
+/// callers (e.g. holly-cli's exit-code mapping) need to tell a
+/// PermissionDenied (missing udev rule) apart from a Busy (device held).
+pub(crate) fn usb_err(err: nusb::Error) -> std::io::Error {
+    // ErrorKind is #[non_exhaustive], hence the catch-all arm.
+    let kind = match err.kind() {
+        nusb::ErrorKind::Disconnected => std::io::ErrorKind::NotConnected,
+        nusb::ErrorKind::Busy => std::io::ErrorKind::ResourceBusy,
+        nusb::ErrorKind::PermissionDenied => std::io::ErrorKind::PermissionDenied,
+        nusb::ErrorKind::NotFound => std::io::ErrorKind::NotFound,
+        nusb::ErrorKind::Unsupported => std::io::ErrorKind::Unsupported,
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, format!("{err}"))
+}
+
+/// Map a transfer-level error (control endpoints return these) into an
+/// [`std::io::Error`]. TransferError carries no errno, so kinds are preserved
+/// only where they are trustworthy (`Disconnected`, `InvalidArgument`);
+/// everything else lands on `Other` with the variant name in the message
+/// (e.g. `Cancelled` covers both cancellation and timeout, per nusb docs).
+pub(crate) fn transfer_err(err: nusb::transfer::TransferError) -> std::io::Error {
+    // TransferError is #[non_exhaustive] too.
+    let kind = match err {
+        nusb::transfer::TransferError::Disconnected => std::io::ErrorKind::NotConnected,
+        nusb::transfer::TransferError::InvalidArgument => std::io::ErrorKind::InvalidInput,
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, format!("{err:?}"))
 }
 
 #[derive(Debug, Default)]
