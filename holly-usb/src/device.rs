@@ -98,7 +98,7 @@ impl HollyControl<NusbTransport> {
     /// this crate does; the UAC interfaces are untouched.
     ///
     /// Requires write access to the `/dev/bus/usb` node — install
-    /// `packaging/70-hollyland.rules` (MODE 0660 + uaccess) so this works
+    /// `packaging/70-hollyland.rules` (MODE 0666, `ae709d6`) so this works
     /// without root.
     pub fn open() -> Result<Self, Error> {
         for info in nusb::list_devices()
@@ -109,8 +109,17 @@ impl HollyControl<NusbTransport> {
                 continue;
             }
             let device = info.open().wait().map_err(crate::transport::usb_err)?;
+            // detach_and_claim (not plain claim): a FRESH enumeration lets the
+            // kernel probe IF0 with usbhid (observed 2026-11-05 after replug,
+            // `lsusb -t`: If0 Driver=usbhid → errno 16 BUSY on claim). nusb's
+            // detach path uses USBDEVFS_DISCONNECT_CLAIM with
+            // EXCEPT_DRIVER("usbfs") — it detaches the kernel driver *but*
+            // still fails with the same errno-16 BUSY when another usbfs
+            // userspace holder keeps IF0, which is exactly the parallel-
+            // claim signal holly-app classifies (`classify_claim`).
+            // Drop reattaches the kernel driver (see type-level doc).
             let iface = device
-                .claim_interface(CONTROL_IFACE)
+                .detach_and_claim_interface(CONTROL_IFACE)
                 .wait()
                 .map_err(crate::transport::usb_err)?;
             return Ok(Self::new(NusbTransport::new(iface, CONTROL_IFACE)));

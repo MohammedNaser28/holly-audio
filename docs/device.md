@@ -117,6 +117,37 @@ First live GET/SET round-trips through holly-usb/nusb (the
   do", post-restore switch `true`. **The Task-1 SET_NOISE [wire] vector
   is now exercised by the crate itself on the real wire.**
 
+## Kernel-driver claim fix (2026-11-05, post-replug)
+
+After a physical replug the kernel re-probes IF0 and binds **usbhid**
+(`lsusb -t`: `If 0 … Driver=usbhid`), so the previous sessions' implicit
+assumption "IF0 has no kernel driver" breaks: a plain
+`USBDEVFS_CLAIMINTERFACE` fails with **EBUSY, errno 16**
+("interface is busy") — holly-app classifies that as `Busy`. The earlier
+tooling (`tools/probe_hearinfo.py`, `tools/capture_set_noise.py`) claims
+via `USBDEVFS_DISCONNECT_CLAIM` and never reattaches on exit, which is why
+every pre-replug session saw `driver=NONE` [observed, this document's
+crash section].
+
+Fix (holly-usb `HollyControl::open`): the claim now uses nusb
+`Device::detach_and_claim_interface` (nusb 0.2.9 `src/device.rs:103` →
+`platform/linux_usbfs/usbfs.rs`: `USBDEVFS_DISCONNECT_CLAIM` with
+`USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER` + driver "usbfs"). Semantics:
+- kernel driver (usbhid) is detached in one shot for our claim;
+- an existing *usbfs* (another userspace program holding IF0) is NEVER
+  stolen — the ioctl still returns errno 16 (`ErrorKind::Busy`), which
+  keeps the parallel-claim/Busy-classification behavior identical;
+- Drop path reattaches the usbhid driver
+  (`LinuxInterface::drop`: release + attach, cited in holly-usb's
+  type-level docs).
+
+Observed after the fix: the replugged dongle (bus node `006/003`) claims
+cleanly as the user, GET succeeds (`Noise cancel: on (level 1)` — see
+`captures/2026-11-05-noise-level-medium.txt`), and `holly-cli status`
+from a second process still reports busy cleanly while the first holds
+the claim.
+
+
 ## Device access (udev rule)
 
 Non-root claiming of IF0 needs write access to the dongle's
