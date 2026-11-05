@@ -46,6 +46,77 @@ are invented; numbers come straight from that dump.
 - User has NOT confirmed the marketing model name; treat "6108" as the working
   internal name.
 
+## Crash behavior (observed 2026-11-05, `tools/crash_test.sh` stdout)
+
+Question: if a process holding the IF0 claim dies with SIGKILL (no Drop
+handler, no usbfs RELEASE ioctl), does the kernel restore the interface so
+the next process can claim it, and does the audio stack survive?
+
+Observed, quoted from the script run (probe =
+`holly-usb/examples/claim_and_sleep`, one GET then sleep:
+
+```text
+--- DURING claim (should show IF0 WITHOUT usbhid) ---
+6-1:1.0                driver=usbfs        # kernel shows the claim
+6-1:1.1                driver=snd-usb-audio
+6-1:1.2                driver=snd-usb-audio
+6-1:1.3                driver=NONE
+
+killed probe with SIGKILL (no Drop handler ran)
+
+--- AFTER SIGKILL (task: does usbhid come back to IF0? audio still bound?) ---
+6-1:1.0                driver=NONE         # usbfs gone, nothing rebound
+6-1:1.1                driver=snd-usb-audio
+6-1:1.2                driver=snd-usb-audio
+6-1:1.3                driver=NONE         # unchanged
+```
+
+- **IF0 DURING the claim: `driver=usbfs`** — the kernel marks a claimed
+  interface as usbfs; this is the normal, expected state for HID-class
+  interfaces driven by userspace (there is no kernel HID driver on IF0 in
+  the idle state either, see the BEFORE note below).
+- **IF0 AFTER the SIGKILL: `driver=NONE`** — the dead process's claim was
+  cleaned up by the kernel and *no* driver rebound to the interface.
+  Consequences for us: a crashed process leaves a clean (unclaimed)
+  interface, so the next holly-usb session can claim it — but nothing
+  re-arms usbhid for the device, matching the idle baseline where IF0 and
+  IF3 both had no kernel driver (`6-1:1.0 driver=NONE`,
+  `6-1:1.3 driver=NONE` in this same run's BEFORE section; IF0 had NONE
+  also in the very first (partial, sudo-cut) run the same day).
+- **The audio stack was untouched by the crash, in all three phases**:
+  `snd-usb-audio` stayed bound to IF1/IF2 BEFORE, DURING, and AFTER; ALSA
+  still listed `card 2: Microphone [Wireless Microphone] (USB Audio)`
+  with its capture subdevice; PipeWire kept
+  `alsa_input.usb-Shenzhen_Hollyland_Technology_Co._Ltd_Wireless_Microphone_
+  Wireless_Microphone-01.analog-stereo` alive before and after the kill.
+- The audio stack was also untouched by *claiming* IF0: DURING the
+  controlled claim, accept for IF0's usbfs binding, all audio bindings
+  and devices stayed as in BEFORE. Claiming IF0 does not disturb IF1/IF2.
+
+Not asserted (needs evidence): whether a device-node fd left node
+permissions (0666 rule) after the kill; none of the checks compare that
+state. Also not re-verified by this script: an actual *re-claim* by a
+new process after the SIGKILL — the guarded hardware test runs before
+the script in its chain and claims cleanly, but an explicit
+claim-after-kill step is not in the script.
+
+## Hardware session notes (2026-11-05)
+
+First live GET/SET round-trips through holly-usb/nusb (the
+`holly-usb --ignored` tests, all 3 green):
+
+- `open_and_read_heart_info`: live GET through nusb; reply parsed into
+  the certified §5 shape, 17 bytes, multi-TX fields all `None`:
+  `tx1 off, tx2 on, tx2 battery 76 → 75` (drift between runs, matches
+  `docs/protocol.md` §5), `nc on level 0`, `voice 3/0`,
+  `shutdown 0`, `light on, eq 3`, `reverb off level 2`, `signal 0`.
+- `set_noise_roundtrip_guarded`: GET → NC `on=true level=0`;
+  SET off; fresh GET shows `nc off`; SET on; fresh GET returns
+  `nc on level 0` with the level byte unchanged; the drop guard's own
+  fresh GET logged "NC already at original state (true), nothing to
+  do", post-restore switch `true`. **The Task-1 SET_NOISE [wire] vector
+  is now exercised by the crate itself on the real wire.**
+
 ## Open questions (to resolve in Phase 2, evidence required)
 
 | Question | How it will be answered |
