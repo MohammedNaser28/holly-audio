@@ -7,7 +7,19 @@
 # claims anything itself, never sends SET_NOISE, and never unbinds drivers.
 #
 # Usage:  tools/crash_test.sh          (dongle plugged in; no VM passthrough)
+#
+# Run WITHOUT sudo: the probe binary needs only the udev-rule grant
+# (packaging/99-hollyland.rules) and cargo must run as the invoking user —
+# rustup has no toolchain configured for root. If accidentally started as
+# root, the script re-execs itself as the original user instead of failing
+# late at `cargo build` (observed 2026-11-05: rustup "no default toolchain").
 set -u
+
+# Re-exec as the invoking user when started via sudo.
+if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+    echo "(started as root — re-executing as '$SUDO_USER': cargo must run as the user)"
+    exec sudo -u "$SUDO_USER" "$0" "$@"
+fi
 
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -37,19 +49,27 @@ print_state() {
             "$( [ -e "$if/driver" ] && basename "$(readlink "$if/driver")" || echo NONE )"
     done
     echo -n "bus node: "
-    found=""
-    for node in /dev/bus/usb/*/*; do
-        # read VID/PID straight from the node descriptor (offsets 8,9)
-        vid=$(( 16#$(dd if="$node" bs=1 skip=8 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n') ))
-        pid=$(( 16#$(dd if="$node" bs=1 skip=10 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n') ))
-        # VID 0x3547 = 13639 decimal, PID 0x0407 = 1031 decimal (inputs/lsusb-v.txt)
-        [ "$vid" = "13639" ] && [ "$pid" = "1031" ] && found="$node"
-    done
-    echo "${found:-NONE}"
+    # sysfs busnum/devnum are plain decimals; the node path is zero-padded
+    # (/dev/bus/usb/006/001). (Previous dd-over-descriptor walk printed NONE
+    # when the reader lacked descriptor access — sysfs files always readable.)
+    busnum="$(cat "$dev/busnum" 2>/dev/null || true)"
+    devnum="$(cat "$dev/devnum" 2>/dev/null || true)"
+    if [ -n "$busnum" ] && [ -n "$devnum" ]; then
+        printf '/dev/bus/usb/%03d/%03d\n' "$busnum" "$devnum"
+    else
+        echo "NONE (no busnum/devnum in sysfs)"
+    fi
     echo "ALSA capture devices (arecord -l):"
     arecord -l 2>&1 | sed 's/^/    /'
     echo "PipeWire sources matching holly/Hollyland:"
-    pactl list sources 2>/dev/null | grep -iE '"?[a-z ]*holly' | sed 's/^/    /' || echo "(no PipeWire match / not running)"
+    # NOTE: `grep | sed || echo` never reached the fallback (grep finds
+    # nothing -> sed still exits 0). Collect first, fall back on emptiness.
+    pw="$(pactl list sources 2>/dev/null | grep -iE 'holly|wireless microphone' | sed 's/^/    /')"
+    if [ -n "$pw" ]; then
+        echo "$pw"
+    else
+        echo "(no PipeWire match / not running)"
+    fi
     echo
 }
 
