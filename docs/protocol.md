@@ -218,6 +218,43 @@ GET — holly-usb's level write path is [wire]-certified for the values 1
 and 2 (restore flow to level 0 additionally stays [wire]-certified
 through `set_noise`, which never invents a level).
 
+### 5.1 Phone-side byte map and UI mapping (added after the 3b report)
+
+The app's V2 heart parser reads exactly the bytes our status prints
+[code `ProGetHearInfo.java:50-67`]: `data[6]` = noise switch, `data[7]` =
+noise level, `data[8]` = voice level (battery/mute/light/EQ also at this
+table's offsets; plain `toInt`, no transforms). The phone UI is a pure
+function of the same bytes `holly-cli` prints.
+
+NC level labels are an identity mapping on this product — read path
+[code `HLDevice6302Activity.java:1276/:1791-1793`]: strong = wire 2,
+medium = wire 1, low = wire 0; SET path same identity (`:1593-1594`
+strong, `:1610-1611` medium, `:1627-1629` low — the low press sends `0`
+only when `productId == 1031`, ours [code `:416`]). So "phone shows
+medium" and "wire byte 1" are the same statement. Caveat: the phone
+also calls `updateNoiseView(n, true)` locally ON PRESS, before any
+device ack (optimistic), and later heart frames (one per second)
+re-derive it from `data[7]` — so a just-pressed phone screen can lead
+the actual device state for a second. holly-app never renders
+unacked/unobserved state, by design.
+
+Voice gain rendering: the 6-stop bar works in a 0-based index space
+(default `totalCount = 6` [code `CustomScaleSeekBar.java:72`], touch →
+`coerceIn(0..5)`), but draws the numerals 1..6 — `i3++` before
+`drawText(String.valueOf(i3))` [code `CustomScaleSeekBar.java:177-178`]
+— so the phone's on-screen "4" is index 3. Draw and press paths both
+use the raw index: `onIndexChanged(i)` → `setVoice(i)` [code
+`HLDevice6302Activity.java:583-587/:840-846`], and heart read →
+`setSelectIndex(voiceLevel)` [code `:1283`]. Session 3b read
+`voiceLevel = 03` [wire] while the user's phone showed stop "4":
+display-space +1 over the same byte.
+
+Value path of the gain press (view layer, NOT wire-exercised):
+`setVoice(index)` → `ProSetVoiceLevel`, cmd 3, single payload value,
+ack `[]→status==0` [code `ProSetVoiceLevel.java:15-27`]. cmd 3 stays
+forbidden for us until a phone-driven gain change is captured on our
+wire (Option-B: GET-only watch while the user moves the bar).
+
 ## 6. Provenance note
 
 Consumer crates in this workspace:
