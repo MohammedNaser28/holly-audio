@@ -7,6 +7,20 @@ infrastructure that comes after that. Nothing here may be built without the
 evidence named in its own section — the repo rule ("no guessed constants;
 every cite") applies to the GUI exactly like every other layer.
 
+## 0a. Frontend baseline update (2026-11-05)
+
+- Signal theme tokens are centralized in `frontends/gpui/src/main.rs` (design
+  spec §5: background `#111318` … error `#DF7777`); header gained the HOLLY +
+  subtitle + connection badge row, footer gained `state received HH:MM:SS
+  (UTC)` (from `Snapshot.received_at`, change-gated so the emit contract stays
+  change-only) + crate version. Window 760×620.
+- `--demo` mode: `holly_app::demo::start_demo()` runs the real actor over the
+  scripted `DemoDevice` (certified session-3 payload); UI marks it via title
+  suffix, header chip, and footer note. Build/run/tests: `frontends/gpui/README.md`.
+- NC level buttons keep the identity mapping committed today
+  (docs/protocol.md §5.1: strong = wire 2, medium = wire 1, low = wire 0;
+  the phone's numerals 1..6 concern the voice bar, not NC).
+
 ## 0. The v1 baseline (what exists and why it is legal)
 
 - Only two operations are ever sent [wire]:
