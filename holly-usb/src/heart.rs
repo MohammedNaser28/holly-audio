@@ -14,6 +14,11 @@ const SINGLE_TX_FIELDS: usize = 17;
 
 /// Status snapshot from `cmd 31 (GET_HEART_INFO)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "snake_case")
+)]
 pub struct HeartInfo {
     pub tx1_status: bool,
     pub tx2_status: bool,

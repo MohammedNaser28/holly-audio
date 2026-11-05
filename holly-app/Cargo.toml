@@ -1,0 +1,12 @@
+[package]
+name = "holly-app"
+version.workspace = true
+edition.workspace = true
+description = "UI-agnostic device actor over holly-usb: state machine, snapshots, view-model"
+
+[dependencies]
+holly-usb = { path = "../holly-usb", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

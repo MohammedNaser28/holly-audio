@@ -8,6 +8,12 @@ description = "Hollyland 6108 USB control transport (nusb) — certified SET/GET
 holly-proto = { path = "../holly-proto" }
 nusb = "0.2.9"
 thiserror = "2"
+# Optional: only consumers that serialize device state (holly-app's
+# Snapshot) turn this on; the transport itself stays dependency-free.
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
 
 [dev-dependencies]
 # none: mock transport is in-crate so CI tests need no extra deps
