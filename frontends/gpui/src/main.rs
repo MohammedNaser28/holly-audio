@@ -29,9 +29,9 @@ use std::thread;
 
 use futures::{StreamExt, channel::mpsc::unbounded};
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, KeyBinding,
-    Render, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
-    rgb, size,
+    App, Application, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, FontWeight,
+    KeyBinding, Render, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
+    prelude::*, px, rgb, size,
 };
 use holly_app::DeviceHandle;
 use holly_app::NoiseWrite;
@@ -42,30 +42,70 @@ actions!(
     [ToggleNoise, NcLow, NcMedium, NcStrong, Refresh, Quit]
 );
 
-// ---- presentation palette --------------------------------------------------
-// Presentation-only colors: no device meaning, chosen here (the VM exposes
-// classes, not colors). Dark scheme to match the project's other UIs.
-const COL_BG: u32 = 0x14161d;
-const COL_PANEL: u32 = 0x1e222c;
-const COL_PANEL_DIM: u32 = 0x1a1d25;
-const COL_BORDER: u32 = 0x2a2f3a;
-const COL_TEXT: u32 = 0xd8dee9;
-const COL_MUTED: u32 = 0x8892a4;
-const COL_ACCENT: u32 = 0x5b9dd9;
-const COL_PENDING: u32 = 0xd19a66;
-const COL_ERROR: u32 = 0x8c3840;
-const COL_ERROR_TEXT: u32 = 0xf0a4ab;
-const COL_WARN: u32 = 0x6e5320;
-const COL_WARN_TEXT: u32 = 0xe5c07b;
+// ---- Signal theme tokens ----------------------------------------------------
+// Presentation-only: exact hex from the design spec (§5 "Signal"), centralized
+// here — components must not scatter hex values (tokens rule). No device
+// meaning; the VM exposes classes/strings, the UI maps them to tokens.
+//   background; surface = recessed rows/buttons; elevated = cards.
+const COL_BG: u32 = 0x111318;
+const COL_SURFACE: u32 = 0x191d25;
+const COL_ELEVATED: u32 = 0x222833;
+const COL_BORDER: u32 = 0x303744;
+const COL_TEXT: u32 = 0xe8ebf0;
+const COL_MUTED: u32 = 0x929baa;
+const COL_ACCENT: u32 = 0x83a9e8;
+/// Semantic: success = connected/healthy battery; warning = pending ops/low
+/// battery/permission+busy banners; error = error banner/critical battery.
+const COL_SUCCESS: u32 = 0x65b891;
+const COL_WARNING: u32 = 0xe5b765;
+const COL_ERROR: u32 = 0xdf7777;
 
 fn battery_color(class: BatteryClass) -> gpui::Hsla {
+    // Spec mapping: Full/High → success green, Low → amber, Critical → red.
     rgb(match class {
-        BatteryClass::Full => 0x98c379,
-        BatteryClass::High => 0xb5bd68,
-        BatteryClass::Low => 0xe5c07b,
-        BatteryClass::Critical => 0xe06c75,
+        BatteryClass::Full | BatteryClass::High => COL_SUCCESS,
+        BatteryClass::Low => COL_WARNING,
+        BatteryClass::Critical => COL_ERROR,
     })
     .into()
+}
+
+/// Per-TX battery line. Rule (spec §7c): a disconnected/unverifiable
+/// transmitter shows an explicit unavailable state — never a decoded 0 %
+/// (the heart's zero byte on a dead link is device padding, not 0 percent).
+/// Pure + unit-tested.
+fn battery_text(tx: &TxVm) -> String {
+    if tx.connected {
+        format!("battery {} % ({:?})", tx.battery, tx.battery_class)
+    } else {
+        "battery — (unavailable)".to_string()
+    }
+}
+
+/// Header badge state, decided ONLY from what the VM carries (banner kind +
+/// whether the connecting hint is active). Connected never invents itself: it
+/// is the state when the actor stopped showing any banner or searching text.
+/// Pure + unit-tested. Returns (label, token).
+fn conn_badge(vm: &ViewModel) -> (&'static str, u32) {
+    match &vm.banner {
+        Some(Banner::Error) => ("error", COL_ERROR),
+        Some(Banner::PermissionDenied) | Some(Banner::Busy) => ("blocked", COL_WARNING),
+        Some(Banner::NotFound) => ("no device", COL_MUTED),
+        None if vm.banner_text.is_some() => ("connecting", COL_ACCENT),
+        None => ("connected", COL_SUCCESS),
+    }
+}
+
+/// `HH:MM:SS` in UTC from integer UNIX seconds — std-only (no chrono, no
+/// local timezone: the stamp is an actor-side wall clock; UTC display is
+/// explicit and honest). `None` (no successful GET yet) renders a dash.
+/// Pure + unit-tested.
+fn utc_hms(updated: Option<u64>) -> String {
+    let Some(secs) = updated else {
+        return "—".to_string();
+    };
+    let d = secs % 86_400;
+    format!("{:02}:{:02}:{:02}", d / 3600, d % 3600 / 60, d % 60)
 }
 
 fn onoff(on: bool) -> &'static str {
@@ -125,11 +165,14 @@ fn toggle_target(pending: Option<NoiseWrite>, state: Option<bool>) -> Option<boo
     }
 }
 
-/// One window model; the whole app for v1.
+/// One window model; the whole app for v1. `demo` = scripted-device mode,
+/// decided ONCE in `main` (--demo); it only ever changes presentation
+/// (chip/title/footer note), never behavior and never the device API surface.
 struct AppModel {
     focus: FocusHandle,
     vm: ViewModel,
     device: DeviceHandle,
+    demo: bool,
 }
 
 impl AppModel {
@@ -177,26 +220,67 @@ impl AppModel {
         self.device.refresh();
     }
 
+    /// Header per spec §7a: name + subtitle (+ DEMO chip when demo mode) on
+    /// the first line, the connection badge on the right, key hints as a
+    /// second quiet line. Badge color/label from [`conn_badge`] (pure,
+    /// VM-only), DEMO chip = warning token on bg text (amber = "be aware"),
+    /// never hidden (explicit mock/hardware separation).
     fn render_header(&mut self) -> gpui::Div {
+        let (badge_label, badge_color) = conn_badge(&self.vm);
         div()
             .flex()
-            .justify_between()
-            .items_center()
-            .child("Hollyland 6108 — control surface")
+            .flex_col()
+            .gap_2()
             .child(
-                div().text_color(rgb(COL_MUTED)).child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child("HOLLY"))
+                            .child(
+                                div()
+                                    .text_color(rgb(COL_MUTED))
+                                    .text_sm()
+                                    .child("Wireless Audio Controller"),
+                            )
+                            .children(self.demo.then(|| {
+                                div()
+                                    .px_2()
+                                    .rounded_md()
+                                    .bg(rgb(COL_WARNING))
+                                    .text_color(rgb(COL_BG))
+                                    .child("DEMO")
+                            })),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .rounded_md()
+                            .text_color(rgb(badge_color))
+                            .child(badge_label),
+                    ),
+            )
+            .child(
+                div().text_color(rgb(COL_MUTED)).text_sm().child(
                     "space: toggle NC · 1/2/3: low/medium/strong · r: reconnect · ctrl+q: quit",
                 ),
             )
     }
 
     /// Device-rule banner straight from the VM (vm.rs owns these strings).
+    /// Token mapping: error → red, permission/busy → amber, not-found stays
+    /// quiet (muted) — backgrounds stay on `SURFACE`, only the border and
+    /// text carry the semantic token (spec: no invented hex here).
     fn render_banner(&mut self) -> Option<gpui::Div> {
         let banner = self.vm.banner.clone()?;
-        let (bg, fg) = match banner {
-            Banner::Error => (COL_ERROR, COL_ERROR_TEXT),
-            Banner::PermissionDenied => (COL_WARN, COL_WARN_TEXT),
-            Banner::Busy => (COL_WARN, COL_WARN_TEXT),
+        let (border, fg) = match banner {
+            Banner::Error => (COL_ERROR, COL_ERROR),
+            Banner::PermissionDenied | Banner::Busy => (COL_WARNING, COL_WARNING),
             Banner::NotFound => (COL_BORDER, COL_MUTED),
         };
         Some(
@@ -205,8 +289,8 @@ impl AppModel {
                 .py_3()
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(bg))
-                .bg(rgb(bg))
+                .border_color(rgb(border))
+                .bg(rgb(COL_SURFACE))
                 .child(
                     div()
                         .text_color(rgb(fg))
@@ -252,8 +336,10 @@ impl AppModel {
         let decision = level_button(level, &self.vm.nc);
         let (border, bg) = match decision {
             LevelBtn::Active => (COL_ACCENT, COL_ACCENT),
-            LevelBtn::Pending => (COL_PENDING, COL_PANEL_DIM),
-            LevelBtn::Idle => (COL_BORDER, COL_PANEL_DIM),
+            // Pending = amber border on surface (semantic token, no invented
+            // hex); Idle = quiet border on surface.
+            LevelBtn::Pending => (COL_WARNING, COL_SURFACE),
+            LevelBtn::Idle => (COL_BORDER, COL_SURFACE),
         };
         // Text stays readable on the active accent background.
         let fg = match decision {
@@ -296,11 +382,11 @@ impl AppModel {
         let state = self.vm.nc.state;
 
         let (border, bg) = if !enabled {
-            (COL_BORDER, COL_PANEL_DIM)
+            (COL_BORDER, COL_SURFACE)
         } else if pending.is_some() {
-            (COL_PENDING, COL_PANEL_DIM)
+            (COL_WARNING, COL_SURFACE)
         } else {
-            (COL_ACCENT, COL_PANEL)
+            (COL_ACCENT, COL_ELEVATED)
         };
 
         let level = self.vm.nc.level;
@@ -373,14 +459,14 @@ impl AppModel {
             .px_4()
             .py_2()
             .rounded_md()
-            .bg(rgb(COL_PANEL))
+            .bg(rgb(COL_ELEVATED))
             .border_1()
             .border_color(rgb(COL_BORDER))
             .child(div().child(left))
             .child(
                 div()
                     .text_color(battery_color(tx.battery_class))
-                    .child(format!("battery {} % ({:?})", tx.battery, tx.battery_class)),
+                    .child(battery_text(tx)),
             )
     }
 
@@ -408,7 +494,7 @@ impl AppModel {
                 .px_4()
                 .py_2()
                 .rounded_md()
-                .bg(rgb(COL_PANEL_DIM))
+                .bg(rgb(COL_SURFACE))
                 .border_1()
                 .border_color(rgb(COL_BORDER))
                 .child(div().text_color(rgb(COL_MUTED)).child(format!(
@@ -422,6 +508,29 @@ impl AppModel {
                         .child("writable only after a capture"),
                 ),
         )
+    }
+
+    /// Footer per spec §7f: last successful update + version, subtle. The
+    /// time comes from the VM's `updated` echo (actor-stamped, change-gated:
+    /// it advances when the device confirmed something new). DEMO mode
+    /// prefixes an explicit mock-data note — never passable for hardware.
+    fn render_footer(&mut self) -> gpui::Div {
+        let left = if self.demo {
+            format!(
+                "DEMO — scripted device, no hardware · state received {} (UTC)",
+                utc_hms(self.vm.updated)
+            )
+        } else {
+            format!("state received {} (UTC)", utc_hms(self.vm.updated))
+        };
+        div()
+            .flex()
+            .justify_between()
+            .pt_2()
+            .text_color(rgb(COL_MUTED))
+            .text_sm()
+            .child(left)
+            .child(format!("holly-gpui v{}", env!("CARGO_PKG_VERSION")))
     }
 }
 
@@ -446,15 +555,7 @@ impl Render for AppModel {
             .child(self.render_nc(cx))
             .children(self.render_txs().into_iter().flatten())
             .children(self.render_audio())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .pt_2()
-                    .text_color(rgb(COL_MUTED))
-                    .text_sm()
-                    .child("state changes only when the device reports them (1 s heartbeat, change-only)"),
-            )
+            .child(self.render_footer())
     }
 }
 
@@ -476,8 +577,17 @@ fn main() {
         })
         .detach();
 
-        // The device actor owns the ONLY claim; start() spawns its thread.
-        let device = holly_app::start();
+        // The device actor owns the ONLY claim. `--demo` (explicit flag)
+        // starts the SAME actor over the scripted DemoDevice instead: zero
+        // USB in demo mode, clearly marked in the UI (chip + title + footer).
+        // Discard anything after the flag so arg shapes stay minimal (no
+        // clap in a frontend of this size).
+        let demo = std::env::args().skip(1).any(|a| a == "--demo");
+        let device = if demo {
+            holly_app::demo::start_demo()
+        } else {
+            holly_app::start()
+        };
         let rx = device.subscribe();
 
         let window = cx
@@ -485,11 +595,15 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                         None,
-                        size(px(620.), px(520.)),
+                        size(px(760.), px(620.)),
                         cx,
                     ))),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Hollyland 6108".into()),
+                        title: Some(if demo {
+                            "HOLLY — DEMO".into()
+                        } else {
+                            "HOLLY".into()
+                        }),
                         ..Default::default()
                     }),
                     app_id: Some("holly-gpui".to_string()),
@@ -503,6 +617,7 @@ fn main() {
                             focus,
                             vm: ViewModel::default(),
                             device,
+                            demo,
                         }
                     })
                 },
@@ -543,8 +658,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{LevelBtn, NoiseWrite, level_button, toggle_target};
-    use holly_app::vm::NcVm;
+    use super::{
+        LevelBtn, NoiseWrite, battery_text, conn_badge, level_button, toggle_target, utc_hms,
+    };
+    use holly_app::vm::{Banner, BatteryClass, NcVm, TxVm, ViewModel};
     /// The toggle's entire decision logic, exercised on all pending/state
     /// combinations. Disabled whenever no verified state exists; pending
     /// (actor-reported in-flight SET) wins over the displayed state, which
@@ -632,5 +749,83 @@ mod tests {
             LevelBtn::Active,
             "device-reported odd level shows as active (read truth) — press path blocks via set_nc_level"
         );
+    }
+
+    fn blank_vm() -> ViewModel {
+        ViewModel {
+            banner: None,
+            banner_text: None,
+            tx1: None,
+            tx2: None,
+            tx3: None,
+            tx4: None,
+            nc: NcVm {
+                state: None,
+                level: None,
+                pending: None,
+                last_error: None,
+            },
+            voice_level: None,
+            eq_level: None,
+            reverb: None,
+            updated: Some(0),
+        }
+    }
+
+    fn tx(connected: bool, battery: u8, class: BatteryClass) -> TxVm {
+        TxVm {
+            connected,
+            battery,
+            battery_class: class,
+            muted: false,
+        }
+    }
+
+    /// Battery line (spec §7c): a disconnected transmitter must NOT render a
+    /// 0 % figure — the heart's zero on a dead link is padding, not percent.
+    #[test]
+    fn battery_text_shows_unavailable_when_disconnected() {
+        let live = tx(true, 93, BatteryClass::High);
+        assert_eq!(battery_text(&live), "battery 93 % (High)");
+        // Even with device-decoded "0 % (Critical)" bytes on a dead link:
+        let dead = tx(false, 0, BatteryClass::Critical);
+        assert_eq!(battery_text(&dead), "battery — (unavailable)");
+    }
+
+    /// Header badge: decided only from VM state; boundary arms on both ends.
+    #[test]
+    fn conn_badge_matrix() {
+        // Connected = no banner AND no searching text, nothing invented.
+        assert_eq!(conn_badge(&blank_vm()), ("connected", super::COL_SUCCESS));
+
+        let mut connecting = blank_vm();
+        connecting.banner_text = Some("searching for the dongle…".to_string());
+        assert_eq!(conn_badge(&connecting), ("connecting", super::COL_ACCENT));
+
+        let mut nf = blank_vm();
+        nf.banner = Some(Banner::NotFound);
+        assert_eq!(conn_badge(&nf), ("no device", super::COL_MUTED));
+
+        let mut busy = blank_vm();
+        busy.banner = Some(Banner::Busy);
+        assert_eq!(conn_badge(&busy), ("blocked", super::COL_WARNING));
+        let mut denied = blank_vm();
+        denied.banner = Some(Banner::PermissionDenied);
+        assert_eq!(conn_badge(&denied), ("blocked", super::COL_WARNING));
+
+        let mut err = blank_vm();
+        err.banner = Some(Banner::Error);
+        assert_eq!(conn_badge(&err), ("error", super::COL_ERROR));
+    }
+
+    /// UTC HH:MM:SS from the actor's UNIX-second stamp, std-only (day
+    /// boundary irrelevant); no successful GET yet → an explicit dash.
+    #[test]
+    fn utc_hms_boundaries() {
+        assert_eq!(utc_hms(None), "—");
+        assert_eq!(utc_hms(Some(0)), "00:00:00");
+        assert_eq!(utc_hms(Some(3725)), "01:02:05");
+        assert_eq!(utc_hms(Some(86_399)), "23:59:59");
+        assert_eq!(utc_hms(Some(86_499)), "00:01:39", "wraps at midnight");
     }
 }
