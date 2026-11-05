@@ -1,5 +1,7 @@
 # Build artifacts
 /target/
+# gpui frontend is its own workspace (root-excluded) — keep its artifacts out
+/frontends/gpui/target/
 
 # Re-enginering working area: decompiled Hollyland APK output and extracted
 # bundles. NEVER commit — original code only in this repo (hard rule).
