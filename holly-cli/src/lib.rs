@@ -135,7 +135,8 @@ impl From<&Error> for Failure {
             // actionable, points at the repo's own rule file
             line = "permission denied writing /dev/bus/usb — install \
                     packaging/99-hollyland.rules (sudo cp packaging/99-hollyland.rules \
-                    /etc/udev/rules.d/ && sudo udevadm control --reload, then replug)"
+                    /etc/udev/rules.d/ && sudo udevadm control --reload, then replug \
+                    or 'sudo udevadm trigger --action=add /sys/bus/usb/devices/<node>')"
                 .to_string();
         }
         Failure { code, line, detail }
