@@ -7,7 +7,10 @@ infrastructure that comes after that. Nothing here may be built without the
 evidence named in its own section — the repo rule ("no guessed constants;
 every cite") applies to the GUI exactly like every other layer.
 
-## 0a. Frontend baseline update (2026-11-05)
+## 0a. Frontend baseline update (2026-11-05) — SUPERSEDED by §0b
+
+> The views described here were replaced by the 0b rebuild; the VM/actor/demo
+> facts below still hold. Kept for history.
 
 - Signal theme tokens are centralized in `frontends/gpui/src/main.rs` (design
   spec §5: background `#111318` … error `#DF7777`); header gained the HOLLY +
@@ -20,6 +23,47 @@ every cite") applies to the GUI exactly like every other layer.
 - NC level buttons keep the identity mapping committed today
   (docs/protocol.md §5.1: strong = wire 2, medium = wire 1, low = wire 0;
   the phone's numerals 1..6 concern the voice bar, not NC).
+
+## 0b. Frontend rebuilt on the design contract (2026-11-06, commit `5e17670`)
+
+The gpui views are now the px-exact "graphite and tungsten" build of
+`docs/design/index.html`; commit `5e17670` (theme `0e42c35`, fonts
+`6149c58`):
+
+- Token set CLOSED in `frontends/gpui/src/theme.rs` (0xRRGGBB + contrast
+  tests); every reference value maps through the table in
+  `frontends/gpui/README.md` (nearest-token rule documented, e.g.
+  `#0B0C0E`→WELL, `#3A3F47`→LINE). Fonts: Hanken Grotesk
+  300/400/500/600 register before the first window (`fonts.rs`).
+- Window 1080×760 (also the minimum), client-drawn titlebar
+  (`WindowDecorations::Client`; drag + close handled in-view), footer keeps
+  LED + status word + VID:PID (the timestamp row is gone — §6's checklist
+  below updated accordingly).
+- Demo words stay `connected|pending|busy` (§0a's `--demo` note): unknown
+  words are usage errors (`exit(2)`).
+- Every non-NC control is read-only BY DEFAULT (`WRITABLE.*: false`) and
+  renders the honest unknown state: full opacity, NO selection, no click
+  handlers. Known read pairs (mic mute words, reverb switch) render their
+  verified value. NC keeps the single pending rule: ANY SET in flight ⇒
+  both rocker and selector ignore picks, pads render the in-flight look
+  ("Applying"), selector dims to 0.5 — decided in pure fns
+  (`nc_write_accepted`, `level_pick`, unit-tested).
+- Status source note (whole frontend): EVERY device byte displayed comes
+  from the GET_HEART_INFO poll (cmd 31, the certified 17-byte shape,
+  `docs/protocol.md` §5 offsets 0-16). No panel has a second wire source —
+  any future control first promotes its HeartInfo field into `ViewModel`
+  as a RAW reading, and only a §1-gated capture turns it into a label
+  mapping + write.
+- Safety notes carried by the new build:
+  - The UI retries nothing (one command = one op through the actor's
+    latest-wins coalescing queue), and never invents a fallback stream or
+    a "write anything" escape (§5 of this file stays absolute).
+  - No mode makes the UI claim more than IF0; IF1/IF2/IF3 remain
+    untouched in every demo and real path, and demo mode opens NO USB
+    handle at all.
+  - Keys/mouse write only through the same per-control gates — keyboard
+    bindings are shortcuts for the same decision functions, never a
+    second decision path.
 
 ## 0. The v1 baseline (what exists and why it is legal)
 
@@ -147,7 +191,64 @@ docs/protocol.md until captured.
   untouchable. Write that conclusion into docs/protocol.md rather than a
   fake control.
 
-### 2.7 Other §4 commands deliberately NOT on the GUI roadmap
+### 2.7 Indicator light — SET_LIGHT cmd 33 / GET cmd 34
+
+- Already wire-READ: HeartInfo offset 11 `lightStatus` is captured in every
+  certified session [wire] at its certified offset, byte INVERTED
+  (`data[11] == 0` = on, `ProGetHearInfo.java:76` [code], docs/protocol.md
+  §5); the VM carries it as `ViewModel.light: Some(bool)` and the receiver
+  panel renders the verified value read-only.
+- Missing evidence: the SET. Payload `[{value}]` per §4 row 33; the
+  decompiled producer exists (`ProSetLight.java` [code]) — but is the SET
+  byte ALSO inverted like the GET? UNDECIDED until the capture.
+- Capture recipe: app → toggle the receiver indicator light off and on,
+  two SET frames each way; THEN the §1 chain, with the guarded hardware
+  test toggling 0→1→0 verifying via GET_LIGHT (34) and fresh GETs.
+- UI after the gate: the toggle writes the same value it just verified;
+  pending rule identical to NC (nothing else becomes interactive).
+
+### 2.8 Schedule power off — SET/GET_SHUTDOWN_TIME cmd 39/40
+
+- Already wire-READ: HeartInfo offset 10 `shutdownTime` [wire],
+  `ProGetHearInfo.java:73` [code]; decompiled producers exist
+  (`ProSetShutdownTime.java`, §4 rows 39/40 [code]).
+- UNDECIDED byte semantics: `[{value}]` — enum index or minutes? The mock's
+  labels are `["15min", "Never"]`; no captured frame links either label to a
+  byte, so the UI renders NO selection today (correct: labels are unmapped).
+- Capture recipe: set "15 min" in the app, then "Never", two SET frames +
+  both GETs; decode value↔label; §1 chain with the guarded test (restore
+  the captured original value; verify via GET_SHUTDOWN_TIME + fresh heart).
+
+### 2.9 Channel mode ("Mono"/"Stereo") — label mapping UNDECIDED
+
+- Candidate wire home: HeartInfo offset 9 `voiceMode`
+  (`ProGetHearInfo.java:70` [code]) with its own SET/GET pair — §4 rows
+  `SET/GET_VOICE_MODE = 1/2`, producers `ProSetVoiceMode.java` /
+  `ProGetVoiceMode.java` [code]; signalMode (HeartInfo offset 16, §4 rows
+  63-65) is a DIFFERENT field and is not touched by this task.
+- UNDECIDED: the byte→label mapping. The mock's `["Mono", "Stereo"]` labels
+  have no captured byte value behind them (docs/protocol.md open question
+  4 ranges). If the byte turns out to have MORE steady states than two,
+  the labels stay unmapped and the panel keeps rendering no-selection.
+- Capture recipe: flip the app's channel switch, capture its SET frame +
+  the GET reply + the heart field, twice (one value each); then §1
+  chain with the guarded test (restore original value; verify via
+  GET_VOICE_MODE + fresh heart).
+
+### 2.10 Mic recognition — NO protocol item (decode may dead-end)
+
+- The mock has the toggle; the protocol does NOT: no `Pro*Recognition*`
+  producer name appears in the extracted table, no HeartInfo field is named
+  for it, and offset 15 `txIdentifyStatus` is the identify-beep — do NOT
+  conflate the two.
+- Decode task: grep the decompiled sources for the feature's real name
+  (recognition/voice-assist family); if nothing surfaces, the honest output
+  is a docs/protocol.md note that the feature is app-side (phone ML/DSP),
+  NOT a dongle state — then the panel shows its current unknown-state
+  render permanently, waiting for evidence that never arrives (or the
+  reference gets corrected).
+
+### 2.11 Other §4 commands deliberately NOT on the GUI roadmap
 
 Neither now nor later without a dedicated new task each: SET_DEVICE_REBOOT
 (12), RX/TX_UPGRADE + DFU (26–30), SET_UPGRADE_DEVICE (44), REFRESH_RX
@@ -233,13 +334,20 @@ cargo run --release
 ```
 
 In-round: status panel matches `holly status` output line for line (same
-HeartInfo source); NC toggle click (and `space`) flips the DEVICE state
-with the pending → verified transition visible within ~2 s; banners:
+HeartInfo source); the footer shows the connection LED + status word +
+`VID:PID` (the demo session also adds `· demo`); NC rocker click (or a
+pad click, or `space`/`enter` while the well is focused) flips the DEVICE
+state with the pending look (dimmed pad, "Applying" status word,
+selector at 0.5) visible until the fresh snapshot confirms, within ~2 s
+connected / 20 s pending-demo; banners:
 launch the GUI and run `holly status` in a terminal while the GUI holds
 IF0 — the CLI must report the claim cleanly (Busy classification) and the
 GUI must keep showing the device truth, whatever the arbiter allows;
 unplug with the window open → GUI banner NotFound, replug → auto-
 reconnect to Connected;
+Key sanity: `1/2/3` move the DEVICE level only when NC is verified ON and
+nothing is in flight (level-while-off is intended to be a noop); ctrl-r
+re-opens the device (visible as the connecting flash); ctrl-q quits.
 During: OBS/Audacity recording for a few minutes with the GUI open —
 watch for audio xruns; the GUI touches only IF0 control transfers and
 consumes ~1 frame/s, nothing in the audio path is claimed.
