@@ -42,6 +42,7 @@ actions!(
     [ToggleNoise, NcLow, NcMedium, NcStrong, Refresh, Quit]
 );
 
+mod fonts;
 mod theme;
 
 // ---- Theme bridge (T1) -------------------------------------------------------
@@ -552,6 +553,9 @@ impl Render for AppModel {
             .gap_3()
             .p_4()
             .bg(rgb(COL_BG))
+            // T2: the bundled face for every string (theme::text::FAMILY);
+            // weight/size refinements live on the elements.
+            .font(gpui::font(theme::text::FAMILY))
             .text_color(rgb(COL_TEXT))
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::toggle_nc))
@@ -570,6 +574,9 @@ impl Render for AppModel {
 
 fn main() {
     Application::new().run(|cx: &mut App| {
+        // T2: register the bundled Hanken Grotesk faces before the first
+        // window; failure logs once and falls back to the system sans.
+        fonts::register(cx);
         cx.bind_keys([
             KeyBinding::new("space", ToggleNoise, None),
             KeyBinding::new("1", NcLow, None),
