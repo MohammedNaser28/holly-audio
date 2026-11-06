@@ -38,6 +38,14 @@ pub const HINT_PERMISSION: &str = "Permission denied — install packaging/70-ho
 /// plumbed end-to-end.
 pub const DEVICE_NAME: &str = "Lark A1";
 
+/// Footer device id [code docs/protocol.md:3 — `PRODUCT_6108 = 1031 =
+/// 0x0407 = device PID`, `inputs/lsusb-v.txt`; holly-usb's own NotFound
+/// error words carry the same pair]. holly-usb's VENDOR_ID/PRODUCT_ID are
+/// not re-exported and holly-usb is frozen, so the composition lives here
+/// (the VM stays the only device-adjacent string source views may read);
+/// the test pins it so a probe drift can never sneak in silently.
+pub const VID_PID: &str = "3547:0407";
+
 /// Which controls have a wire-certified SET path. ONE flag per design
 /// control: when a capture lands for a read-only control, flipping its flag
 /// (after the §1 gate in docs/gui-roadmap.md) promotes exactly that control —
@@ -714,5 +722,12 @@ mod tests {
     #[test]
     fn device_name_is_pinned() {
         assert_eq!(DEVICE_NAME, "Lark A1");
+    }
+
+    /// Footer device id pinned the same way as the device name (one source
+    /// in the VM, no view-side literal).
+    #[test]
+    fn vid_pid_is_the_certified_pair() {
+        assert_eq!(VID_PID, "3547:0407");
     }
 }
