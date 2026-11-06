@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Holly tokens reference</title>
+<style>
+@font-face{font-family:'Hanken Grotesk';font-style:normal;font-weight:300;font-display:swap;src:url('fonts/hanken-grotesk-latin-300-normal.woff2') format('woff2')}
+@font-face{font-family:'Hanken Grotesk';font-style:normal;font-weight:400;font-display:swap;src:url('fonts/hanken-grotesk-latin-400-normal.woff2') format('woff2')}
+@font-face{font-family:'Hanken Grotesk';font-style:normal;font-weight:500;font-display:swap;src:url('fonts/hanken-grotesk-latin-500-normal.woff2') format('woff2')}
+@font-face{font-family:'Hanken Grotesk';font-style:normal;font-weight:600;font-display:swap;src:url('fonts/hanken-grotesk-latin-600-normal.woff2') format('woff2')}
+
+body{margin:0;background:#0F1114}
+
+html{background:#08090A}
+body{margin:0;padding:24px;background:#08090A;font-family:'Hanken Grotesk',system-ui,sans-serif}
+.ref-bar{display:flex;gap:16px;align-items:center;margin:0 0 16px;font-size:13px;color:#A3AAB4}
+.ref-bar a{color:#A3AAB4;text-decoration:none;padding:6px 10px;border-radius:6px;border:1px solid #2A2E35}
+.ref-bar a[aria-current=page]{color:#1A1205;background:#FFB547;border-color:#FFB547}
+</style>
+</head>
+<body>
+<nav class="ref-bar"><a href="index.html">window</a><span>Holly theme tokens reference</span></nav>
+<div id="root" style="display:inline-block"></div>
+<template id="tpl"><div style="width:880px;height:640px;box-sizing:border-box;display:flex;flex-direction:column;gap:28px;padding:36px;background:linear-gradient(180deg,#15181C 0%,#0F1114 100%);border:1px solid #2A2E35;border-radius:12px;overflow:hidden;font-family:'Hanken Grotesk',system-ui,sans-serif;color:#ECEEF1">
+
+<div style="display:flex;flex-direction:column;gap:6px">
+<h1 style="margin:0;font-size:30px;font-weight:300;letter-spacing:-.01em">Graphite and tungsten</h1>
+<p style="margin:0;font-size:14px;line-height:1.45;color:#A3AAB4;max-width:560px">A dark faceplate for a piece of audio gear. Surfaces stay quiet; amber is the only colour that asks for attention.</p>
+</div>
+
+<div style="flex:1;min-height:0;display:flex;gap:32px">
+
+<div style="width:250px;flex:none;display:flex;flex-direction:column;gap:18px">
+<div style="display:flex;flex-direction:column;gap:8px">
+<span style="font-size:13px;font-weight:600">Surfaces</span>
+<sc-for list="{{surfaces}}" as="c" hint-placeholder-count="5">
+<div style="display:flex;align-items:center;gap:10px;height:30px">
+<span style="width:24px;height:24px;border-radius:7px;border:1px solid rgba(255,255,255,.14);background:{{c.bg}}"></span>
+<span style="font-size:13px;flex:1">{{c.name}}</span>
+<span style="font-size:12px;color:#7F8793;font-variant-numeric:tabular-nums">{{c.hex}}</span>
+</div>
+</sc-for>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<span style="font-size:13px;font-weight:600">Text</span>
+<sc-for list="{{texts}}" as="c" hint-placeholder-count="3">
+<div style="display:flex;align-items:center;gap:10px;height:30px">
+<span style="width:24px;height:24px;border-radius:7px;border:1px solid rgba(255,255,255,.14);background:{{c.bg}}"></span>
+<span style="font-size:13px;flex:1">{{c.name}}</span>
+<span style="font-size:12px;color:#7F8793;font-variant-numeric:tabular-nums">{{c.hex}}</span>
+</div>
+</sc-for>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<span style="font-size:13px;font-weight:600">Signal</span>
+<sc-for list="{{signals}}" as="c" hint-placeholder-count="4">
+<div style="display:flex;align-items:center;gap:10px;height:30px">
+<span style="width:24px;height:24px;border-radius:7px;border:1px solid rgba(255,255,255,.14);background:{{c.bg}}"></span>
+<span style="font-size:13px;flex:1">{{c.name}}</span>
+<span style="font-size:12px;color:#7F8793;font-variant-numeric:tabular-nums">{{c.hex}}</span>
+</div>
+</sc-for>
+</div>
+</div>
+
+<div style="width:240px;flex:none;display:flex;flex-direction:column;gap:18px">
+<span style="font-size:13px;font-weight:600">Type: Hanken Grotesk</span>
+<div style="display:flex;flex-direction:column;gap:6px;padding-bottom:16px;border-bottom:1px solid #22262C">
+<span style="font-size:64px;font-weight:300;line-height:1;letter-spacing:-.02em;font-variant-numeric:tabular-nums">99<span style="font-size:20px;color:#A3AAB4;letter-spacing:0">%</span></span>
+<span style="font-size:12px;color:#7F8793">Readout. Light 64, tabular figures</span>
+</div>
+<div style="display:flex;flex-direction:column;gap:6px;padding-bottom:16px;border-bottom:1px solid #22262C">
+<span style="font-size:15px;font-weight:600">Noise cancellation</span>
+<span style="font-size:12px;color:#7F8793">Title. Semibold 15</span>
+</div>
+<div style="display:flex;flex-direction:column;gap:6px;padding-bottom:16px;border-bottom:1px solid #22262C">
+<span style="font-size:13px;color:#A3AAB4">Reduces steady background noise.</span>
+<span style="font-size:12px;color:#7F8793">Body. Regular 13</span>
+</div>
+<div style="display:flex;flex-direction:column;gap:6px">
+<span style="font-size:12px;color:#7F8793">Receiver connected</span>
+<span style="font-size:12px;color:#7F8793">Caption. Regular 12</span>
+</div>
+</div>
+
+<div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:18px">
+<div style="display:flex;flex-direction:column;gap:8px">
+<span style="font-size:13px;font-weight:600">Radii</span>
+<sc-for list="{{radii}}" as="r" hint-placeholder-count="5">
+<div style="display:flex;align-items:center;gap:10px;height:28px">
+<span style="width:24px;height:24px;box-sizing:border-box;border:1.5px solid #5A616B;border-radius:{{r.css}}"></span>
+<span style="font-size:13px;flex:1">{{r.name}}</span>
+<span style="font-size:12px;color:#7F8793;font-variant-numeric:tabular-nums">{{r.value}}</span>
+</div>
+</sc-for>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<span style="font-size:13px;font-weight:600">Spacing</span>
+<div style="display:flex;align-items:flex-end;gap:12px">
+<sc-for list="{{spacing}}" as="s" hint-placeholder-count="5">
+<div style="display:flex;flex-direction:column;align-items:flex-start;gap:6px">
+<span style="display:block;width:{{s.w}}px;height:8px;border-radius:2px;background:#A3AAB4"></span>
+<span style="font-size:12px;color:#7F8793;font-variant-numeric:tabular-nums">{{s.v}}</span>
+</div>
+</sc-for>
+</div>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<span style="font-size:13px;font-weight:600">Depth</span>
+<p style="margin:0;font-size:13px;line-height:1.5;color:#A3AAB4">Panels catch light on the top edge and drop a dark line below. Wells sink inward. Only a lit pad glows.</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<span style="font-size:13px;font-weight:600">Colour rule</span>
+<p style="margin:0;font-size:13px;line-height:1.5;color:#A3AAB4">Amber means engaged or needs attention. Green means a live connection. Red means an error. Everything else stays grey.</p>
+</div>
+</div>
+
+</div>
+</div></template>
+<script>
+class DCLogic { constructor(props) { this.props = props || {}; this.state = {}; } }
+</script>
+<script>
+
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      surfaces: [
+        { name: 'Chassis', hex: '#0F1114', bg: '#0F1114' },
+        { name: 'Panel', hex: '#1C1F24 to #15171B', bg: 'linear-gradient(180deg,#1C1F24,#15171B)' },
+        { name: 'Well', hex: '#0A0B0D', bg: '#0A0B0D' },
+        { name: 'Raised', hex: '#262A30', bg: '#262A30' },
+        { name: 'Line', hex: '#2A2E35', bg: '#2A2E35' }
+      ],
+      texts: [
+        { name: 'Primary', hex: '#ECEEF1', bg: '#ECEEF1' },
+        { name: 'Secondary', hex: '#A3AAB4', bg: '#A3AAB4' },
+        { name: 'Tertiary', hex: '#7F8793', bg: '#7F8793' }
+      ],
+      signals: [
+        { name: 'Tungsten', hex: '#FFB547', bg: '#FFB547' },
+        { name: 'Ink on tungsten', hex: '#1A1205', bg: '#1A1205' },
+        { name: 'Live', hex: '#5FD38D', bg: '#5FD38D' },
+        { name: 'Alert', hex: '#FF6B6B', bg: '#FF6B6B' }
+      ],
+      radii: [
+        { name: 'Window', value: '12', css: '12px' },
+        { name: 'Panel', value: '14', css: '14px' },
+        { name: 'Well', value: '26', css: '12px' },
+        { name: 'Pad, outer and inner', value: '14 and 6', css: '12px 12px 4px 4px' },
+        { name: 'Button', value: '8', css: '8px' },
+        { name: 'Selector, outer and segment', value: '12 and 8', css: '12px' },
+        { name: 'Toggle track', value: '13', css: '12px' }
+      ],
+      spacing: [
+        { v: '4', w: 4 }, { v: '8', w: 8 }, { v: '12', w: 12 }, { v: '16', w: 16 }, { v: '20', w: 20 }
+      ]
+    };
+  }
+}
+
+</script>
+<script>
+
+function resolve(path, scope) {
+  const p = path.trim();
+  if (p === 'true') return true;
+  if (p === 'false') return false;
+  const parts = p.split('.');
+  let v = scope[parts[0]];
+  for (let i = 1; i < parts.length && v != null; i++) v = v[parts[i]];
+  return v;
+}
+const HOLE = /\{\{([^}]+)\}\}/g;
+function interp(s, scope) {
+  return s.replace(HOLE, (_, p) => { const v = resolve(p, scope); return v == null ? '' : String(v); });
+}
+function whole(s) { const m = s.match(/^\s*\{\{([^}]+)\}\}\s*$/); return m ? m[1] : null; }
+function raw(node, name, scope) {
+  const s = node.getAttribute(name);
+  if (s == null) return undefined;
+  const w = whole(s);
+  return w !== null ? resolve(w, scope) : interp(s, scope);
+}
+function render(node, scope, out) {
+  if (node.nodeType === 3) { out.appendChild(document.createTextNode(interp(node.nodeValue, scope))); return; }
+  if (node.nodeType !== 1) return;
+  const tag = node.tagName.toLowerCase();
+  if (tag === 'sc-for') {
+    const list = raw(node, 'list', scope) || [];
+    const as = node.getAttribute('as');
+    list.forEach((item, i) => {
+      const s = Object.assign({}, scope, { [as]: item, $index: i });
+      node.childNodes.forEach((c) => render(c, s, out));
+    });
+    return;
+  }
+  if (tag === 'sc-if') {
+    if (raw(node, 'value', scope)) node.childNodes.forEach((c) => render(c, scope, out));
+    return;
+  }
+  const el = node.cloneNode(false);
+  Array.from(el.attributes).forEach((a) => el.removeAttribute(a.name));
+  Array.from(node.attributes).forEach((a) => {
+    if (a.name.startsWith('hint-')) return;
+    const w = whole(a.value);
+    if (w !== null) {
+      const v = resolve(w, scope);
+      if (v === false || v == null) return;
+      el.setAttribute(a.name, v === true && !a.name.startsWith('aria-') ? '' : String(v));
+    } else {
+      el.setAttribute(a.name, interp(a.value, scope));
+    }
+  });
+  node.childNodes.forEach((c) => render(c, scope, el));
+  out.appendChild(el);
+}
+const params = new URLSearchParams(location.search);
+const props = {};
+if (params.get('mode')) props.mode = params.get('mode');
+const vals = new Component(props).renderVals();
+const tpl = document.getElementById('tpl').content;
+const root = document.getElementById('root');
+tpl.childNodes.forEach((c) => render(c, vals, root));
+document.querySelectorAll('[data-mode-link]').forEach((a) => {
+  if ((params.get('mode') || 'connected') === a.dataset.modeLink) a.setAttribute('aria-current', 'page');
+});
+
+</script>
+</body>
+</html>
