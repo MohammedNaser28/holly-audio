@@ -9,11 +9,11 @@
 //! a live connection, red means an error. Everything else stays grey.
 //! Visual reference: docs/design/index.html (states) and docs/design/tokens.html.
 //!
-//! T1 note: the token surface is complete BY DESIGN while the view layer is
-//! still the pre-T3 one; the constants not yet consumed emit dead-code
-//! warnings, so this file carries one scoped allow. It is dissolved in T3,
-//! when every view consumes tokens from here.
-#![allow(dead_code)]
+//! T3 note: the token surface is complete BY DESIGN. The T3 views consume
+//! every live token from here; the few remaining constants carry NARROW
+//! per-item allows with a reason each — they encode reference recipes that
+//! gpui cannot reproduce today or that the wire/videos never expose (see the
+//! reasons inline + frontends/gpui/README.md).
 
 pub mod color {
     // Surfaces
@@ -49,8 +49,15 @@ pub mod color {
     pub const BANNER_TEXT: u32 = 0xC9B38A;
 
     // Translucent recipes: (rgb, alpha)
+    // Inset top-highlight recipes. NOT consumed: gpui 0.2.2 draws only
+    // outset shadows, so the reference's `inset 0 1px 0 rgba(255,255,255,..)`
+    // edges cannot be painted with these numbers (kept as designed token
+    // data — README: unfinished reproductions).
+    #[allow(dead_code, reason = "inset recipes: gpui has no inset shadows")]
     pub const HIGHLIGHT_TOP: (u32, f32) = (0xFFFFFF, 0.06); // 1px top edge of panels
+    #[allow(dead_code, reason = "inset recipes: gpui has no inset shadows")]
     pub const HIGHLIGHT_PAD: (u32, f32) = (0xFFFFFF, 0.08); // top edge of matte pads
+    #[allow(dead_code, reason = "inset recipes: gpui has no inset shadows")]
     pub const HIGHLIGHT_LIT: (u32, f32) = (0xFFFFFF, 0.50); // top edge of lit pad
     pub const DROP_DARK: (u32, f32) = (0x000000, 0.50); // 1px line under panels
     pub const GLOW_TUNGSTEN: (u32, f32) = (0xFFB547, 0.35); // lit pad glow, blur 32
@@ -91,6 +98,13 @@ pub mod metrics {
     pub const TOGGLE_THUMB: f32 = 20.0;
     pub const METER_SEGMENTS: usize = 20; // live mic level
     pub const METER_SEGMENT_HEIGHT: f32 = 14.0;
+    // Peak segment threshold: the meter renders ALWAYS-UNLIT because
+    // HeartInfo exposes no decoded per-mic level (README: unfinished
+    // reproductions); the tungsten-from-here recipe stays as designed data.
+    #[allow(
+        dead_code,
+        reason = "meter always unlit: no wire source for segment levels"
+    )]
     pub const METER_PEAK_FROM: usize = 17; // segments from here up use TUNGSTEN
     pub const SELECTOR_HEIGHT: f32 = 36.0; // NC level selector segment
     pub const SELECTOR_PADDING: f32 = 4.0;
@@ -113,12 +127,30 @@ pub mod text {
     pub const TITLE_SIZE: f32 = 15.0; // weight 600
     pub const BODY_SIZE: f32 = 13.0; // weight 400
     pub const CAPTION_SIZE: f32 = 12.0; // weight 400
+    // Numeric weight contract. gpui exposes `FontWeight::{LIGHT, NORMAL,
+    // MEDIUM, SEMIBOLD}` consts (text_system.rs:662-668) and the views use
+    // THOSE; the numbers stay so the token set remains closed and the
+    // bundled faces' usWeightClass stays checkable (fonts.rs).
+    #[allow(
+        dead_code,
+        reason = "gpui FontWeight consts are used at the call sites"
+    )]
     pub const WEIGHT_LIGHT: u16 = 300;
+    #[allow(
+        dead_code,
+        reason = "gpui FontWeight consts are used at the call sites"
+    )]
     pub const WEIGHT_REGULAR: u16 = 400;
+    #[allow(
+        dead_code,
+        reason = "gpui FontWeight consts are used at the call sites"
+    )]
     pub const WEIGHT_SEMIBOLD: u16 = 600;
 }
 
-/// WCAG 2.x contrast ratio between two 0xRRGGBB colours.
+/// WCAG 2.x contrast ratio between two 0xRRGGBB colours. Test-only: this is
+/// the design-gate calculator for the AA table below.
+#[cfg(test)]
 pub fn contrast(a: u32, b: u32) -> f64 {
     fn lin(c: u32) -> f64 {
         let c = c as f64 / 255.0;

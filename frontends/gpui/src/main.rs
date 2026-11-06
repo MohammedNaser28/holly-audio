@@ -1,22 +1,81 @@
-//! gpui frontend (Task 8) — thin shell over `holly-app`.
+//! gpui frontend (Task 8) — "graphite and tungsten" window (T3).
 //!
 //! Scope discipline (project rule): this file knows NOTHING about the
 //! device beyond what `holly_app::vm::ViewModel` carries. Every device-rule
-//! string, readability decision, and pending-state rule comes from the VM;
-//! the only write actions are the NC switch toggle (`set_noise`) and the NC
-//! level buttons (`set_noise_level`, cmd 19's second byte — wire-exercised
-//! in captures/2026-11-05-noise-level-medium.txt).
+//! string, readability decision, and pending-state rule comes from the VM
+//! (`holly_app::vm`); the only write actions are the NC switch toggle
+//! (`set_noise`) and the NC level picks (`set_noise_level`, cmd 19's second
+//! byte — wire-exercised in captures/2026-11-05-noise-level-medium.txt).
+//! Layout/colors/geometry come verbatim from the design contract:
+//! `docs/design/index.html` (window reference, px-exact) + `theme.rs`
+//! (tokens). Reference values with no token map to the nearest token:
+//! `#0B0C0E`→WELL, `#3A3F47`/`#343941` button borders→LINE,
+//! `#4A5059`→TEXT_DISABLED (the token set in theme.rs is closed; the full
+//! list is documented in frontends/gpui/README.md).
 //!
 //! gpui API provenance (hard rule: nothing written from memory): every call
 //! below was verified against the vendored gpui 0.2.2 source
-//! (~/.cargo/registry/src/.../gpui-0.2.2/), citing the specific examples:
-//!   - window setup: examples/hello_world.rs, examples/on_window_close_quit.rs
-//!   - actions/bindings/on_action/listeners: examples/input.rs
-//!   - async bridging: src/app.rs `App::spawn` (foreground executor,
-//!     AsyncFnOnce(&mut AsyncApp)) + src/app/async_context.rs
-//!     (`impl AppContext for AsyncApp`) + src/app/entity_map.rs
-//!     `Entity::update` — the blocker is that AsyncApp is !Send, so a
-//!     std thread cannot drive gpui async directly; see the pump below.
+//! (~/.cargo/registry/src/.../gpui-0.2.2/), citing files/lines:
+//!   - window: `WindowOptions::window_decorations` (src/platform.rs:377
+//!     enum, :1131 field; example window_shadow.rs:212) + `window_min_size`
+//!     (platform.rs:1131, `Option<Size<Pixels>>`); window title through
+//!     `TitlebarOptions::title` (platform.rs:1248-1258).
+//!   - CSD: client-drawn titlebar = `WindowDecorations::Client`
+//!     (window_shadow.rs:212) with `TitlebarOptions { title: Some(..) }`
+//!     carrying the compositor/xdg window name (image_gallery.rs:263-271);
+//!     drag = `Window::start_window_move()` on mousedown (window.rs:1753;
+//!     example window_shadow.rs:83-87); close = `Window::remove_window()`
+//!     (window.rs:1375; example window.rs:30). NOTE: gpui 0.2.2 has NO
+//!     `window_control_area` API (grep over the vendored tree) — drag/close
+//!     follow the example wiring instead.
+//!   - shadows: `.shadow(vec![BoxShadow{..}])` (gpui-macros
+//!     src/styles.rs:390-399; struct src/style.rs:308-317; constructed the
+//!     same way in example window_shadow.rs:122-128). There are NO inset
+//!     shadows in gpui — the reference's `inset ..` recipes fall back to
+//!     the flat fills listed in README.md (unfinished reproductions).
+//!   - gradients: `linear_gradient(angle, from, to)` (src/color.rs:765-776;
+//!     example gradient.rs:222-228) + `linear_color_stop` (color.rs:793).
+//!   - translucency for the theme.rs (rgb, alpha) recipes: `opacity` lives
+//!     on `Hsla` (color.rs:549), `From<Rgba> for Hsla` (color.rs:589) and
+//!     `BoxShadow.color: Hsla` (style.rs:308-316) — so glows are composed
+//!     `Hsla::from(solid(TOKEN)).opacity(f)`; `gpui::Result` is the
+//!     re-exported `anyhow::Result` (src/gpui.rs:69).
+//!   - listeners/actions: `Context::listener` wraps a closure that sees
+//!     `&mut Context<Self>` (src/app/context.rs:252-267); `.on_action`
+//!     dispatches along the focus chain (examples/input.rs); app-level
+//!     `cx.on_action` / `cx.on_window_closed` (src/app.rs:1696/:1806;
+//!     example image_gallery.rs:255-267); focusing a handle is
+//!     `FocusHandle::focus(window)` (examples/on_window_close_quit.rs:58);
+//!     focused styles are a StyleRefinement mutation
+//!     (examples/tab_stop.rs:55-63).
+//!   - animation: `Animation::new().repeat().with_easing()`
+//!     (src/elements/animation.rs:31/40/47) + `pulsating_between`
+//!     (easing mod, :249; re-exported at src/elements/animation.rs:10 and
+//!     src/gpui.rs:77) + `.with_animation(id, animation, |el, d| ..)`
+//!     (AnimationExt, :75-85; example animation.rs:73-84).
+//!   - monochrome icons: the `svg()` element paints ONE color from an alpha
+//!     mask (src/elements/svg.rs:109-124; "monochrome SVG",
+//!     window.rs:3060-3065); sources load through `AssetSource`
+//!     (src/assets.rs:13-18), wired via `Application::with_assets`
+//!     (src/app.rs:155; example animation.rs:10-24 loads bytes by path).
+//!     This file embeds the reference SVG markup as consts and keys the
+//!     AssetSource by the source itself — no filesystem, no new dependency.
+//!   - focus keys: `.track_focus` (src/elements/div.rs:616), `.focus(..)`
+//!     focused styles (div.rs:1014-1025), `.key_context` (div.rs:658-667),
+//!     `KeyBinding::new(keystrokes, action, context)` (src/keymap/binding.rs
+//!     :33; `TryFrom<&str> for KeyContext` src/keymap/context.rs:21-27).
+//!   - type: `FontWeight::{LIGHT, NORMAL, MEDIUM, SEMIBOLD}`
+//!     (src/text_system.rs:662-668); `.text_size(px(..))` (styled.rs:424);
+//!     `.opacity(f32)` on elements (styled.rs:652); the family is set once
+//!     through `.font_family(theme::text::FAMILY)` (styled.rs:615-623; the
+//!     free `font()` helper is text_system.rs:807).
+//!   - box helpers `w/h/size/min_w/min_h/gap/rounded*/border_*/shadow/flex_1/
+//!     flex_none/items_center/...` are generated by
+//!     `gpui_macros::style_helpers!()` (src/styled.rs:25; gpui-macros
+//!     src/styles.rs:897-960); `.when(..)`/`.when_some(..)` come with
+//!     `FluentBuilder` (src/util.rs:23-50; example window_shadow.rs:74).
+//!   - async bridging (unchanged from T1/T2): src/app.rs `App::spawn` +
+//!     src/app/async_context.rs — AsyncApp is !Send, hence the pump thread.
 //!
 //! Bridge pattern: `DeviceHandle::subscribe()` yields a BLOCKING
 //! `std::sync::mpsc::Receiver<Snapshot>`. A dedicated pump thread holds the
@@ -25,17 +84,23 @@
 //! 0.2.2's dependency tree, so no new dependency). The UI consumes the
 //! stream via `cx.spawn` + `Entity::update` on the main-thread executor.
 
+use std::borrow::Cow;
 use std::thread;
+use std::time::Duration;
 
 use futures::{StreamExt, channel::mpsc::unbounded};
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, FontWeight,
-    KeyBinding, Render, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    prelude::*, px, rgb, size,
+    Animation, AnimationExt, App, Application, AssetSource, Bounds, BoxShadow, ClickEvent, Context,
+    ElementId, Entity, FocusHandle, FontWeight, KeyBinding, MouseButton, Render, SharedString,
+    TitlebarOptions, Window, WindowBounds, WindowDecorations, WindowOptions, actions, div,
+    linear_color_stop, linear_gradient, point, prelude::*, pulsating_between, px, rgb, size, svg,
 };
 use holly_app::DeviceHandle;
-use holly_app::NoiseWrite;
-use holly_app::vm::{Banner, BatteryClass, NcVm, ReverbVm, TxVm, ViewModel, view_model};
+use holly_app::demo::DemoScenario;
+use holly_app::vm::{
+    Banner, DEVICE_NAME, NcVm, TxVm, VID_PID, ViewModel, conn_status_word, mic_status, mute_label,
+    nc_level_label, nc_status, view_model,
+};
 
 actions!(
     holly,
@@ -45,144 +110,488 @@ actions!(
 mod fonts;
 mod theme;
 
-// ---- Theme bridge (T1) -------------------------------------------------------
-// The Signal token set is gone; `theme.rs` (verbatim from the design reference,
-// docs/design/theme.rs) is the single colour source. The pre-T3 view layer
-// below still uses the old component names, so they now resolve to graphite/
-// tungsten tokens as follows — presentation mapping only, no device meaning:
-//   window/background  -> CHASSIS        recessed rows/banner body -> PANEL_BOTTOM
-//   card bodies        -> RAISED         one-pixel lines           -> LINE
-//   primary/secondary  -> TEXT / TEXT_2  interactive emphasis      -> TUNGSTEN
-//   "connected"        -> LIVE           needs-attention           -> TUNGSTEN
-//                        (the design colour rule collapses amber roles:
-//                         amber = engaged OR needs attention)
-//   failure            -> ALERT
-// Every value cites theme.rs — no hex literals remain in view code.
-const COL_BG: u32 = theme::color::CHASSIS;
-const COL_SURFACE: u32 = theme::color::PANEL_BOTTOM;
-const COL_ELEVATED: u32 = theme::color::RAISED;
-const COL_BORDER: u32 = theme::color::LINE;
-const COL_TEXT: u32 = theme::color::TEXT;
-const COL_MUTED: u32 = theme::color::TEXT_2;
-const COL_ACCENT: u32 = theme::color::TUNGSTEN;
-const COL_SUCCESS: u32 = theme::color::LIVE;
-/// Needs-attention — same amber role as [`COL_ACCENT`] by the design colour rule.
-const COL_WARNING: u32 = theme::color::TUNGSTEN;
-const COL_ERROR: u32 = theme::color::ALERT;
+// ---- reference SVG markup (copied from docs/design/index.html) ---------------
+// The `svg()` element renders an alpha mask tinted with ONE color, so each
+// icon carries the reference geometry and gets its color from
+// `.text_color(...)` on the svg element itself (svg.rs:113 zips
+// `path` with `style.text.color` — nothing paints without it).
 
-fn battery_color(class: BatteryClass) -> gpui::Hsla {
-    // Spec mapping: Full/High → success green, Low → amber, Critical → red.
-    rgb(match class {
-        BatteryClass::Full | BatteryClass::High => COL_SUCCESS,
-        BatteryClass::Low => COL_WARNING,
-        BatteryClass::Critical => COL_ERROR,
-    })
-    .into()
-}
+const ICON_MIC: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ECEEF1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>"##;
 
-/// Per-TX battery line. Rule (spec §7c): a disconnected/unverifiable
-/// transmitter shows an explicit unavailable state — never a decoded 0 %
-/// (the heart's zero byte on a dead link is device padding, not 0 percent).
-/// Pure + unit-tested.
-fn battery_text(tx: &TxVm) -> String {
-    if tx.connected {
-        format!("battery {} % ({:?})", tx.battery, tx.battery_class)
-    } else {
-        "battery — (unavailable)".to_string()
+/// Banner icon (the reference's amber plug glyph, index.html:39).
+const ICON_CHARGER: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ECEEF1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v5M15 2v5M6 7h12v4a6 6 0 0 1-12 0V7zM12 17v5"/></svg>"##;
+
+const ICON_CLOSE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ECEEF1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></svg>"##;
+
+/// In-memory `AssetSource`: the key IS the SVG source. `svg()` asks the
+/// source for bytes under `.path(..)` (elements/svg.rs:120); returning the
+/// key's own bytes keeps icons inline with zero filesystem and zero new
+/// dependencies (trait method signatures per src/assets.rs:13-18).
+struct IconAssets;
+
+impl AssetSource for IconAssets {
+    // `gpui::Result` IS `anyhow::Result` (re-export, src/gpui.rs:69), so this
+    // impl needs no anyhow dependency of its own. The loader is keyed BY THE
+    // SOURCE ITSELF: `svg_glyph` hands the full embedded SVG markup string to
+    // `svg()`, which resolves it through this AssetSource (svg.rs renders by
+    // the path key, assets.rs:13-18); matching against the consts restores
+    // the 'static signature — the &'static bytes are returned, the borrowed
+    // user/viewer copy never escapes. An unknown key loads as None (renders
+    // blank rather than panicking).
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        let src = match path {
+            ICON_MIC => ICON_MIC,
+            ICON_CHARGER => ICON_CHARGER,
+            ICON_CLOSE => ICON_CLOSE,
+            _ => return Ok(None),
+        };
+        Ok(Some(Cow::Borrowed(src.as_bytes())))
+    }
+
+    fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(vec![])
     }
 }
 
-/// Header badge state, decided ONLY from what the VM carries (banner kind +
-/// whether the connecting hint is active). Connected never invents itself: it
-/// is the state when the actor stopped showing any banner or searching text.
-/// Pure + unit-tested. Returns (label, token).
-fn conn_badge(vm: &ViewModel) -> (&'static str, u32) {
-    match &vm.banner {
-        Some(Banner::Error) => ("error", COL_ERROR),
-        Some(Banner::PermissionDenied) | Some(Banner::Busy) => ("blocked", COL_WARNING),
-        Some(Banner::NotFound) => ("no device", COL_MUTED),
-        None if vm.banner_text.is_some() => ("connecting", COL_ACCENT),
-        None => ("connected", COL_SUCCESS),
-    }
+/// One monochrome glyph: `svg()` + source + explicit color + square size
+/// (the element picks its color from its own text style, svg.rs:113).
+fn svg_glyph(source: &'static str, side: f32, color: gpui::Rgba) -> gpui::Svg {
+    svg()
+        .path(SharedString::from(source))
+        .size(px(side))
+        .text_color(color)
 }
 
-/// `HH:MM:SS` in UTC from integer UNIX seconds — std-only (no chrono, no
-/// local timezone: the stamp is an actor-side wall clock; UTC display is
-/// explicit and honest). `None` (no successful GET yet) renders a dash.
-/// Pure + unit-tested.
-fn utc_hms(updated: Option<u64>) -> String {
-    let Some(secs) = updated else {
-        return "—".to_string();
-    };
-    let d = secs % 86_400;
-    format!("{:02}:{:02}:{:02}", d / 3600, d % 3600 / 60, d % 60)
+// ---- small view helpers over theme tokens ------------------------------------
+
+/// A solid token as `Rgba` (theme.rs stores 0xRRGGBB).
+fn solid(token: u32) -> gpui::Rgba {
+    rgb(token)
 }
 
-fn onoff(on: bool) -> &'static str {
-    if on { "on" } else { "off" }
+/// The reference's non-inset drop shadows, mapped to the WELL token (`#0B0C0E`
+/// → WELL, the nearest token; the token set is closed): the matte pads' hard
+/// under-edge `0 2px 0 #0B0C0E` (index.html:95/234) and the selected selector
+/// option's `0 1px 0 #000` line (index.html:202). The matching `inset 0 1px 0`
+/// top highlights are NOT reproduced — gpui has no inset shadows (README:
+/// unfinished reproductions).
+fn matte_under_edge(offset_y: f32) -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color: solid(theme::color::WELL).into(),
+        offset: point(px(0.), px(offset_y)),
+        blur_radius: px(0.),
+        spread_radius: px(0.),
+    }]
 }
 
-/// Level button labels: 0/1/2 map to the APK's own value names
-/// (`device_noise_level_low/normal/strong` resources, [code
-/// HLDevice6302Activity.java:1593/:1610/:1626-1631]; presentation strings).
-fn level_label(level: u8) -> &'static str {
-    match level {
-        0 => "low",
-        1 => "medium",
-        2 => "strong",
-        _ => "unknown",
-    }
+/// The panel recipe from docs/design/index.html: 20px padding, 14px radius,
+/// 1px LINE_PANEL border, faceplate gradient, and the reference's
+/// `0 1px 0 rgba(0,0,0,.5)` bottom edge painted as a BoxShadow (theme.rs
+/// `DROP_DARK` recipe). The reference's `inset 0 1px 0` top highlight is
+/// NOT reproduced — gpui has no inset shadows (README: unfinished
+/// reproductions).
+fn panel() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .p(px(theme::metrics::SPACE_5))
+        .rounded(px(theme::metrics::PANEL_RADIUS))
+        .border_1()
+        .border_color(solid(theme::color::LINE_PANEL))
+        .bg(linear_gradient(
+            180.,
+            linear_color_stop(solid(theme::color::PANEL_TOP), 0.),
+            linear_color_stop(solid(theme::color::PANEL_BOTTOM), 1.),
+        ))
+        .shadow(vec![BoxShadow {
+            color: gpui::Hsla::from(solid(0x000000)).opacity(theme::color::DROP_DARK.1),
+            offset: point(px(0.), px(1.)),
+            blur_radius: px(0.),
+            spread_radius: px(0.),
+        }])
 }
 
-/// Per-level-button decision — the ONLY button logic in the UI, pure and
-/// unit-tested. A button is ACTIVE when the device reports this level with
-/// the switch verified on; PENDING when an in-flight Level write targets it;
-/// otherwise IDLE. Buttons are Idle whenever the verified switch state is
-/// not `on`: the APK's level presses always send `isOpen=true` [code], and a
-/// level write while off has never been sent/observed [wire] — so the row
-/// stays inert until the toggle turns NC on. (Rationale with holly-usb:
-/// `set_noise_level` preserves the switch byte, like the APK's own switch.)
+/// The recessed "well" recipe: WELL fill; the reference's inset shadows
+/// (`inset 0 2px 8px rgba(0,0,0,.8)`, ...) fall back to a 1px LINE_SOFT
+/// border (README: unfinished reproductions).
+fn well(radius: f32) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .rounded(px(radius))
+        .border_1()
+        .border_color(solid(theme::color::LINE_SOFT))
+        .bg(solid(theme::color::WELL))
+}
+
+/// A status LED dot: 7px circle; LIVE/TUNGSTEN/ALERT get the designed LED
+/// glow (theme.rs `GLOW_*_LED`: blur 8); the ring state draws a
+/// TEXT_DISABLED contour with no fill and no glow (reference: `1.5px solid
+/// #5A616B` — nearest token, 1px, README).
+/// LED states, decided ONLY from VM fields ([code] index.html:215-217).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LevelBtn {
-    Active,
-    Pending,
-    Idle,
+enum LedLit {
+    Live,
+    /// Attention = tungsten; `pulse` reproduces the reference's
+    /// `holly-pulse 1.1s` keyframes for the pending state (index.html:15).
+    Attention {
+        pulse: bool,
+    },
+    Alert,
+    Ring,
 }
 
-fn level_button(level: u8, nc: &NcVm) -> LevelBtn {
+impl LedLit {
+    fn color(&self) -> gpui::Rgba {
+        match self {
+            Self::Live => solid(theme::color::LIVE),
+            Self::Attention { .. } => solid(theme::color::TUNGSTEN),
+            Self::Alert => solid(theme::color::ALERT),
+            Self::Ring => solid(theme::color::TEXT_DISABLED),
+        }
+    }
+
+    fn glow(&self) -> Option<gpui::Hsla> {
+        match self {
+            Self::Live => Some(
+                gpui::Hsla::from(solid(theme::color::GLOW_LIVE_LED.0))
+                    .opacity(theme::color::GLOW_LIVE_LED.1),
+            ),
+            Self::Attention { .. } => Some(
+                gpui::Hsla::from(solid(theme::color::GLOW_TUNGSTEN_LED.0))
+                    .opacity(theme::color::GLOW_TUNGSTEN_LED.1),
+            ),
+            Self::Alert => Some(
+                // Same LED-glow alpha as the designed glows (0.70), on the
+                // alert signal color — composition documented in README.
+                gpui::Hsla::from(solid(theme::color::ALERT)).opacity(0.70),
+            ),
+            Self::Ring => None,
+        }
+    }
+}
+/// Render the LED dot; the pulsing state wraps the circle in the
+/// reference's 1.1s breathing animation (`.repeat()` +
+/// `pulsating_between(0.3, 1.0)` ≙ `0%,100%{opacity:1}50%{opacity:.3}`).
+fn led_dot(lit: LedLit) -> gpui::AnyElement {
+    let glow_dot = |color: gpui::Rgba, glow: gpui::Hsla| {
+        div()
+            .w(px(theme::metrics::LED_SIZE))
+            .h(px(theme::metrics::LED_SIZE))
+            .rounded_full()
+            .bg(color)
+            .shadow(vec![BoxShadow {
+                color: glow,
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(8.),
+                spread_radius: px(0.),
+            }])
+            .into_any_element()
+    };
+    let ring_dot = || {
+        div()
+            .w(px(theme::metrics::LED_SIZE))
+            .h(px(theme::metrics::LED_SIZE))
+            .rounded_full()
+            .border_1()
+            .border_color(solid(theme::color::TEXT_DISABLED))
+            .into_any_element()
+    };
+    match &lit {
+        LedLit::Ring => ring_dot(),
+        LedLit::Alert => glow_dot(lit.color(), lit.glow().unwrap()),
+        LedLit::Attention { pulse: false } => glow_dot(lit.color(), lit.glow().unwrap()),
+        LedLit::Attention { pulse: true } => {
+            let dot = div()
+                .w(px(theme::metrics::LED_SIZE))
+                .h(px(theme::metrics::LED_SIZE))
+                .rounded_full()
+                .bg(lit.color())
+                .shadow(vec![BoxShadow {
+                    color: lit.glow().unwrap(),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(8.),
+                    spread_radius: px(0.),
+                }]);
+            dot.with_animation(
+                "led-pulse",
+                Animation::new(Duration::from_millis(1100))
+                    .repeat()
+                    .with_easing(pulsating_between(0.3, 1.0)),
+                |dot, delta| dot.opacity(delta),
+            )
+            .into_any_element()
+        }
+        LedLit::Live => glow_dot(lit.color(), lit.glow().unwrap()),
+    }
+}
+
+/// `title + led + status word` row used by the panels (title 15/600, the
+/// status word 13/TEXT_2 next to its 7px LED).
+fn titled_with_led(title: &'static str, lit: LedLit, status: String) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .text_size(px(theme::text::TITLE_SIZE))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_color(solid(theme::color::TEXT_2))
+                .text_size(px(theme::text::BODY_SIZE))
+                .child(led_dot(lit))
+                .child(status),
+        )
+}
+
+/// A segmented selector group rendered in a well (reference:
+/// `role=radiogroup`, 4px padding, 2px gaps, 36px options, 12px/8px radii).
+/// `selected` = index of the option whose matte pad + tungsten indicator bar
+/// shows; `None` = no selection (unknown state). READ-ONLY here (the
+/// interactive NC level variant is [`AppModel::nc_selector`]).
+fn radio_group(labels: &[&'static str], selected: Option<usize>) -> gpui::Div {
+    let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
+        .flex_row()
+        .p(px(theme::metrics::SELECTOR_PADDING))
+        .gap(px(theme::metrics::SELECTOR_GAP));
+    for (ix, label) in labels.iter().enumerate() {
+        let selected_now = selected == Some(ix);
+        let mut option = div()
+            .flex_1()
+            .min_w_0()
+            .h(px(theme::metrics::SELECTOR_HEIGHT))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
+            .text_size(px(theme::text::BODY_SIZE))
+            .when(selected_now, |o| {
+                o.bg(linear_gradient(
+                    180.,
+                    linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
+                    linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
+                ))
+                .text_color(solid(theme::color::TEXT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .shadow(matte_under_edge(1.))
+            })
+            .when(!selected_now, |o| {
+                o.text_color(solid(theme::color::TEXT_2))
+                    .font_weight(FontWeight::MEDIUM)
+            })
+            .child(*label)
+            .relative();
+        if selected_now {
+            // the 14×2 tungsten indicator bar under the selected option
+            // (index.html:111; glow `0 0 6px rgba(255,181,71,.6)`)
+            option = option.child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .right(px(0.))
+                    .bottom(px(4.))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
+                            .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
+                            .rounded(px(1.))
+                            .bg(solid(theme::color::TUNGSTEN))
+                            .shadow(vec![BoxShadow {
+                                color: gpui::Hsla::from(solid(theme::color::TUNGSTEN)).opacity(0.6),
+                                offset: point(px(0.), px(0.)),
+                                blur_radius: px(6.),
+                                spread_radius: px(0.),
+                            }]),
+                    ),
+            );
+        }
+        group = group.child(option);
+    }
+    group
+}
+
+/// The small on/off switch (48×26 track, 20px thumb; reference `tog()`).
+/// Rendered READ-ONLY: the app's toggles other than NC are unmapped, so a
+/// switch shows the wire-read state at full opacity and no interaction.
+fn toggle_switch(on: bool) -> gpui::Div {
+    let track = div()
+        .relative()
+        .w(px(theme::metrics::TOGGLE_WIDTH))
+        .h(px(theme::metrics::TOGGLE_HEIGHT))
+        // the mock's toggle track: border-radius 13px on 48×26
+        // (index.html:137/160/164) — the TOGGLE_RADIUS token, a full round
+        // for this geometry
+        .rounded(px(theme::metrics::TOGGLE_RADIUS))
+        .when(on, |t| {
+            t.border_1()
+                .border_color(solid(theme::color::TUNGSTEN_BOTTOM))
+                .bg(linear_gradient(
+                    180.,
+                    linear_color_stop(solid(theme::color::TUNGSTEN_TOP), 0.),
+                    linear_color_stop(solid(theme::color::TUNGSTEN_BOTTOM), 1.),
+                ))
+        })
+        .when(!on, |t| {
+            t.border_1()
+                .border_color(solid(theme::color::LINE_SOFT))
+                .bg(solid(theme::color::WELL))
+        });
+    track.child(
+        div()
+            .absolute()
+            .top(px(3.))
+            .left(px(if on {
+                theme::metrics::TOGGLE_WIDTH - theme::metrics::TOGGLE_THUMB - 3.
+            } else {
+                3.
+            }))
+            .w(px(theme::metrics::TOGGLE_THUMB))
+            .h(px(theme::metrics::TOGGLE_THUMB))
+            .rounded_full()
+            .shadow(vec![BoxShadow {
+                color: gpui::Hsla::from(solid(0x000000)).opacity(0.5),
+                offset: point(px(0.), px(1.)),
+                blur_radius: px(2.),
+                spread_radius: px(0.),
+            }])
+            .bg(solid(if on {
+                theme::color::TEXT
+            } else {
+                theme::color::TEXT_2
+            })),
+    )
+}
+
+// ---- pure decisions (unit-tested below; VM-only inputs) ----------------------
+
+/// Battery readout digits (reference: `{{m.battery}}` = "100" | "--"): a
+/// live transmitter shows its percent; ANYTHING else is "--" — a decoded
+/// zero byte on a dead link is device padding, never "0 %".
+fn battery_digits(tx: &TxVm) -> String {
+    if tx.connected {
+        tx.battery.to_string()
+    } else {
+        "--".to_string()
+    }
+}
+
+/// What a click or a 1/2/3 press on level L may do right now (the ONLY
+/// place pick semantics live, shared by mouse and keyboard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LevelPick {
+    /// Already the device's level — nothing to write (no duplicate SETs).
+    Noop,
+    /// A level SET goes out.
+    Write,
+    /// Blocked: while ANY SET is in flight picks are ignored (pending
+    /// latest-wins; no second queue), and a level pick with the switch
+    /// verified OFF never writes (level-while-off was never sent/observed
+    /// on the wire — the APK always sends `isOpen=true` with its level
+    /// presses).
+    Blocked,
+}
+
+fn level_pick(level: u8, nc: &NcVm) -> LevelPick {
+    if nc.pending.is_some() {
+        return LevelPick::Blocked;
+    }
     if nc.state != Some(true) {
-        return LevelBtn::Idle;
+        return LevelPick::Blocked;
     }
     if nc.level == Some(level) {
-        return LevelBtn::Active;
+        return LevelPick::Noop;
     }
-    if nc.pending == Some(NoiseWrite::Level(level)) {
-        return LevelBtn::Pending;
-    }
-    LevelBtn::Idle
+    LevelPick::Write
 }
 
-/// The ONLY place "what does a click mean" is decided, shared by mouse and
-/// keyboard paths. `None` = disabled: no heart ever arrived, so there is no
-/// verified state to toggle against (UI must not invent a success).
-/// Pending wins over state, but ONLY a Switch write changes the toggle's
-/// target semantics: an in-flight Level write is orthogonal (the flip is
-/// computed from the verified state and simply goes out after it).
-fn toggle_target(pending: Option<NoiseWrite>, state: Option<bool>) -> Option<bool> {
-    match pending {
-        Some(NoiseWrite::Switch(pending_on)) => Some(!pending_on),
-        _ => Some(!state?),
+/// May THIS NC request go out right now? Guard for the rocker flip and the
+/// rocker pads: allowed only with a verified state and NOTHING in flight
+/// (any pending SET — switch OR level — blocks picks; while pending the
+/// actor is busy and the UI must not queue a second write; the actor's own
+/// latest-wins coalescing stays the ONLY queue).
+fn nc_write_accepted(nc: &NcVm) -> bool {
+    nc.pending.is_none() && nc.state.is_some()
+}
+
+/// Banner decoration per kind, decided ONLY from `Banner` (the design
+/// colour rule: amber = needs attention, red = error, grey = everything
+/// else; container stays on the designed BANNER_BG/BANNER_LINE). The
+/// reference depicts only the busy banner; error/not-found treatments are
+/// token compositions of that rule (README documents them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BannerPalette {
+    accent: u32,
+    title: u32,
+    body: u32,
+}
+
+fn banner_palette(banner: &Banner) -> BannerPalette {
+    match banner {
+        Banner::Error => BannerPalette {
+            accent: theme::color::ALERT,
+            title: theme::color::ALERT,
+            body: theme::color::BANNER_TEXT,
+        },
+        Banner::PermissionDenied | Banner::Busy => BannerPalette {
+            accent: theme::color::TUNGSTEN,
+            title: theme::color::TEXT,
+            body: theme::color::BANNER_TEXT,
+        },
+        Banner::NotFound => BannerPalette {
+            accent: theme::color::TEXT_3,
+            title: theme::color::TEXT_2,
+            body: theme::color::TEXT_3,
+        },
     }
 }
 
-/// One window model; the whole app for v1. `demo` = scripted-device mode,
-/// decided ONCE in `main` (--demo); it only ever changes presentation
-/// (chip/title/footer note), never behavior and never the device API surface.
+/// Footer LED decision (VM-only): red on error; amber (attention) on the
+/// busy/denied banners and while connecting; green on a live connection;
+/// the grey ring otherwise (not found).
+fn vm_led(vm: &ViewModel) -> LedLit {
+    match &vm.banner {
+        Some(Banner::Error) => LedLit::Alert,
+        Some(Banner::PermissionDenied | Banner::Busy) => LedLit::Attention { pulse: false },
+        Some(Banner::NotFound) => LedLit::Ring,
+        None if vm.banner_text.is_some() => LedLit::Attention { pulse: false },
+        None => LedLit::Live,
+    }
+}
+
+/// The NC panel's LED: tungsten while ON (solid) and while a write is in
+/// flight (pulsing); the grey ring otherwise (OFF/unknown — per the
+/// colour rule grey means "everything else").
+fn nc_led(nc: &NcVm) -> LedLit {
+    if nc.pending.is_some() {
+        LedLit::Attention { pulse: true }
+    } else if nc.state == Some(true) {
+        LedLit::Attention { pulse: false }
+    } else {
+        LedLit::Ring
+    }
+}
+
+// ---- app model ----------------------------------------------------------------
+
+/// One window model; the whole app. `demo` = scripted-device mode (from
+/// the `--demo` flag, :parsing in `main`); it only ever changes
+/// presentation (chip/title/footer), never behavior and never the device
+/// API surface. The rocker is the window's keyboard control (Space/Enter
+/// inside its `key_context`; see `main`), so it owns the FocusHandle.
 struct AppModel {
     focus: FocusHandle,
     vm: ViewModel,
     device: DeviceHandle,
-    demo: bool,
+    demo: Option<DemoScenario>,
 }
 
 impl AppModel {
@@ -193,19 +602,22 @@ impl AppModel {
         cx.notify();
     }
 
+    /// The toggle's single flip path (Space/Enter/the rocker container);
+    /// [`nc_write_accepted`] is the whole gate (nothing in flight, state
+    /// verified). The flip target is computed from the VERIFIED state.
     fn toggle_nc(&mut self, _: &ToggleNoise, _: &mut Window, _: &mut Context<Self>) {
-        if let Some(target) = toggle_target(self.vm.nc.pending, self.vm.nc.state) {
-            self.device.set_noise(target);
+        if nc_write_accepted(&self.vm.nc)
+            && let Some(state) = self.vm.nc.state
+        {
+            self.device.set_noise(!state);
         }
     }
 
-    /// One level press: only when the verified switch is on and this level is
-    /// not already the device's (no duplicate SETs for the active button).
-    /// `set_noise_level` preserves the switch, mirroring the APK's switch
-    /// path; a pending Level for another value is REPLACED here (holly-app's
-    /// pump is latest-wins), which is the intended "change my mind" flow.
+    /// One level pick for mouse AND keyboard; [`level_pick`] is the whole
+    /// decision (blocked while pending, blocked with the switch off, noop
+    /// when already that level).
     fn set_nc_level(&mut self, level: u8, _: &mut Context<Self>) {
-        if level_button(level, &self.vm.nc) == LevelBtn::Idle {
+        if level_pick(level, &self.vm.nc) == LevelPick::Write {
             self.device.set_noise_level(level);
         }
     }
@@ -222,325 +634,839 @@ impl AppModel {
         self.set_nc_level(2, cx);
     }
 
-    fn on_nc_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_nc(&ToggleNoise, window, cx);
+    /// A rocker pad click requests THAT pad's state explicitly (pressing
+    /// the lit pad is a noop — a rocker, not a toggle): same gate, explicit
+    /// request, dedup on the verified state.
+    fn request_nc(&mut self, request: bool, _window: &mut Window, _cx: &mut Context<Self>) {
+        if nc_write_accepted(&self.vm.nc) && self.vm.nc.state != Some(request) {
+            self.device.set_noise(request);
+        }
     }
 
-    fn refresh(&mut self, _: &Refresh, _: &mut Window, _: &mut Context<Self>) {
+    fn refresh_now(&mut self, _: &mut Context<Self>) {
         self.device.refresh();
     }
 
-    /// Header per spec §7a: name + subtitle (+ DEMO chip when demo mode) on
-    /// the first line, the connection badge on the right, key hints as a
-    /// second quiet line. Badge color/label from [`conn_badge`] (pure,
-    /// VM-only), DEMO chip = warning token on bg text (amber = "be aware"),
-    /// never hidden (explicit mock/hardware separation).
-    fn render_header(&mut self) -> gpui::Div {
-        let (badge_label, badge_color) = conn_badge(&self.vm);
+    // ---- titlebar (44px) ------------------------------------------------------
+
+    /// Reference titlebar: 44px, gap 10, padding left 16, bottom rule
+    /// LINE_SOFT; logo (TEXT ring + tungsten dot), "Holly" 14/600, a 1×16
+    /// LINE divider, then `DEVICE_NAME` 14/TEXT_2 (VM const). The left
+    /// portion is ONE drag strip (`start_window_move` on mouse-down); the
+    /// close button stays OUTSIDE it. CSD context: with client decorations
+    /// the compositor renders no window buttons, so the close affordance
+    /// is a platform necessity the painted mock does not depict.
+    fn render_titlebar(&self) -> gpui::Div {
         div()
+            .h(px(theme::metrics::TITLEBAR_HEIGHT))
+            .flex_none()
             .flex()
-            .flex_col()
-            .gap_2()
+            .items_center()
+            .gap(px(10.))
+            .pl(px(16.))
+            .pr(px(12.))
+            .border_b_1()
+            .border_color(solid(theme::color::LINE_SOFT))
             .child(
                 div()
                     .flex()
-                    .justify_between()
                     .items_center()
+                    .gap(px(10.))
+                    // drag strip (logo .. device name / DEMO chip)
+                    .on_mouse_down(MouseButton::Left, |_, window, _| {
+                        window.start_window_move();
+                    })
                     .child(
+                        // logo: the reference's 18×18 SVG has a stroke ring AND a
+                        // filled dot of DIFFERENT colors, while `svg()` paints one
+                        // color from an alpha mask — so it is composed from div
+                        // primitives instead (README: reused assets). Geometry
+                        // follows the svg's proportional rendering
+                        // (viewBox 24 → 18px: r10 ring ≈16px diameter, stroke
+                        // 1.6×.75 ≈1.2px, r4 dot ≈6px — index.html:31).
                         div()
+                            .w(px(16.))
+                            .h(px(16.))
+                            .rounded_full()
+                            .border(px(1.2)) // absolute-length border setter (gpui-macros styles.rs:348-360; "border" = all four edges, styles.rs:1325-1334)
+                            .border_color(solid(theme::color::TEXT))
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child("HOLLY"))
+                            .justify_center()
                             .child(
                                 div()
-                                    .text_color(rgb(COL_MUTED))
-                                    .text_sm()
-                                    .child("Wireless Audio Controller"),
-                            )
-                            .children(self.demo.then(|| {
-                                div()
-                                    .px_2()
-                                    .rounded_md()
-                                    .bg(rgb(COL_WARNING))
-                                    .text_color(rgb(COL_BG))
-                                    .child("DEMO")
-                            })),
+                                    .w(px(6.))
+                                    .h(px(6.))
+                                    .rounded_full()
+                                    .bg(solid(theme::color::TUNGSTEN)),
+                            ),
                     )
                     .child(
                         div()
-                            .px_2()
-                            .rounded_md()
-                            .text_color(rgb(badge_color))
-                            .child(badge_label),
-                    ),
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Holly"),
+                    )
+                    .child(div().w(px(1.)).h(px(16.)).bg(solid(theme::color::LINE)))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .text_color(solid(theme::color::TEXT_2))
+                            .child(DEVICE_NAME),
+                    )
+                    .children(self.demo.map(|_| {
+                        div()
+                            .ml(px(6.))
+                            .px(px(6.))
+                            .rounded(px(3.))
+                            .bg(solid(theme::color::TUNGSTEN))
+                            .text_color(solid(theme::color::INK))
+                            .text_size(px(theme::text::CAPTION_SIZE))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("DEMO")
+                    })),
             )
+            .child(div().flex_1())
             .child(
-                div().text_color(rgb(COL_MUTED)).text_sm().child(
-                    "space: toggle NC · 1/2/3: low/medium/strong · r: reconnect · ctrl+q: quit",
-                ),
+                // close button (outside the drag strip; CSD)
+                div()
+                    .id("titlebar-close")
+                    .w(px(28.))
+                    .h(px(28.))
+                    .rounded(px(theme::metrics::BUTTON_RADIUS))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|s| s.bg(solid(theme::color::RAISED)))
+                    .on_click(|_, window, _| window.remove_window())
+                    .child(svg_glyph(ICON_CLOSE, 14., solid(theme::color::TEXT_2))),
             )
     }
 
-    /// Device-rule banner straight from the VM (vm.rs owns these strings).
-    /// Token mapping: error → red, permission/busy → amber, not-found stays
-    /// quiet (muted) — backgrounds stay on `SURFACE`, only the border and
-    /// text carry the semantic token (spec: no invented hex here).
-    fn render_banner(&mut self) -> Option<gpui::Div> {
-        let banner = self.vm.banner.clone()?;
-        let (border, fg) = match banner {
-            Banner::Error => (COL_ERROR, COL_ERROR),
-            Banner::PermissionDenied | Banner::Busy => (COL_WARNING, COL_WARNING),
-            Banner::NotFound => (COL_BORDER, COL_MUTED),
-        };
+    // ---- banner ---------------------------------------------------------------
+
+    /// Device-rule banner straight from the VM (`conn_status_word` fills
+    /// the title slot, `banner_text` the body: mind that the reference's
+    /// banner words differ — the VM wording wins per project rule).
+    /// Reference recipe: alert row, 14px gap, 12/20 padding, BANNER_BG
+    /// fill + bottom rule; title 14/600; body 13; "Try again" button
+    /// (RAISED fill, LINE border, 36px) on the right. Shows for every
+    /// banner kind (it is the only recovery affordance).
+    fn render_banner(&self, cx: &Context<Self>) -> Option<gpui::Div> {
+        let banner = self.vm.banner.as_ref()?;
+        let palette = banner_palette(banner);
+        let body = self.vm.banner_text.clone().unwrap_or_default();
         Some(
             div()
-                .px_4()
-                .py_3()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(border))
-                .bg(rgb(COL_SURFACE))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .px(px(20.))
+                .py(px(12.))
+                .bg(solid(theme::color::BANNER_BG))
+                .border_b_1()
+                .border_color(if banner == &Banner::Error {
+                    solid(theme::color::ALERT)
+                } else {
+                    solid(theme::color::BANNER_LINE)
+                })
+                .child(svg_glyph(ICON_CHARGER, 22., solid(palette.accent)))
                 .child(
                     div()
-                        .text_color(rgb(fg))
-                        .child(self.vm.banner_text.clone().unwrap_or_default()),
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(solid(palette.title))
+                                .child(conn_status_word(&self.vm)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::text::BODY_SIZE))
+                                .text_color(solid(palette.body))
+                                .child(body),
+                        ),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("banner-retry")
+                        .h(px(36.))
+                        .px(px(16.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .rounded(px(theme::metrics::BUTTON_RADIUS))
+                        .border_1()
+                        .border_color(solid(theme::color::LINE))
+                        .bg(solid(theme::color::RAISED))
+                        .text_color(solid(theme::color::TEXT))
+                        .text_size(px(theme::text::BODY_SIZE))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .hover(|s| s.cursor_pointer())
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.refresh_now(cx);
+                        }))
+                        .child("Try again"),
                 ),
         )
     }
 
-    /// The NC panel: toggle row + the three level buttons, laid out as ONE
-    /// row stack. Pending display comes ONLY from `vm.nc.pending`
-    /// (actor-reported), never from a click.
-    fn render_nc(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+    // ---- body -----------------------------------------------------------------
+
+    /// Reference body: flex-1, gap 16, padding 20. Left = the 336px mic
+    /// column (two equal cards); right = NC panel over its two fixed rows
+    /// (132 / 120), each row split into the same two columns.
+    fn render_body(&self, cx: &Context<Self>) -> gpui::Div {
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .gap(px(theme::metrics::SPACE_4))
+            .p(px(theme::metrics::SPACE_5))
+            .child(
+                // left: Mic 1 / Mic 2 (336px)
+                div()
+                    .w(px(theme::metrics::MIC_COLUMN_WIDTH))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::metrics::SPACE_4))
+                    .child(self.mic_card("mic-1", self.vm.tx1.as_ref()).flex_1())
+                    .child(self.mic_card("mic-2", self.vm.tx2.as_ref()).flex_1()),
+            )
+            .child(
+                // right: rows 1fr / 132 / 120
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::metrics::SPACE_4))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .flex()
+                            .gap(px(theme::metrics::SPACE_4))
+                            .child(self.nc_panel(cx).flex_1())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::metrics::SPACE_4))
+                                    .child(
+                                        self.audio_panel(
+                                            "Volume adjustment",
+                                            &["1", "2", "3", "4", "5", "6"], // [code index.html:260]
+                                        )
+                                        .flex_1(),
+                                    )
+                                    .child(
+                                        self.audio_panel("Channel mode", &["Mono", "Stereo"])
+                                            .flex_1(),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(theme::metrics::GRID_ROW_EQ_HEIGHT))
+                            .flex_none()
+                            .flex()
+                            .gap(px(theme::metrics::SPACE_4))
+                            .child(
+                                self.audio_panel(
+                                    "EQ adjustment",
+                                    &["Equalization", "Low", "Bright"], // [code index.html:262]
+                                )
+                                .flex_1(),
+                            )
+                            .child(self.reverb_panel().flex_1()),
+                    )
+                    .child(
+                        div()
+                            .h(px(theme::metrics::GRID_ROW_POWER_HEIGHT))
+                            .flex_none()
+                            .flex()
+                            .gap(px(theme::metrics::SPACE_4))
+                            .child(
+                                self.audio_panel(
+                                    "Schedule power off",
+                                    &["15min", "Never"], // [code index.html:264]
+                                )
+                                .flex_1(),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::metrics::SPACE_4))
+                                    .child(self.led_toggle_panel("Mic recognition", false).flex_1())
+                                    .child(
+                                        self.led_toggle_panel(
+                                            "Indicator light",
+                                            self.vm.light.unwrap_or(false),
+                                        )
+                                        .flex_1(),
+                                    ),
+                            ),
+                    ),
+            )
+    }
+
+    /// One mic card (336px column, halves): reference recipe — icon in a
+    /// WELL circle, name 15/600, LED + status (`mic_status`), mute chip
+    /// (state read `[wire read]`, no write path — `WRITABLE.mic_mute` false),
+    /// the 64px battery readout (LIGHT, "--" when unavailable), 5 battery
+    /// segments, and an UNLIT 20-segment level meter (no wire source for
+    /// the meter: always unlit, per the writability/evidence rules).
+    fn mic_card(&self, id: &'static str, tx: Option<&TxVm>) -> gpui::Div {
+        let (name, status, muted, digits, live) = match tx {
+            Some(tx) => (
+                name_for(id),
+                mic_status(tx.connected).to_string(),
+                mute_label(tx.muted),
+                battery_digits(tx),
+                tx.connected,
+            ),
+            None => (
+                name_for(id),
+                mic_status(false).to_string(),
+                "Mute",
+                "--".to_string(),
+                false,
+            ),
+        };
+        let glyph_color = solid(if live {
+            theme::color::TEXT
+        } else {
+            theme::color::TEXT_3
+        });
+        // NO element id: the card is not interactive; its child controls
+        // carry their own affordances (svg needs none).
         div()
             .flex()
             .flex_col()
-            .gap_2()
-            .child(self.render_nc_row(cx))
-            .child(self.render_nc_levels(cx))
-    }
-
-    /// Per-level button. The wrap div keeps them visually one row even when
-    /// the whole panel is idle.
-    /// Level buttons row: one button per APK value 0/1/2. The decision per
-    /// button = [`level_button`]; the click + keyboard bindings share it.
-    fn render_nc_levels(&mut self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut row = div().flex().gap_2();
-        for (level, action) in [(0, "1: low"), (1, "2: medium"), (2, "3: strong")] {
-            row = row.child(self.nc_level_btn(level, action, cx));
-        }
-        row
-    }
-
-    /// One level button: active/pending/idle styling from [`level_button`],
-    /// the write goes through the actor only when the decision allows it
-    /// (that shared decision is also what the 1/2/3 keyboard bindings call).
-    fn nc_level_btn(
-        &mut self,
-        level: u8,
-        key_hint: &'static str,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let enabled = self.vm.nc.state == Some(true);
-        let decision = level_button(level, &self.vm.nc);
-        let (border, bg) = match decision {
-            LevelBtn::Active => (COL_ACCENT, COL_ACCENT),
-            // Pending = amber border on surface (semantic token, no invented
-            // hex); Idle = quiet border on surface.
-            LevelBtn::Pending => (COL_WARNING, COL_SURFACE),
-            LevelBtn::Idle => (COL_BORDER, COL_SURFACE),
-        };
-        // Text stays readable on the active accent background.
-        let fg = match decision {
-            LevelBtn::Active => COL_BG,
-            _ if enabled => COL_TEXT,
-            _ => COL_MUTED,
-        };
-        let label = format!("{} {} ({level})", key_hint, level_label(level));
-
-        div()
-            .id(ElementId::named_usize("nc-level-btn", level as usize))
-            .px_4()
-            .py_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(border))
-            .bg(rgb(bg))
-            .text_color(rgb(fg))
-            .map(|btn| {
-                if enabled {
-                    btn.hover(|s| s.cursor_pointer())
-                } else {
-                    btn
-                }
-            })
-            .child(label)
-            .on_click(
-                cx.listener(move |this, _: &ClickEvent, _: &mut Window, cx| {
-                    this.set_nc_level(level, cx);
-                }),
-            )
-    }
-
-    /// The toggle ROW. Disabled (non-clickable look) whenever the VM has no
-    /// verified NC state; pending display comes ONLY from `vm.nc.pending`
-    /// (actor-reported), never from the click.
-    fn render_nc_row(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let enabled = self.vm.nc.state.is_some();
-        let pending = self.vm.nc.pending;
-        let state = self.vm.nc.state;
-
-        let (border, bg) = if !enabled {
-            (COL_BORDER, COL_SURFACE)
-        } else if pending.is_some() {
-            (COL_WARNING, COL_SURFACE)
-        } else {
-            (COL_ACCENT, COL_ELEVATED)
-        };
-
-        let level = self.vm.nc.level;
-        let state_part = match (state, level) {
-            (Some(actual), Some(l)) => {
-                format!("{} · level {} ({})", onoff(actual), l, level_label(l))
-            }
-            (Some(actual), None) => onoff(actual).to_string(),
-            (None, _) => "—".to_string(),
-        };
-        let right = match pending {
-            Some(NoiseWrite::Switch(t)) => {
-                format!("pending → switch {} · device still: {state_part}", onoff(t))
-            }
-            Some(NoiseWrite::Level(l)) => format!(
-                "pending → level {} ({}) · device still: {state_part}",
-                l,
-                level_label(l)
-            ),
-            None => state_part,
-        };
-
-        div()
-            .id("nc-row")
-            .flex()
-            .justify_between()
-            .items_center()
-            .px_4()
-            .py_3()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(border))
-            .bg(rgb(bg))
-            .map(|row| {
-                if enabled {
-                    row.hover(|s| s.cursor_pointer())
-                } else {
-                    row
-                }
-            })
-            .on_click(cx.listener(Self::on_nc_click))
-            .child(
-                div().child("noise cancellation").child(
-                    div()
-                        .text_color(rgb(COL_MUTED))
-                        .text_sm()
-                        .child("SET_NOISE (cmd 19) — switch toggle [wire E2/E4] · level writes wire-exercised 2026-11-05"),
-                ),
-            )
+            .gap(px(18.))
             .child(
                 div()
-                    .text_color(rgb(if enabled { COL_TEXT } else { COL_MUTED }))
-                    .child(right),
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .w(px(32.))
+                            .h(px(32.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(solid(theme::color::LINE_SOFT))
+                            .bg(solid(theme::color::WELL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(svg_glyph(ICON_MIC, 16., glyph_color)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(px(theme::text::TITLE_SIZE))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .text_color(solid(theme::color::TEXT_2))
+                                    .child(if live {
+                                        led_dot(LedLit::Live)
+                                    } else {
+                                        led_dot(LedLit::Ring)
+                                    })
+                                    .child(status),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        // read-only mute state chip; full opacity (a known
+                        // state displays, it never greys out)
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .h(px(36.))
+                            .px(px(12.))
+                            .rounded(px(theme::metrics::BUTTON_RADIUS))
+                            .border_1()
+                            .border_color(solid(theme::color::LINE))
+                            .bg(solid(theme::color::RAISED))
+                            .text_color(solid(theme::color::TEXT))
+                            .text_size(px(theme::text::BODY_SIZE))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(svg_glyph(ICON_MIC, 14., solid(theme::color::TEXT)))
+                            .child(muted),
+                    ),
             )
-    }
-
-    fn tx_card(&self, idx: u8, tx: &TxVm) -> gpui::Div {
-        let status = if tx.connected {
-            "connected".to_string()
-        } else {
-            "no link".to_string()
-        };
-        let mut left = format!("tx{idx} — {status}");
-        if tx.muted {
-            left.push_str(" · muted");
-        }
-        div()
-            .flex()
-            .justify_between()
-            .px_4()
-            .py_2()
-            .rounded_md()
-            .bg(rgb(COL_ELEVATED))
-            .border_1()
-            .border_color(rgb(COL_BORDER))
-            .child(div().child(left))
             .child(
+                // battery part + meter part in ONE 10px-gap column
+                // [code index.html:64]
                 div()
-                    .text_color(battery_color(tx.battery_class))
-                    .child(battery_text(tx)),
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .child(battery_block(&digits, live))
+                    .child(level_meter_block()),
             )
     }
 
-    /// TX rows: always tx1/tx2 when a heart exists (even for a disconnected
-    /// TX), tail rows only when the reply carried a complete triple.
-    fn render_txs(&self) -> [Option<gpui::Div>; 4] {
-        [
-            self.vm.tx1.as_ref().map(|t| self.tx_card(1, t)),
-            self.vm.tx2.as_ref().map(|t| self.tx_card(2, t)),
-            self.vm.tx3.as_ref().map(|t| self.tx_card(3, t)),
-            self.vm.tx4.as_ref().map(|t| self.tx_card(4, t)),
-        ]
-    }
-
-    /// Read-only audio panels. When nothing is connected this whole section
-    /// collapses to `None`.
-    fn render_audio(&self) -> Option<gpui::Div> {
-        let voice = self.vm.voice_level?;
-        let eq = self.vm.eq_level?;
-        let ReverbVm { enabled, level } = self.vm.reverb?;
-        Some(
-            div()
-                .flex()
-                .justify_between()
-                .px_4()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(COL_SURFACE))
-                .border_1()
-                .border_color(rgb(COL_BORDER))
-                .child(div().text_color(rgb(COL_MUTED)).child(format!(
-                    "read-only: gain {voice} · eq {eq} · reverb {} (level {level})",
-                    onoff(enabled)
-                )))
+    /// NC panel: title + LED/status row, then the rocker well + the level
+    /// selector. While ANY SET is pending the status word says "Applying"
+    /// (VM), the lit pad renders at 40% element opacity with no glow, the
+    /// selector dims to 0.5, and BOTH controls ignore picks (mouse AND
+    /// keyboard — the decisions live in `nc_write_accepted`/`level_pick`).
+    fn nc_panel(&self, cx: &Context<Self>) -> gpui::Div {
+        let nc = &self.vm.nc;
+        let pending = nc.pending.is_some();
+        div().flex_1().min_h(px(0.)).child(
+            panel()
+                .flex_1()
+                .min_h(px(0.))
+                .gap(px(18.))
+                .child(titled_with_led(
+                    "Noise cancellation",
+                    nc_led(nc),
+                    nc_status(nc).to_string(),
+                ))
                 .child(
                     div()
-                        .text_color(rgb(COL_MUTED))
-                        .text_sm()
-                        .child("writable only after a capture"),
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .gap(px(theme::metrics::SPACE_4))
+                        .child(
+                            // rocker well: 14px padding, 26px radius over
+                            // the WELL fill (index.html:92). NOT a click
+                            // target — the two pads own the clicks, and
+                            // Space/Enter flip through the "nc_rocker"
+                            // key context (bindings in main).
+                            well(theme::metrics::WELL_RADIUS)
+                                .items_center()
+                                .justify_center()
+                                .p(px(14.))
+                                .track_focus(&self.focus)
+                                .key_context("nc_rocker")
+                                // focus-visible outline from the mock
+                                // (2px tungsten, index.html:14) becomes a
+                                // 2px border on the well itself.
+                                .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
+                                .child(
+                                    div()
+                                        .w(px(theme::metrics::ROCKER_WIDTH))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(6.))
+                                        .child(self.rocker_pad_on(pending, cx))
+                                        .child(self.rocker_pad_off(cx)),
+                                ),
+                        )
+                        .child(self.nc_selector(pending, cx)),
                 ),
         )
     }
 
-    /// Footer per spec §7f: last successful update + version, subtle. The
-    /// time comes from the VM's `updated` echo (actor-stamped, change-gated:
-    /// it advances when the device confirmed something new). DEMO mode
-    /// prefixes an explicit mock-data note — never passable for hardware.
-    fn render_footer(&mut self) -> gpui::Div {
-        let left = if self.demo {
-            format!(
-                "DEMO — scripted device, no hardware · state received {} (UTC)",
-                utc_hms(self.vm.updated)
-            )
-        } else {
-            format!("state received {} (UTC)", utc_hms(self.vm.updated))
-        };
-        div()
+    /// The On pad: the reference's lit recipe (tungsten gradient + INK text +
+    /// 32px tungsten glow) exactly when the verified state is ON; while a SET
+    /// is in flight the pad renders the SAME gradient at 40% ELEMENT opacity
+    /// with no glow (index.html:238 — opacity on the pad, not the fill);
+    /// OFF/unknown render the matte recipe with its hard under-edge. The
+    /// click requests THIS pad's state; `nc_write_accepted` turns a
+    /// pending-time click (or an unverified link) into a noop.
+    fn rocker_pad_on(&self, pending: bool, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let tungsten_gradient = linear_gradient(
+            180.,
+            linear_color_stop(solid(theme::color::TUNGSTEN_TOP), 0.),
+            linear_color_stop(solid(theme::color::TUNGSTEN_BOTTOM), 1.),
+        );
+        let matte_gradient = linear_gradient(
+            180.,
+            linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
+            linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
+        );
+        let pad = div()
+            .id("nc-pad-on")
+            .h(px(theme::metrics::ROCKER_PAD_ON_HEIGHT))
             .flex()
+            .items_center()
+            .justify_center()
+            .rounded_tl(px(theme::metrics::PAD_RADIUS_OUTER))
+            .rounded_tr(px(theme::metrics::PAD_RADIUS_OUTER))
+            .rounded_bl(px(theme::metrics::PAD_RADIUS_INNER))
+            .rounded_br(px(theme::metrics::PAD_RADIUS_INNER))
+            .text_size(px(16.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child("On");
+        let pad = if pending {
+            pad.text_color(solid(theme::color::INK))
+                .bg(tungsten_gradient)
+                .opacity(0.4)
+        } else if self.vm.nc.state == Some(true) {
+            // lit pad glow: `0 0 32px rgba(255,181,71,.35)` (theme.rs
+            // GLOW_TUNGSTEN); the inset top highlight is dropped (README).
+            pad.text_color(solid(theme::color::INK))
+                .bg(tungsten_gradient)
+                .shadow(vec![BoxShadow {
+                    color: gpui::Hsla::from(solid(theme::color::GLOW_TUNGSTEN.0))
+                        .opacity(theme::color::GLOW_TUNGSTEN.1),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(32.),
+                    spread_radius: px(0.),
+                }])
+        } else {
+            pad.text_color(solid(theme::color::TEXT_2))
+                .bg(matte_gradient)
+                .shadow(matte_under_edge(2.))
+        };
+        pad.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+            this.request_nc(true, window, cx);
+        }))
+    }
+
+    /// The Off pad: always the matte recipe (the reference never lights it;
+    /// a verified OFF is told apart by the status word). Requests OFF.
+    fn rocker_pad_off(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("nc-pad-off")
+            .h(px(theme::metrics::ROCKER_PAD_OFF_HEIGHT))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_tl(px(theme::metrics::PAD_RADIUS_INNER))
+            .rounded_tr(px(theme::metrics::PAD_RADIUS_INNER))
+            .rounded_bl(px(theme::metrics::PAD_RADIUS_OUTER))
+            .rounded_br(px(theme::metrics::PAD_RADIUS_OUTER))
+            .bg(linear_gradient(
+                180.,
+                linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
+                linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
+            ))
+            .text_color(solid(theme::color::TEXT_2))
+            .text_size(px(16.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .shadow(matte_under_edge(2.))
+            .child("Off")
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.request_nc(false, window, cx);
+            }))
+    }
+
+    /// NC level selector: the reference is a VERTICAL radiogroup (flex
+    /// column, index.html:98) — 4px padding, 2px gaps, each row flex-1 at
+    /// min-height 0, radius 12/8. The selected option = the device's
+    /// VERIFIED level (`nc_state == on && nc.level`); no pending target is
+    /// ever shown (the device hasn't confirmed it). While ANY SET is pending
+    /// the group dims to 0.5 (`nc.levelOpacity`, index.html:246) and picks
+    /// are ignored (`level_pick`, shared with the 1/2/3 keys); with the
+    /// switch verified OFF the rows render unselected and
+    /// non-interactive (level-while-off was never sent/observed).
+    fn nc_selector(&self, pending: bool, cx: &Context<Self>) -> gpui::Div {
+        let nc = &self.vm.nc;
+        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
+            .flex_1()
+            .min_w(px(0.))
+            .p(px(theme::metrics::SELECTOR_PADDING))
+            .gap(px(theme::metrics::SELECTOR_GAP))
+            .when(pending, |g| g.opacity(0.5));
+        for level in 0u8..=2 {
+            let selected = nc.state == Some(true) && nc.level == Some(level);
+            let pick = level_pick(level, nc);
+            let mut option = div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
+                .text_size(px(theme::text::BODY_SIZE))
+                .when(selected, |o| {
+                    o.bg(linear_gradient(
+                        180.,
+                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
+                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
+                    ))
+                    .text_color(solid(theme::color::TEXT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .shadow(matte_under_edge(1.))
+                })
+                .when(!selected, |o| {
+                    o.text_color(solid(theme::color::TEXT_2))
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .child(nc_level_label(level))
+                .relative();
+            if selected {
+                // 14×2 tungsten bar under the selected row, 5px up from the
+                // bottom (index.html:100); glow `0 0 6px rgba(255,181,71,.6)`.
+                option = option.child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(5.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
+                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
+                                .rounded(px(1.))
+                                .bg(solid(theme::color::TUNGSTEN))
+                                .shadow(vec![BoxShadow {
+                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
+                                        .opacity(0.6),
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(6.),
+                                    spread_radius: px(0.),
+                                }]),
+                        ),
+                );
+            }
+            let option = if pick != LevelPick::Blocked {
+                option
+                    .id(ElementId::named_usize("nc-level", usize::from(level)))
+                    .hover(|s| s.cursor_pointer())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_nc_level(level, cx);
+                    }))
+                    .into_any_element()
+            } else {
+                option.into_any_element()
+            };
+            group = group.child(option);
+        }
+        group
+    }
+
+    /// The read-only audio panels (Volume / Channel / EQ / Schedule): a
+    /// title and a selector group whose options are UNMAPPED — no HeartInfo
+    /// field→control mapping has ever been captured for them, so they render
+    /// at full opacity with NO selection (the "--"/no-selection rule) and
+    /// STAY read-only until a capture passes the roadmap gate
+    /// (`WRITABLE.*` false). Panels are justify-center with a 12px gap per
+    /// the reference (index.html:107). The DEVISION-chart dim (busy → 0.6)
+    /// is intentionally NOT applied: unknown is not disabled-looking
+    /// (documented deviation in README).
+    fn audio_panel(&self, title: &'static str, labels: &[&'static str]) -> gpui::Div {
+        panel()
+            .flex_1()
+            .justify_center()
+            .gap(px(theme::metrics::SPACE_3))
+            .child(
+                div()
+                    .text_size(px(theme::text::TITLE_SIZE))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(radio_group(labels, None))
+    }
+
+    /// Reverb panel: title + read-only state toggle (`ReverbVm.enabled`,
+    /// wire-read) + the size selector row, shown only while reverb is ON
+    /// (reference `sc-if reverbOn`, index.html:139); no selection (the
+    /// reverb level→label mapping is undocumented).
+    fn reverb_panel(&self) -> gpui::Div {
+        let enabled = self.vm.reverb.is_some_and(|reverb| reverb.enabled);
+        panel()
+            .flex_1()
+            .justify_center()
+            .gap(px(theme::metrics::SPACE_3))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(theme::text::TITLE_SIZE))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Reverb adjustment"),
+                    )
+                    .child(toggle_switch(enabled)),
+            )
+            .children(enabled.then(|| radio_group(&["Small", "Medium", "Large"], None)))
+    }
+
+    /// Mic recognition / Indicator light panels (the 120px row halves): the
+    /// reference's one-row layout (`align-items:center;
+    /// justify-content:space-between`, index.html:158). Mic recognition has
+    /// NO wire read → renders the OFF switch at full opacity (an unknown
+    /// state shows, it never greys out); the indicator light is the
+    /// wire-read `light` byte (§5 offset 11, inverted). BOTH are read-only
+    /// (`WRITABLE`, no listeners).
+    fn led_toggle_panel(&self, title: &'static str, on_state: bool) -> gpui::Div {
+        panel()
+            .flex_row()
+            .items_center()
             .justify_between()
-            .pt_2()
-            .text_color(rgb(COL_MUTED))
-            .text_sm()
-            .child(left)
-            .child(format!("holly-gpui v{}", env!("CARGO_PKG_VERSION")))
+            .child(
+                div()
+                    .text_size(px(theme::text::TITLE_SIZE))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(toggle_switch(on_state))
+    }
+
+    // ---- footer (32px) --------------------------------------------------------
+
+    /// Reference footer: 32px, top rule LINE_SOFT, 20px side padding,
+    /// caption-size TEXT_3; LED + the short connection word
+    /// (`conn_status_word`); right: the certified VID:PID (VM const). The
+    /// DEMO marker rides next to the word — never hidden (mock-data rule).
+    fn render_footer(&self) -> gpui::Div {
+        div()
+            .h(px(theme::metrics::FOOTER_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(theme::metrics::SPACE_2))
+            .px(px(theme::metrics::SPACE_5))
+            .border_t_1()
+            .border_color(solid(theme::color::LINE_SOFT))
+            .text_size(px(theme::text::CAPTION_SIZE))
+            .text_color(solid(theme::color::TEXT_3))
+            .child(led_dot(vm_led(&self.vm)))
+            .child(div().child(conn_status_word(&self.vm)))
+            .children(self.demo.map(|_| {
+                div()
+                    .text_color(solid(theme::color::TUNGSTEN))
+                    .child("· demo")
+            }))
+            .child(div().ml_auto().child(VID_PID.to_string()))
+    }
+}
+
+/// Mic card names: the design fixes exactly two receivers (Mic 1/Mic 2 —
+/// [user] the rig is a dual-channel set; cards render even without a
+/// heart, with "--"/"No data"). NOT device protocol data.
+fn name_for(id: &str) -> &'static str {
+    match id {
+        "mic-1" => "Mic 1",
+        _ => "Mic 2",
+    }
+}
+
+/// The reference battery block: 64px/300 digits + (live) 20px "%" suffix +
+/// right "Battery" label; 5 segments h8 r3 gap 4, lit = TEXT white when
+/// live, RAISED when not.
+fn battery_block(digits: &str, live: bool) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap(px(theme::metrics::SPACE_1))
+                .child(
+                    div()
+                        .text_size(px(theme::text::READOUT_SIZE))
+                        .font_weight(FontWeight::LIGHT)
+                        .text_color(solid(if live {
+                            theme::color::TEXT
+                        } else {
+                            theme::color::TEXT_DISABLED
+                        }))
+                        .child(digits.to_string()),
+                )
+                .children(live.then(|| {
+                    div()
+                        .text_size(px(theme::text::READOUT_UNIT_SIZE))
+                        .text_color(solid(theme::color::TEXT_2))
+                        .child("%")
+                }))
+                .child(
+                    div()
+                        .ml_auto()
+                        .text_size(px(theme::text::BODY_SIZE))
+                        .text_color(solid(theme::color::TEXT_2))
+                        .child("Battery"),
+                ),
+        )
+        .child(
+            // 5 segments, h8 r3, gap 4; the reference lights ALL of them on a
+            // live link (`seg(5, live ? 5 : 0, TEXT)`, index.html:229) and
+            // leaves every segment the unlit RAISED fill otherwise.
+            div().flex().gap(px(theme::metrics::SPACE_1)).children(
+                (0..theme::metrics::BATTERY_SEGMENTS).map(|_| {
+                    div()
+                        .flex_1()
+                        .h(px(8.))
+                        .rounded(px(theme::metrics::BATTERY_SEGMENT_RADIUS))
+                        .bg(solid(if live {
+                            theme::color::TEXT
+                        } else {
+                            theme::color::RAISED
+                        }))
+                        .into_any_element()
+                }),
+            ),
+        )
+}
+
+/// The reference level meter: a "Level" caption (13px TEXT_2) above a row of
+/// 20 segments (row gap 3, height 14, radius 2; index.html:74-78). The VM
+/// carries NO per-mic level field (HeartInfo exposes none we have decoded),
+/// so every segment renders the unlit RAISED fill — always. This is the one
+/// unfinished reproduction in the mock (README: deviations); a live meter
+/// REQUIREMENT, not an invented device reading.
+fn level_meter_block() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.)) // [code index.html:74]
+        .child(
+            div()
+                .text_size(px(theme::text::BODY_SIZE))
+                .text_color(solid(theme::color::TEXT_2))
+                .child("Level"),
+        )
+        .child(
+            div()
+                .flex()
+                .gap(px(3.)) // [code index.html:76]
+                .children((0..theme::metrics::METER_SEGMENTS).map(|_| {
+                    div()
+                        .flex_1()
+                        .h(px(theme::metrics::METER_SEGMENT_HEIGHT))
+                        .rounded(px(theme::metrics::METER_SEGMENT_RADIUS))
+                        .bg(solid(theme::color::RAISED))
+                        .into_any_element()
+                })),
+        )
+}
+
+// ---- render -------------------------------------------------------------------
+
+impl AppModel {
+    /// Action target for ctrl-r ([`Refresh`], global key binding, dispatched
+    /// at the window root when no handle holds focus — window.rs:3982-3988).
+    fn on_refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_now(cx);
     }
 }
 
@@ -550,173 +1476,209 @@ impl Render for AppModel {
             .size_full()
             .flex()
             .flex_col()
-            .gap_3()
-            .p_4()
-            .bg(rgb(COL_BG))
-            // T2: the bundled face for every string (theme::text::FAMILY);
-            // weight/size refinements live on the elements.
-            .font(gpui::font(theme::text::FAMILY))
-            .text_color(rgb(COL_TEXT))
-            .track_focus(&self.focus)
+            .rounded(px(theme::metrics::WINDOW_RADIUS))
+            .border_1()
+            .border_color(solid(theme::color::LINE))
+            .overflow_hidden()
+            .bg(linear_gradient(
+                180.,
+                linear_color_stop(solid(theme::color::CHASSIS_TOP), 0.),
+                linear_color_stop(solid(theme::color::CHASSIS), 1.),
+            ))
+            .font_family(theme::text::FAMILY) // family for every text below (styled.rs:615-623)
+            .text_color(solid(theme::color::TEXT))
+            // Global keys (1/2/3, ctrl-r) reach these listeners when nothing
+            // holds focus (dispatch falls back to the ROOT node's path,
+            // window.rs:3982-3988 + key_dispatch.rs:550-557); Space/Enter
+            // ("nc_rocker" context) flow through the focused well. Interactive
+            // elements own their own clicks; the root is a plain extension of
+            // the dispatch chain, not a focus target.
             .on_action(cx.listener(Self::toggle_nc))
             .on_action(cx.listener(Self::on_nc_low))
             .on_action(cx.listener(Self::on_nc_medium))
             .on_action(cx.listener(Self::on_nc_strong))
-            .on_action(cx.listener(Self::refresh))
-            .child(self.render_header())
-            .children(self.render_banner())
-            .child(self.render_nc(cx))
-            .children(self.render_txs().into_iter().flatten())
-            .children(self.render_audio())
+            .on_action(cx.listener(Self::on_refresh))
+            .child(self.render_titlebar())
+            .children(self.render_banner(cx))
+            .child(self.render_body(cx))
             .child(self.render_footer())
     }
 }
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
-        // T2: register the bundled Hanken Grotesk faces before the first
-        // window; failure logs once and falls back to the system sans.
-        fonts::register(cx);
-        cx.bind_keys([
-            KeyBinding::new("space", ToggleNoise, None),
-            KeyBinding::new("1", NcLow, None),
-            KeyBinding::new("2", NcMedium, None),
-            KeyBinding::new("3", NcStrong, None),
-            KeyBinding::new("r", Refresh, None),
-            KeyBinding::new("ctrl-q", Quit, None),
-        ]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
+// ---- entry --------------------------------------------------------------------
 
-        // The device actor owns the ONLY claim. `--demo` (explicit flag)
-        // starts the SAME actor over the scripted DemoDevice instead: zero
-        // USB in demo mode, clearly marked in the UI (chip + title + footer).
-        // Discard anything after the flag so arg shapes stay minimal (no
-        // clap in a frontend of this size).
-        let demo = std::env::args().skip(1).any(|a| a == "--demo");
-        let device = if demo {
-            holly_app::demo::start_demo()
+/// `--demo [word]`, std-only and testable (no clap in a frontend of this
+/// size). The flag may appear anywhere; an optional following word selects
+/// the scenario via [`DemoScenario::from_word`] (bare flag = `connected`).
+/// An unrecognized flag or word is a USAGE ERROR: print and exit(2) — never
+/// a silent fallback to a session the user did not pick. Not directly
+/// testable for the exit path (std process exit); tests cover the returned
+/// arms.
+fn parse_demo_args(args: impl Iterator<Item = String>) -> Option<DemoScenario> {
+    let mut saw_flag = false;
+    let mut word: Option<String> = None;
+    for arg in args {
+        if arg == "--demo" {
+            saw_flag = true;
+        } else if saw_flag && word.is_none() && !arg.starts_with('-') {
+            word = Some(arg); // the scenario word right after the flag
         } else {
-            holly_app::start()
-        };
-        let rx = device.subscribe();
+            eprintln!("usage: holly-gpui [--demo [connected|pending|busy]]");
+            eprintln!("unrecognized argument: {arg}");
+            std::process::exit(2);
+        }
+    }
+    if !saw_flag {
+        return None;
+    }
+    DemoScenario::from_word(word.as_deref()).inspect(|_| {})
+}
 
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
-                        size(px(760.), px(620.)),
-                        cx,
-                    ))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(if demo {
-                            "HOLLY — DEMO".into()
-                        } else {
-                            "HOLLY".into()
+/// holly-gpui: the window. Boots the shared actor behind a handle, opens the
+/// ONLY window of the app, and pumps the blocking snapshot channel into the
+/// executor (a std Receiver cannot be awaited — the bridge lives here, see
+/// the module docs and old task-8 notes).
+fn main() {
+    Application::new()
+        .with_assets(IconAssets) // assets ship inside the binary (app.rs:155)
+        .run(|cx: &mut App| {
+            // T2: register the bundled Hanken Grotesk faces before the first
+            // window opens; failure logs once and falls back to the system
+            // sans (fonts.rs).
+            fonts::register(cx);
+
+            // Keyboard: Space/Enter flip the rocker ONLY while its well is
+            // focused (key context "nc_rocker"); 1/2/3 and ctrl-r are global
+            // bindings — with nothing focused their actions dispatch at the
+            // window ROOT (window.rs:3982-3988), which carries the
+            // corresponding on_action listeners.
+            cx.bind_keys([
+                KeyBinding::new("space", ToggleNoise, Some("nc_rocker")),
+                KeyBinding::new("enter", ToggleNoise, Some("nc_rocker")),
+                KeyBinding::new("1", NcLow, None),
+                KeyBinding::new("2", NcMedium, None),
+                KeyBinding::new("3", NcStrong, None),
+                KeyBinding::new("ctrl-r", Refresh, None),
+                KeyBinding::new("ctrl-q", Quit, None),
+            ]);
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+
+            // The device actor owns the ONLY claim. `--demo [word]` starts
+            // the SAME actor over the scripted DemoDevice (demo.rs): zero
+            // USB in demo mode, clearly marked in the UI (chip + title +
+            // footer).
+            let demo = parse_demo_args(std::env::args().skip(1));
+            let device = match demo {
+                Some(scenario) => holly_app::demo::start_demo_scenario(scenario),
+                None => holly_app::start(),
+            };
+            let rx = device.subscribe();
+
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                            None,
+                            size(
+                                px(theme::metrics::WINDOW_DEFAULT_WIDTH),
+                                px(theme::metrics::WINDOW_DEFAULT_HEIGHT),
+                            ),
+                            cx,
+                        ))),
+                        // The mock's grid (1fr auto 132px 120px) does not
+                        // reflow below the designed size — clamp it.
+                        window_min_size: Some(size(
+                            px(theme::metrics::WINDOW_DEFAULT_WIDTH),
+                            px(theme::metrics::WINDOW_DEFAULT_HEIGHT),
+                        )),
+                        // CSD: `Client` drops the compositor chrome (the
+                        // titlebar is drawn in render_titlebar) while
+                        // `title`/`appears_transparent` keep the xdg window
+                        // name for taskbars — image_gallery.rs:263-271
+                        // pattern; fields verified platform.rs:1122-1131.
+                        titlebar: Some(TitlebarOptions {
+                            title: Some(if demo.is_some() {
+                                "HOLLY — DEMO".into()
+                            } else {
+                                "HOLLY".into()
+                            }),
+                            appears_transparent: true,
+                            ..Default::default() // traffic_light_position (platform.rs:1257), derives Default (platform.rs:1244-1248)
                         }),
+                        window_decorations: Some(WindowDecorations::Client),
+                        app_id: Some("holly-gpui".to_string()),
                         ..Default::default()
-                    }),
-                    app_id: Some("holly-gpui".to_string()),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    cx.new(|cx| {
-                        let focus = cx.focus_handle();
-                        focus.focus(window);
-                        AppModel {
-                            focus,
-                            vm: ViewModel::default(),
-                            device,
-                            demo,
+                    },
+                    |window, cx| {
+                        cx.new(|cx| {
+                            // The rocket rocker owns the keyboard on start:
+                            // focusing its handle puts "nc_rocker" on the
+                            // dispatch path from the first frame
+                            // (on_window_close_quit.rs:58 pattern).
+                            let focus = cx.focus_handle();
+                            focus.focus(window);
+                            AppModel {
+                                focus,
+                                vm: ViewModel::default(),
+                                device,
+                                demo,
+                            }
+                        })
+                    },
+                )
+                .unwrap();
+
+            let view: Entity<AppModel> = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+
+            // ---- blocking Receiver -> executor bridge (see module docs) ----
+            let (snap_tx, mut snap_rx) = unbounded::<holly_app::Snapshot>();
+            thread::Builder::new()
+                .name("holly-gpui-pump".to_string())
+                .spawn(move || {
+                    for snap in rx {
+                        if snap_tx.unbounded_send(snap).is_err() {
+                            break; // UI side is gone
                         }
-                    })
-                },
-            )
-            .unwrap();
+                    }
+                    // Keep rx alive until UI teardown; rx dropped here
+                    // releases our subscriber slot (Hub silently drops
+                    // lagged subs).
+                })
+                .expect("spawn holly-gpui-pump");
 
-        let view: Entity<AppModel> = window.update(cx, |_, _, cx| cx.entity()).unwrap();
-
-        // ---- blocking Receiver -> executor bridge (see module docs) ----
-        let (snap_tx, mut snap_rx) = unbounded::<holly_app::Snapshot>();
-        thread::Builder::new()
-            .name("holly-gpui-pump".to_string())
-            .spawn(move || {
-                for snap in rx {
-                    if snap_tx.unbounded_send(snap).is_err() {
-                        break; // UI side is gone
+            cx.spawn(async move |cx| {
+                // snap_rx.next() requires `futures::StreamExt` (import above).
+                while let Some(snap) = snap_rx.next().await {
+                    if view
+                        .update(cx, |model, cx| model.apply_snapshot(snap, cx))
+                        .is_err()
+                    {
+                        break; // view released (window closed)
                     }
                 }
-                // Keep rx alive until UI teardown; rx dropped here releases
-                // our subscriber slot (Hub silently drops lagged subs).
             })
-            .expect("spawn holly-gpui-pump");
-
-        cx.spawn(async move |cx| {
-            // snap_rx.next() requires `futures::StreamExt` (import above).
-            while let Some(snap) = snap_rx.next().await {
-                if view
-                    .update(cx, |model, cx| model.apply_snapshot(snap, cx))
-                    .is_err()
-                {
-                    break; // view released (window closed)
-                }
-            }
-        })
-        .detach();
-    });
+            .detach();
+        });
 }
+
+// ---- decisions under test -----------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::{
-        LevelBtn, NoiseWrite, battery_text, conn_badge, level_button, toggle_target, utc_hms,
+        LedLit, LevelPick, banner_palette, battery_digits, level_pick, nc_led, nc_write_accepted,
+        vm_led,
     };
-    use holly_app::vm::{Banner, BatteryClass, NcVm, TxVm, ViewModel};
-    /// The toggle's entire decision logic, exercised on all pending/state
-    /// combinations. Disabled whenever no verified state exists; pending
-    /// (actor-reported in-flight SET) wins over the displayed state, which
-    /// makes the toggle idempotent under a double-click while a SET is
-    /// still in flight: the second click computes the SAME target.
-    #[test]
-    fn toggle_target_matrix() {
-        // No verified state: disabled both with and without a stray pending.
-        assert_eq!(toggle_target(None, None), None);
-        // Verified states.
-        assert_eq!(toggle_target(None, Some(true)), Some(false));
-        assert_eq!(toggle_target(None, Some(false)), Some(true));
-        // Pending switch overrides displayed state (double-click stability).
-        assert_eq!(
-            toggle_target(Some(NoiseWrite::Switch(false)), Some(true)),
-            Some(true)
-        );
-        assert_eq!(
-            toggle_target(Some(NoiseWrite::Switch(true)), Some(false)),
-            Some(false)
-        );
-        // Pending equal to current state folds to the opposite — matches
-        // the pending-snapshot semantics (pending == the value being SET).
-        assert_eq!(
-            toggle_target(Some(NoiseWrite::Switch(true)), Some(true)),
-            Some(false)
-        );
-        // An in-flight Level write is orthogonal to the switch: the target
-        // is computed purely from the verified state.
-        assert_eq!(
-            toggle_target(Some(NoiseWrite::Level(2)), Some(true)),
-            Some(false)
-        );
-        assert_eq!(
-            toggle_target(Some(NoiseWrite::Level(0)), Some(false)),
-            Some(true)
-        );
-    }
+    use holly_app::NoiseWrite;
+    use holly_app::vm::{Banner, NcVm, TxVm, ViewModel, battery_class};
 
+    /// A rocker/VM shape straight from the VM fields.
     fn nc(level: Option<u8>, state: Option<bool>, pending: Option<NoiseWrite>) -> NcVm {
         NcVm {
             state,
@@ -726,45 +1688,13 @@ mod tests {
         }
     }
 
-    /// Level buttons: active/pending/idle matrix (the entire visual+write
-    /// decision set for the 1/2/3 row).
-    #[test]
-    fn level_button_matrix() {
-        // switch not verified on → always Idle (never writes with a
-        // never-observed off-state level semantics).
-        for st in [None, Some(false)] {
-            assert_eq!(level_button(2, &nc(Some(2), st, None)), LevelBtn::Idle);
-            assert_eq!(
-                level_button(2, &nc(Some(2), st, Some(NoiseWrite::Level(2)))),
-                LevelBtn::Idle,
-                "pending does not rescue a switch-off row"
-            );
+    fn tx(connected: bool, battery: u8) -> TxVm {
+        TxVm {
+            connected,
+            battery,
+            battery_class: battery_class(battery),
+            muted: false,
         }
-        // switch on: the device's current level is ACTIVE (click = no-op).
-        assert_eq!(
-            level_button(1, &nc(Some(1), Some(true), None)),
-            LevelBtn::Active
-        );
-        // other levels idle or pending only via an exact Level match.
-        assert_eq!(
-            level_button(2, &nc(Some(1), Some(true), None)),
-            LevelBtn::Idle
-        );
-        assert_eq!(
-            level_button(2, &nc(Some(1), Some(true), Some(NoiseWrite::Level(2)))),
-            LevelBtn::Pending
-        );
-        // an in-flight SWITCH flip does not mark level buttons pending.
-        assert_eq!(
-            level_button(2, &nc(Some(0), Some(true), Some(NoiseWrite::Switch(false)))),
-            LevelBtn::Idle
-        );
-        // unknown level values are never Active (only 0/1/2 known).
-        assert_eq!(
-            level_button(5, &nc(Some(5), Some(true), None)),
-            LevelBtn::Active,
-            "device-reported odd level shows as active (read truth) — press path blocks via set_nc_level"
-        );
     }
 
     fn blank_vm() -> ViewModel {
@@ -775,73 +1705,132 @@ mod tests {
             tx2: None,
             tx3: None,
             tx4: None,
-            nc: NcVm {
-                state: None,
-                level: None,
-                pending: None,
-                last_error: None,
-            },
+            nc: nc(None, None, None),
+            light: None,
             voice_level: None,
             eq_level: None,
             reverb: None,
-            updated: Some(0),
+            updated: None,
         }
     }
 
-    fn tx(connected: bool, battery: u8, class: BatteryClass) -> TxVm {
-        TxVm {
-            connected,
-            battery,
-            battery_class: class,
-            muted: false,
+    /// Battery digits: the reference's `{{m.battery}}` = "100" | "--". A
+    /// live transmitter shows its percent; ANYTHING on a dead link is "--" —
+    /// even a decoded 0 byte, which is device padding, never "0 %".
+    #[test]
+    fn battery_digits_live_shows_percent_dead_shows_placeholder() {
+        assert_eq!(battery_digits(&tx(true, 93)), "93");
+        assert_eq!(battery_digits(&tx(true, 0)), "0");
+        assert_eq!(battery_digits(&tx(false, 93)), "--");
+        assert_eq!(battery_digits(&tx(false, 0)), "--");
+    }
+
+    /// The level pick: blocked while ANY SET is in flight, blocked while the
+    /// switch is not verified ON (level-while-off was never sent/observed),
+    /// noop on the device's own level, write otherwise.
+    #[test]
+    fn level_pick_matrix() {
+        // Switch not verified on: blocked, pending or not.
+        for state in [None, Some(false)] {
+            assert_eq!(level_pick(2, &nc(None, state, None)), LevelPick::Blocked);
+            assert_eq!(
+                level_pick(2, &nc(Some(1), state, Some(NoiseWrite::Switch(true)))),
+                LevelPick::Blocked
+            );
         }
+        // Switch on, device at level 1.
+        let on = nc(Some(1), Some(true), None);
+        assert_eq!(level_pick(1, &on), LevelPick::Noop);
+        assert_eq!(level_pick(0, &on), LevelPick::Write);
+        assert_eq!(level_pick(2, &on), LevelPick::Write);
+        // ANY pending write blocks (switch in flight ALSO blocks levels).
+        assert_eq!(
+            level_pick(0, &nc(Some(0), Some(true), Some(NoiseWrite::Switch(false)))),
+            LevelPick::Blocked
+        );
+        assert_eq!(
+            level_pick(2, &nc(Some(0), Some(true), Some(NoiseWrite::Level(2)))),
+            LevelPick::Blocked
+        );
     }
 
-    /// Battery line (spec §7c): a disconnected transmitter must NOT render a
-    /// 0 % figure — the heart's zero on a dead link is padding, not percent.
+    /// Write gate: allowed only with a verified state and NOTHING in flight.
     #[test]
-    fn battery_text_shows_unavailable_when_disconnected() {
-        let live = tx(true, 93, BatteryClass::High);
-        assert_eq!(battery_text(&live), "battery 93 % (High)");
-        // Even with device-decoded "0 % (Critical)" bytes on a dead link:
-        let dead = tx(false, 0, BatteryClass::Critical);
-        assert_eq!(battery_text(&dead), "battery — (unavailable)");
+    fn nc_write_accepted_matrix() {
+        // No verified state: never (a request without a known state cannot
+        // be deduped against reality).
+        assert!(!nc_write_accepted(&nc(None, None, None)));
+        // Verified state, nothing in flight: accepted.
+        assert!(nc_write_accepted(&nc(Some(0), Some(true), None)));
+        assert!(nc_write_accepted(&nc(Some(1), Some(false), None)));
+        // ANY pending SET, either byte: rejected.
+        assert!(!nc_write_accepted(&nc(
+            Some(1),
+            Some(true),
+            Some(NoiseWrite::Switch(true))
+        )));
+        assert!(!nc_write_accepted(&nc(
+            Some(1),
+            Some(true),
+            Some(NoiseWrite::Level(1))
+        )));
     }
 
-    /// Header badge: decided only from VM state; boundary arms on both ends.
+    /// Banner palette per kind (colour rule: amber = attention, red = error,
+    /// grey = everything else; container colors come from the tokens).
     #[test]
-    fn conn_badge_matrix() {
-        // Connected = no banner AND no searching text, nothing invented.
-        assert_eq!(conn_badge(&blank_vm()), ("connected", super::COL_SUCCESS));
+    fn banner_palette_kinds() {
+        let err = banner_palette(&Banner::Error);
+        assert_eq!(err.accent, crate::theme::color::ALERT);
+        assert_eq!(err.title, crate::theme::color::ALERT);
 
-        let mut connecting = blank_vm();
-        connecting.banner_text = Some("searching for the dongle…".to_string());
-        assert_eq!(conn_badge(&connecting), ("connecting", super::COL_ACCENT));
+        let attention = banner_palette(&Banner::Busy);
+        assert_eq!(attention.accent, crate::theme::color::TUNGSTEN);
+        let denied = banner_palette(&Banner::PermissionDenied);
+        assert_eq!(denied.accent, crate::theme::color::TUNGSTEN);
 
-        let mut nf = blank_vm();
-        nf.banner = Some(Banner::NotFound);
-        assert_eq!(conn_badge(&nf), ("no device", super::COL_MUTED));
-
-        let mut busy = blank_vm();
-        busy.banner = Some(Banner::Busy);
-        assert_eq!(conn_badge(&busy), ("blocked", super::COL_WARNING));
-        let mut denied = blank_vm();
-        denied.banner = Some(Banner::PermissionDenied);
-        assert_eq!(conn_badge(&denied), ("blocked", super::COL_WARNING));
-
-        let mut err = blank_vm();
-        err.banner = Some(Banner::Error);
-        assert_eq!(conn_badge(&err), ("error", super::COL_ERROR));
+        let lost = banner_palette(&Banner::NotFound);
+        assert_eq!(lost.accent, crate::theme::color::TEXT_3);
     }
 
-    /// UTC HH:MM:SS from the actor's UNIX-second stamp, std-only (day
-    /// boundary irrelevant); no successful GET yet → an explicit dash.
+    /// Footer LED decided only from the VM: alert on error, amber on the
+    /// attention banners and while connecting, grey ring when not found,
+    /// green when live (no banner, no searching text).
     #[test]
-    fn utc_hms_boundaries() {
-        assert_eq!(utc_hms(None), "—");
-        assert_eq!(utc_hms(Some(0)), "00:00:00");
-        assert_eq!(utc_hms(Some(3725)), "01:02:05");
-        assert_eq!(utc_hms(Some(86_399)), "23:59:59");
-        assert_eq!(utc_hms(Some(86_499)), "00:01:39", "wraps at midnight");
+    fn vm_led_matrix() {
+        let mut vm = blank_vm();
+        vm.banner = Some(Banner::Error);
+        assert_eq!(vm_led(&vm), LedLit::Alert);
+
+        for banner in [Banner::Busy, Banner::PermissionDenied] {
+            vm.banner = Some(banner);
+            assert_eq!(vm_led(&vm), LedLit::Attention { pulse: false });
+        }
+
+        vm.banner = Some(Banner::NotFound);
+        assert_eq!(vm_led(&vm), LedLit::Ring);
+
+        vm.banner = None;
+        vm.banner_text = Some("Searching for the dongle…".to_string());
+        assert_eq!(vm_led(&vm), LedLit::Attention { pulse: false });
+
+        vm.banner_text = None;
+        assert_eq!(vm_led(&vm), LedLit::Live);
+    }
+
+    /// NC panel LED decided only from the VM shape: pulsing amber while a
+    /// write is in flight (the actor-reported pending), solid amber while ON,
+    /// grey ring otherwise.
+    #[test]
+    fn nc_led_matrix() {
+        let pending = nc(None, Some(true), Some(NoiseWrite::Switch(false)));
+        assert_eq!(nc_led(&pending), LedLit::Attention { pulse: true });
+
+        let on = nc(Some(1), Some(true), None);
+        assert_eq!(nc_led(&on), LedLit::Attention { pulse: false });
+
+        for state in [None, Some(false)] {
+            assert_eq!(nc_led(&nc(None, state, None)), LedLit::Ring);
+        }
     }
 }
