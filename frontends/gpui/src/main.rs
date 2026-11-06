@@ -42,23 +42,32 @@ actions!(
     [ToggleNoise, NcLow, NcMedium, NcStrong, Refresh, Quit]
 );
 
-// ---- Signal theme tokens ----------------------------------------------------
-// Presentation-only: exact hex from the design spec (§5 "Signal"), centralized
-// here — components must not scatter hex values (tokens rule). No device
-// meaning; the VM exposes classes/strings, the UI maps them to tokens.
-//   background; surface = recessed rows/buttons; elevated = cards.
-const COL_BG: u32 = 0x111318;
-const COL_SURFACE: u32 = 0x191d25;
-const COL_ELEVATED: u32 = 0x222833;
-const COL_BORDER: u32 = 0x303744;
-const COL_TEXT: u32 = 0xe8ebf0;
-const COL_MUTED: u32 = 0x929baa;
-const COL_ACCENT: u32 = 0x83a9e8;
-/// Semantic: success = connected/healthy battery; warning = pending ops/low
-/// battery/permission+busy banners; error = error banner/critical battery.
-const COL_SUCCESS: u32 = 0x65b891;
-const COL_WARNING: u32 = 0xe5b765;
-const COL_ERROR: u32 = 0xdf7777;
+mod theme;
+
+// ---- Theme bridge (T1) -------------------------------------------------------
+// The Signal token set is gone; `theme.rs` (verbatim from the design reference,
+// docs/design/theme.rs) is the single colour source. The pre-T3 view layer
+// below still uses the old component names, so they now resolve to graphite/
+// tungsten tokens as follows — presentation mapping only, no device meaning:
+//   window/background  -> CHASSIS        recessed rows/banner body -> PANEL_BOTTOM
+//   card bodies        -> RAISED         one-pixel lines           -> LINE
+//   primary/secondary  -> TEXT / TEXT_2  interactive emphasis      -> TUNGSTEN
+//   "connected"        -> LIVE           needs-attention           -> TUNGSTEN
+//                        (the design colour rule collapses amber roles:
+//                         amber = engaged OR needs attention)
+//   failure            -> ALERT
+// Every value cites theme.rs — no hex literals remain in view code.
+const COL_BG: u32 = theme::color::CHASSIS;
+const COL_SURFACE: u32 = theme::color::PANEL_BOTTOM;
+const COL_ELEVATED: u32 = theme::color::RAISED;
+const COL_BORDER: u32 = theme::color::LINE;
+const COL_TEXT: u32 = theme::color::TEXT;
+const COL_MUTED: u32 = theme::color::TEXT_2;
+const COL_ACCENT: u32 = theme::color::TUNGSTEN;
+const COL_SUCCESS: u32 = theme::color::LIVE;
+/// Needs-attention — same amber role as [`COL_ACCENT`] by the design colour rule.
+const COL_WARNING: u32 = theme::color::TUNGSTEN;
+const COL_ERROR: u32 = theme::color::ALERT;
 
 fn battery_color(class: BatteryClass) -> gpui::Hsla {
     // Spec mapping: Full/High → success green, Low → amber, Critical → red.
