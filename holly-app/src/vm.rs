@@ -25,9 +25,59 @@ pub enum Banner {
 }
 
 /// Ready-made, tested hint text for [`Banner::PermissionDenied`].
-pub const HINT_PERMISSION: &str = "permission denied — install packaging/70-hollyland.rules \
+pub const HINT_PERMISSION: &str = "Permission denied — install packaging/70-hollyland.rules \
      (sudo cp packaging/70-hollyland.rules /etc/udev/rules.d/ && \
      sudo udevadm control --reload), then replug the dongle";
+
+/// Titlebar device name — one place, never hardcoded in a view. Source: the
+/// project owner confirms the rig is a Hollyland LARK A1 (task brief,
+/// 2026-11-06); `docs/device.md` lists the marketing name as an open
+/// question and the USB product string says only "Wireless Microphone".
+/// Surfacing it here (instead of extending holly-usb, which is frozen) is
+/// the decision recorded for T3; revisit if the product string can be
+/// plumbed end-to-end.
+pub const DEVICE_NAME: &str = "Lark A1";
+
+/// Which controls have a wire-certified SET path. ONE flag per design
+/// control: when a capture lands for a read-only control, flipping its flag
+/// (after the §1 gate in docs/gui-roadmap.md) promotes exactly that control —
+/// no per-control hunting anywhere.
+///
+/// Evidence per flag:
+/// - `nc_toggle`    — SET_NOISE (cmd 19) [wire
+///   captures/2026-11-05-set-noise.txt E2/E4]; `nc_level` — the same
+///   frame's second byte, written + verified [wire
+///   captures/2026-11-05-noise-level-medium.txt session 3a]
+/// - everything else is [code] at best (mic mute cmd 22, light cmd 33,
+///   reverb 5, eq 7, shutdown 39/40 …) and has never been captured, so it
+///   stays read-only today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Writable {
+    pub nc_toggle: bool,
+    pub nc_level: bool,
+    pub mic_mute: bool,
+    pub volume: bool,
+    pub channel_mode: bool,
+    pub eq: bool,
+    pub reverb: bool,
+    pub mic_recognition: bool,
+    pub schedule_power_off: bool,
+    pub indicator_light: bool,
+}
+
+/// The writability table, exactly as the certified chain stands.
+pub const WRITABLE: Writable = Writable {
+    nc_toggle: true,
+    nc_level: true,
+    mic_mute: false,
+    volume: false,
+    channel_mode: false,
+    eq: false,
+    reverb: false,
+    mic_recognition: false,
+    schedule_power_off: false,
+    indicator_light: false,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +98,62 @@ pub fn battery_class(pct: u8) -> BatteryClass {
         40..=74 => BatteryClass::High,
         _ => BatteryClass::Full,
     }
+}
+
+/// NC level byte -> the phone app's own value name [code
+/// HLDevice6302Activity.java:1593/:1610/:1626-1631; §5.1 identity mapping
+/// strong = 2, medium = 1, low = 0 — read 0/1 and written 1/2 [wire
+/// captures/2026-11-05-noise-level-medium.txt]]. The UI selector order
+/// (Weak, Medium, Strong) IS byte order, so this is the only translation
+/// the byte needs; anything outside the APK's 0/1/2 set is "Unknown" and
+/// renders as no selection.
+pub fn nc_level_label(level: u8) -> &'static str {
+    match level {
+        0 => "Weak",
+        1 => "Medium",
+        2 => "Strong",
+        _ => "Unknown",
+    }
+}
+
+/// The NC panel's status word: one place, driven ONLY by NcVm — a pending
+/// (actor-reported, latest-wins) write says "Applying" while the panel keeps
+/// showing the previous device state; an unknown state is "Unavailable".
+pub fn nc_status(nc: &NcVm) -> &'static str {
+    match nc.pending {
+        Some(_) => "Applying",
+        None => match nc.state {
+            Some(true) => "On",
+            Some(false) => "Off",
+            None => "Unavailable",
+        },
+    }
+}
+
+/// Short connection word for the banner title slot AND the footer LED text:
+/// a live connection names itself; anything else borrows the banner's word.
+/// Pure (no device I/O), tested.
+pub fn conn_status_word(vm: &ViewModel) -> &'static str {
+    match vm.banner {
+        Some(Banner::Error) => "Device error",
+        Some(Banner::Busy) => "Receiver in use",
+        Some(Banner::PermissionDenied) => "Access blocked",
+        Some(Banner::NotFound) => "No receiver",
+        None if vm.banner_text.is_some() => "Searching",
+        None => "Receiver connected",
+    }
+}
+
+/// Mic-card status line: a live link says so explicitly; an unverifiable
+/// transmitter never inherits inventing state.
+pub fn mic_status(connected: bool) -> &'static str {
+    if connected { "Connected" } else { "No data" }
+}
+
+/// Per-mic mute button wording. Muted (known and true) reads as state, not
+/// as an alarm: no red, ever (design colour rule).
+pub fn mute_label(muted: bool) -> &'static str {
+    if muted { "Muted" } else { "Mute" }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -98,6 +204,10 @@ pub struct ViewModel {
     pub tx3: Option<TxVm>,
     pub tx4: Option<TxVm>,
     pub nc: NcVm,
+    /// Receiver indicator light (HeartInfo §5 offset 11; the byte is
+    /// inverted — 0 means on `[code ProGetHearInfo.java:75-76]`, captured
+    /// value [wire]). Read-only until SET_LIGHT (cmd 33) passes the §1 gate.
+    pub light: Option<bool>,
     /// Gain (§5 field `voiceLevel`).
     pub voice_level: Option<u8>,
     /// EQ level (§5 field `eqLevel`).
@@ -113,7 +223,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
     match s.status {
         ConnStatus::Connecting => ViewModel {
             banner: None,
-            banner_text: Some("searching for the dongle…".to_string()),
+            banner_text: Some("Searching for the dongle…".to_string()),
             tx1: None,
             tx2: None,
             tx3: None,
@@ -124,6 +234,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 pending: None,
                 last_error: None,
             },
+            light: None,
             voice_level: None,
             eq_level: None,
             reverb: None,
@@ -131,13 +242,13 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
         },
         ConnStatus::NotFound => ViewModel {
             banner: Some(Banner::NotFound),
-            banner_text: Some("no dongle (3547:0407) on the bus".to_string()),
+            banner_text: Some("No dongle (3547:0407) on the bus".to_string()),
             ..disconnected_core()
         },
         ConnStatus::Busy => ViewModel {
             banner: Some(Banner::Busy),
             banner_text: Some(
-                "another process is using the dongle — close holly-cli or other instances"
+                "Another process is using the dongle — close holly-cli or other instances, then try again"
                     .to_string(),
             ),
             ..disconnected_core()
@@ -152,7 +263,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
             banner_text: Some(
                 s.detail
                     .clone()
-                    .unwrap_or_else(|| "unknown error".to_string()),
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             )
             .map(|mut text| {
                 if let Some(heart) = &s.heart {
@@ -187,6 +298,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                     pending: s.pending_set,
                     last_error: None,
                 },
+                light: Some(heart.light_on),
                 voice_level: Some(heart.voice_level),
                 eq_level: Some(heart.eq_level),
                 reverb: Some(ReverbVm {
@@ -213,6 +325,7 @@ fn disconnected_core() -> ViewModel {
             pending: None,
             last_error: None,
         },
+        light: None,
         voice_level: None,
         eq_level: None,
         reverb: None,
@@ -286,7 +399,7 @@ mod tests {
         let vm = view_model(&snap(ConnStatus::Connecting, None, None, None));
         assert_eq!(vm.banner, None);
         let text = vm.banner_text.expect("but it does say something");
-        assert!(text.contains("searching"), "{text}");
+        assert!(text.contains("Searching"), "{text}");
     }
 
     #[test]
@@ -295,14 +408,14 @@ mod tests {
             view_model(&snap(ConnStatus::NotFound, None, None, None)).banner,
             Some(Banner::NotFound)
         );
-        assert!(banner_of(ConnStatus::NotFound).contains("no dongle"));
+        assert!(banner_of(ConnStatus::NotFound).contains("No dongle"));
 
         assert_eq!(
             view_model(&snap(ConnStatus::Busy, None, None, None)).banner,
             Some(Banner::Busy)
         );
         let busy = banner_of(ConnStatus::Busy);
-        assert!(busy.contains("another process"), "{busy}");
+        assert!(busy.contains("Another process"), "{busy}");
         assert!(busy.contains("holly-cli"), "{busy}");
 
         assert_eq!(
@@ -347,7 +460,7 @@ mod tests {
     #[test]
     fn error_without_detail_falls_back() {
         let vm = view_model(&snap(ConnStatus::Error, None, None, None));
-        assert_eq!(vm.banner_text.as_deref(), Some("unknown error"));
+        assert_eq!(vm.banner_text.as_deref(), Some("Unknown error"));
     }
 
     /// Presentation-only thresholds (never protocol data) — boundary sweep.
@@ -490,5 +603,116 @@ mod tests {
                 _ => unreachable!("only lens 18..=23 are scripted"),
             }
         }
+    }
+
+    /// NC level names: the §5.1 identity mapping, owned here so no view
+    /// reimplements the byte→name translation; out-of-range bytes are
+    /// "Unknown" (rendered as no selection), never a guessed name.
+    #[test]
+    fn nc_level_labels_are_the_apk_identity_map() {
+        assert_eq!(nc_level_label(0), "Weak");
+        assert_eq!(nc_level_label(1), "Medium");
+        assert_eq!(nc_level_label(2), "Strong");
+        assert_eq!(nc_level_label(3), "Unknown");
+        assert_eq!(nc_level_label(255), "Unknown");
+    }
+
+    /// The writability table is a fixed contract: exactly the two
+    /// wire-certified SET paths are true, everything else read-only until
+    /// its capture lands (docs/gui-roadmap.md §1 gate).
+    #[test]
+    fn writable_table_matches_the_certified_chain() {
+        let all_read_only = Writable {
+            nc_toggle: false,
+            nc_level: false,
+            mic_mute: false,
+            volume: false,
+            channel_mode: false,
+            eq: false,
+            reverb: false,
+            mic_recognition: false,
+            schedule_power_off: false,
+            indicator_light: false,
+        };
+        assert_eq!(
+            WRITABLE,
+            Writable {
+                nc_toggle: true,
+                nc_level: true,
+                ..all_read_only
+            }
+        );
+    }
+
+    /// NC status word: pending beats the state (the panel keeps showing the
+    /// previous device state while ANY SET is in flight); no verified state
+    /// is "Unavailable" (the busy-banner case renders that way too).
+    #[test]
+    fn nc_status_word_matrix() {
+        let nc = |state: Option<bool>, pending: Option<NoiseWrite>| NcVm {
+            state,
+            level: Some(0),
+            pending,
+            last_error: None,
+        };
+        assert_eq!(nc_status(&nc(None, None)), "Unavailable");
+        assert_eq!(nc_status(&nc(Some(false), None)), "Off");
+        assert_eq!(nc_status(&nc(Some(true), None)), "On");
+        // A SWITCH in flight says Applying…
+        assert_eq!(
+            nc_status(&nc(Some(true), Some(NoiseWrite::Switch(false)))),
+            "Applying"
+        );
+        // …and so does a LEVEL write (one status word for the panel).
+        assert_eq!(
+            nc_status(&nc(Some(true), Some(NoiseWrite::Level(2)))),
+            "Applying"
+        );
+    }
+
+    /// Short connection words: banner-backed states borrow the banner word,
+    /// connecting says Searching, and a live heart names itself — the same
+    /// fn feeds the banner title slot and the footer LED text.
+    #[test]
+    fn conn_status_word_matrix() {
+        let mut vmblank = view_model(&snap(ConnStatus::Connecting, None, None, None));
+        assert_eq!(conn_status_word(&vmblank), "Searching");
+
+        vmblank = view_model(&snap(ConnStatus::Busy, None, None, None));
+        assert_eq!(conn_status_word(&vmblank), "Receiver in use");
+        vmblank = view_model(&snap(ConnStatus::PermissionDenied, None, None, None));
+        assert_eq!(conn_status_word(&vmblank), "Access blocked");
+        vmblank = view_model(&snap(ConnStatus::NotFound, None, None, None));
+        assert_eq!(conn_status_word(&vmblank), "No receiver");
+        vmblank = view_model(&snap(
+            ConnStatus::Error,
+            None,
+            None,
+            Some("malformed device reply: …"),
+        ));
+        assert_eq!(conn_status_word(&vmblank), "Device error");
+
+        let connected = view_model(&snap(ConnStatus::Connected, Some(e1()), None, None));
+        assert_eq!(conn_status_word(&connected), "Receiver connected");
+    }
+
+    /// Indicator light passthrough: header field semantics (offset 11,
+    /// inverted byte) surface straight to the view; unknown without a heart.
+    #[test]
+    fn light_passthrough() {
+        let vm = view_model(&snap(ConnStatus::Connecting, None, None, None));
+        assert_eq!(vm.light, None);
+
+        // E1: light byte 0 -> light_on (inverted) -> Some(true). The demo
+        // payloads and both live captures carry the same semantics.
+        let vm = view_model(&snap(ConnStatus::Connected, Some(e1()), None, None));
+        assert_eq!(vm.light, Some(true));
+    }
+
+    /// Device name: the const is the single source (views must not carry a
+    /// second copy); the test pins the wording so casing drift never ships.
+    #[test]
+    fn device_name_is_pinned() {
+        assert_eq!(DEVICE_NAME, "Lark A1");
     }
 }
