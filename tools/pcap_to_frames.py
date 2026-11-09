@@ -28,10 +28,11 @@ from pathlib import Path
 FIELDS = [
     "frame.number", "frame.time_epoch",
     "usb.bus_id", "usb.device_address",
-    "usb.endpoint_address", "usb.endpoint_direction",
+    "usb.endpoint_address", "usb.endpoint_address.direction",
     "usb.transfer_type", "usb.data_len",
-    "usb.capdata", "usb.iso.data",
-    "usb.setup.opcode",
+    "usb.capdata", "usb.data_fragment", "usbhid.data", "usb.iso.data",
+    "usb.setup.bRequest",  # was usb.setup.opcode (removed in tshark 4.x;
+    #  checked via `tshark -G fields`, 4.7.4)
 ]
 
 TRANSFER_TYPES = {0: "iso", 1: "interrupt", 2: "control", 3: "bulk"}
@@ -50,7 +51,7 @@ def run_tshark(pcap: Path, extra_filter: str | None, with_setup: bool) -> str:
     r = subprocess.run(cmd, capture_output=True, text=True, check=True)
     if r.stderr:
         print(r.stderr, file=sys.stderr)
-    return r.stdout
+    return r.stdout, fields
 
 
 def main() -> None:
@@ -67,17 +68,20 @@ def main() -> None:
     args = ap.parse_args()
 
     out = args.output or args.pcap.with_suffix(".jsonl")
-    text = run_tshark(args.pcap, None, args.setup)
+    text, fields = run_tshark(args.pcap, None, args.setup)
     written = skipped = 0
     with out.open("w") as fh:
         for line in text.splitlines():
             if not line.strip():
                 continue
-            parts = line.split(",", len(FIELDS) - 1)
-            if len(parts) < len(FIELDS):
+            # maxsplit against the RUNTIME field list: with --setup the
+            # setup columns trail FIELDS and must stay separate (pre-existing
+            # bug: maxsplit was frozen to len(FIELDS), merging the ctl tail).
+            parts = line.split(",", len(fields) - 1)
+            if len(parts) < len(fields):
                 continue
-            row = dict(zip(FIELDS, parts))
-            ttype = int(row["usb.transfer_type"]) if row["usb.transfer_type"] else None
+            row = dict(zip(fields, parts))
+            ttype = int(row["usb.transfer_type"], 0) if row["usb.transfer_type"] else None
             if ttype is None:
                 continue
             etype = TRANSFER_TYPES.get(ttype, f"t{ttype}")
@@ -90,27 +94,42 @@ def main() -> None:
                 continue
             if args.device and usb_dev != str(args.device):
                 continue
-            hexdata = row.get("usb.capdata") or row.get("usb.iso.data") or ""
-            if not hexdata and row["usb.setup.opcode"] in (None, ""):
+            # Payload source differs per tshark/stream shape (all checked
+            # live against captures/raw/set_eq_roundtrip.pcap with tshark
+            # 4.7.4): OUT control submits dissect as `usb.data_fragment`,
+            # IN control callbacks dissect as `usbhid.data` (old captures'
+            # `usb.capdata` stays first for their format).
+            hexdata = (
+                row.get("usb.capdata")
+                or row.get("usb.data_fragment")
+                or row.get("usbhid.data")
+                or row.get("usb.iso.data")
+                or ""
+            )
+            if not hexdata and row.get("usb.setup.bRequest", None) in (None, ""):
                 continue
             epid = int(row["usb.endpoint_address"], 0) if row["usb.endpoint_address"] else 0
-            rdir = row["usb.endpoint_direction"]
-            direction = "in" if (rdir == "in" or (rdir not in (None, "") and epid & 0x80)) else "out"
+            # tshark 4.7 removed `usb.endpoint_direction` (field inventory
+            # checked live via `tshark -G fields`); the direction companion
+            # of `usb.endpoint_address` is `usb.endpoint_address.direction`,
+            # printed as a raw `1`/`0` value.
+            rdir = row["usb.endpoint_address.direction"]
+            direction = "in" if (rdir in ("in", "1") or (rdir not in (None, "") and epid & 0x80)) else "out"
             rec: dict = {
                 "frame": int(row["frame.number"]),
                 "ts": float(row["frame.time_epoch"]),
                 "dir": direction,
                 "ep": f"0x{epid:02x}",
                 "type": etype,
-                "len": int(row["usb.data_len"] or 0),
+                "len": int(row["usb.data_len"] or 0, 0),
                 "hex": hexdata.lower().replace(":", ""),
             }
             if args.setup and row.get("usb.setup.bRequest"):
                 rec["ctl"] = {
-                    "bRequest": int(row["usb.setup.bRequest"]),
-                    "wValue": int(row["usb.setup.wValue"]),
-                    "wIndex": int(row["usb.setup.wIndex"]),
-                    "wLength": int(row["usb.setup.wLength"]),
+                    "bRequest": int(row["usb.setup.bRequest"], 0),
+                    "wValue": int(row["usb.setup.wValue"], 0),
+                    "wIndex": int(row["usb.setup.wIndex"], 0),
+                    "wLength": int(row["usb.setup.wLength"], 0),
                 }
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
             written += 1

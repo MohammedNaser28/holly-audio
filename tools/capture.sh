@@ -33,6 +33,5 @@ fi
 tshark -i "usbmon${BUS}" \
   -a duration:"${DUR}" \
   -s 512 \
-  -Y "usb.bus_id == ${BUS} && usb.device_address == ${DEV}" \
   -w "${OUT}"
 echo "wrote ${OUT}"
