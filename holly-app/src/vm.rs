@@ -108,6 +108,17 @@ pub fn battery_class(pct: u8) -> BatteryClass {
     }
 }
 
+/// Battery segments LIT on the 5-segment bar: ~20 % per segment, rounding
+/// up so any real charge above zero shows its segment (93 % → 5, 80 % → 4,
+/// 20 % → 1, 0 → 0). PRESENTATION-ONLY, same non-protocol rule as
+/// [`battery_class`]. DEVIATION from the design mock (which lit all five on
+/// any live link, index.html:229): the mock's "5 = alive, not 5 = full" reading
+/// hid the real value; `battery_digits` keeps the exact number, this keeps the
+/// bar honest with it. Documented in frontends/gpui/README.md.
+pub fn battery_segment_count(pct: u8) -> usize {
+    pct.div_ceil(20) as usize
+}
+
 /// NC level byte -> the phone app's own value name [code
 /// HLDevice6302Activity.java:1593/:1610/:1626-1631; §5.1 identity mapping
 /// strong = 2, medium = 1, low = 0 — read 0/1 and written 1/2 [wire
@@ -122,6 +133,63 @@ pub fn nc_level_label(level: u8) -> &'static str {
         2 => "Strong",
         _ => "Unknown",
     }
+}
+
+/// The Volume panel's selected pad. Certified 1-based knob: session 3b read
+/// `voiceLevel = 03` [wire] while the user's phone showed slider stop "4"
+/// (docs/protocol.md:246-249, `setSelectIndex(voiceLevel)` [:1283]), so
+/// byte N = display stop N+1 = the Nth pad of the six-pad row (pads are
+/// "1".."6", index 0..5 — reference index.html:260). A byte outside 0..=5
+/// has no certified pad and maps to None (no selection, never a guess).
+pub fn volume_selection(voice_level: u8) -> Option<usize> {
+    (voice_level <= 5).then_some(voice_level as usize)
+}
+
+/// The Channel-mode panel's selected pad. Identity on the wire byte:
+/// mono = 0, stereo = 1 [code
+/// `HLDevice6302Activity.java:1803-1805` — `monoMode.setSelected(value==0)`
+/// / `stereoMode.setSelected(value==1)`; the app drives these pads from
+/// `heartInfo.getVoiceMode()` (:1277)]. Anything > 1 has no certified pad.
+pub fn channel_mode_selection(voice_mode: u8) -> Option<usize> {
+    (voice_mode <= 1).then_some(voice_mode as usize)
+}
+
+/// The Schedule-panel's selected pad: `quarterTime` ("15min") = 0,
+/// `neverTime` ("Never") = 1 [code
+/// `HLDevice6302Activity.java:1864-1866`, driven by
+/// `heartInfo.getShutdownTime()` (:1278)]. Anything > 1 is unmapped.
+pub fn shutdown_selection(shutdown_time: u8) -> Option<usize> {
+    (shutdown_time <= 1).then_some(shutdown_time as usize)
+}
+
+/// The EQ panel's selected pad, in the design's display order
+/// ["Equalization", "Low", "Bright"]. The APK's own visual order is
+/// `balance_btn`, `overcast_btn`, `bright_btn` [code
+/// `hldevice_6108.xml:156-166`] with the SAME strings the design copied
+/// ("Equalization"/"Low"/"Bright", `hldevice_6108.xml:1290-1292`), and the
+/// bytes are `DeviceConnectVariable.EQ` = BALANCE(3), OVERCAST(1),
+/// BRIGHT(2) [code :556-574, selected by `updateEqView` at
+/// `HLDevice6302Activity.java:1869-1874`]. So display index 0..2 maps to
+/// wire bytes 3/1/2; anything else (including 0 — the byte space is
+/// 1-based) has no certified pad.
+pub fn eq_selection(eq_level: u8) -> Option<usize> {
+    match eq_level {
+        3 => Some(0), // Balance  ("Equalization")
+        1 => Some(1), // Overcast ("Low")
+        2 => Some(2), // Bright   ("Bright")
+        _ => None,
+    }
+}
+
+/// The Reverb panel's selected pad ["Small", "Medium", "Large"]:
+/// GEAR_ONE = 0, GEAR_TWO = 1, GEAR_THREE = 2 [code
+/// `DeviceConnectVariable.Reverb` (:629-632), selected by
+/// `updateReverbView` at `HLDevice6302Activity.java:1883-1891`], and the
+/// APK's gear strings are exactly the design's words
+/// (`hldevice_6108.xml:792-794`: gear_one="Small", gear_two="Medium",
+/// gear_three="Large" in visual order :204-214). Anything > 2 is unmapped.
+pub fn reverb_selection(reverb_level: u8) -> Option<usize> {
+    (reverb_level <= 2).then_some(reverb_level as usize)
 }
 
 /// The NC panel's status word: one place, driven ONLY by NcVm — a pending
@@ -218,8 +286,27 @@ pub struct ViewModel {
     pub light: Option<bool>,
     /// Gain (§5 field `voiceLevel`).
     pub voice_level: Option<u8>,
-    /// EQ level (§5 field `eqLevel`).
+    /// EQ level (§5 field `eqLevel`). Pads select via [`eq_selection`]
+    /// (byte space is 1/2/3 [code DeviceConnectVariable.EQ]).
     pub eq_level: Option<u8>,
+    /// Identify-beep state (§5 offset 15, `== 1` semantics [code
+    /// ProGetHearInfo.java:88]). The Mic-recognition panel's switch reads
+    /// THIS — it used to be hardcoded `false` in the view, which could
+    /// contradict the device when the phone-side identify was on.
+    pub mic_recognition: Option<bool>,
+    /// Channel-mode pad (`voiceMode`, §5 offset 9) via
+    /// [`channel_mode_selection`]: 0 = Mono, 1 = Stereo [code
+    /// HLDevice6302Activity.java:1803-1805]. Unmapped for any other byte.
+    pub channel_mode: Option<usize>,
+    /// Schedule pad (`shutdownTime`, §5 offset 10) via
+    /// [`shutdown_selection`]: 0 = 15min, 1 = Never [code
+    /// HLDevice6302Activity.java:1864-1866]. Unmapped for any other byte.
+    pub shutdown: Option<usize>,
+    /// §5 offset 16 raw (`signalMode`). The APK parses it but renders it
+    /// nowhere (no `update*View` consumer in the decompiled activity) and
+    /// no design panel exists — carried read-only, surfaced nowhere by
+    /// policy: no invented slot.
+    pub signal_mode: Option<u8>,
     pub reverb: Option<ReverbVm>,
     /// Echo of [`Snapshot::received_at`] (actor-stamped wall clock) for the
     /// footer's "last reply" display. App metadata, not device data.
@@ -245,6 +332,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
             light: None,
             voice_level: None,
             eq_level: None,
+            mic_recognition: None,
+            channel_mode: None,
+            shutdown: None,
+            signal_mode: None,
             reverb: None,
             updated: None,
         },
@@ -309,6 +400,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 light: Some(heart.light_on),
                 voice_level: Some(heart.voice_level),
                 eq_level: Some(heart.eq_level),
+                mic_recognition: Some(heart.tx_identify),
+                channel_mode: channel_mode_selection(heart.voice_mode),
+                shutdown: shutdown_selection(heart.shutdown_time),
+                signal_mode: Some(heart.signal_mode),
                 reverb: Some(ReverbVm {
                     enabled: heart.reverb_switch,
                     level: heart.reverb_level,
@@ -336,6 +431,10 @@ fn disconnected_core() -> ViewModel {
         light: None,
         voice_level: None,
         eq_level: None,
+        mic_recognition: None,
+        channel_mode: None,
+        shutdown: None,
+        signal_mode: None,
         reverb: None,
         updated: None,
     }
@@ -558,6 +657,11 @@ mod tests {
                 level: 2
             })
         );
+        // The formerly-dropped fields: E1's own bytes (cite §5 offsets).
+        assert_eq!(vm.mic_recognition, Some(false), "txIdentify off [15]");
+        assert_eq!(vm.channel_mode, Some(0), "voiceMode 0 = Mono [9]");
+        assert_eq!(vm.shutdown, Some(0), "shutdownTime 0 = 15min [10]");
+        assert_eq!(vm.signal_mode, Some(0), "carried raw [16]");
     }
 
     /// Tail TXs appear only when the reply is long enough — and each field
@@ -623,6 +727,75 @@ mod tests {
         assert_eq!(nc_level_label(2), "Strong");
         assert_eq!(nc_level_label(3), "Unknown");
         assert_eq!(nc_level_label(255), "Unknown");
+    }
+
+    /// Volume pads: the certified 1-based knob (session 3b: byte 03 = the
+    /// phone's stop "4", protocol.md:246-249) — pad index == byte for
+    /// 0..=5, anything wider has no pad and draws no selection.
+    #[test]
+    fn volume_selection_is_the_certified_identity() {
+        assert_eq!(volume_selection(0), Some(0), "pad 1");
+        assert_eq!(volume_selection(3), Some(3), "pad 4 — session 3b");
+        assert_eq!(volume_selection(5), Some(5), "pad 6");
+        assert_eq!(volume_selection(6), None, "no certified pad");
+        assert_eq!(volume_selection(255), None, "no certified pad");
+    }
+
+    /// Channel mode: mono = 0, stereo = 1 (identity) [code
+    /// HLDevice6302Activity.java:1803-1805]; anything else unselected.
+    #[test]
+    fn channel_mode_selection_is_the_apk_identity() {
+        assert_eq!(channel_mode_selection(0), Some(0), "Mono");
+        assert_eq!(channel_mode_selection(1), Some(1), "Stereo");
+        assert_eq!(channel_mode_selection(2), None, "no certified pad");
+        assert_eq!(channel_mode_selection(255), None, "no certified pad");
+    }
+
+    /// Schedule pads: 0 = quarter ("15min"), 1 = never ("Never") [code
+    /// HLDevice6302Activity.java:1864-1866]; anything else unselected.
+    #[test]
+    fn shutdown_selection_is_the_apk_identity() {
+        assert_eq!(shutdown_selection(0), Some(0), "15min");
+        assert_eq!(shutdown_selection(1), Some(1), "Never");
+        assert_eq!(shutdown_selection(2), None, "no certified pad");
+        assert_eq!(shutdown_selection(255), None, "no certified pad");
+    }
+
+    /// EQ pads: display order ["Equalization","Low","Bright"] = wire bytes
+    /// [3,1,2] [code DeviceConnectVariable.EQ + hldevice_6108.xml row
+    /// order]; the byte space is 1-based (0 = no certified pad), anything
+    /// outside 1..=3 unselected.
+    #[test]
+    fn eq_selection_is_the_apk_pad_order() {
+        assert_eq!(eq_selection(3), Some(0), "Equalization (balance)");
+        assert_eq!(eq_selection(1), Some(1), "Low (overcast)");
+        assert_eq!(eq_selection(2), Some(2), "Bright");
+        assert_eq!(eq_selection(0), None, "no certified pad — 1-based space");
+        assert_eq!(eq_selection(4), None, "no certified pad");
+        assert_eq!(eq_selection(255), None, "no certified pad");
+    }
+
+    /// Reverb pads: Small/Medium/Large = wire bytes 0/1/2 (identity) [code
+    /// DeviceConnectVariable.Reverb + gear strings]; anything else unselected.
+    #[test]
+    fn reverb_selection_is_the_apk_identity() {
+        assert_eq!(reverb_selection(0), Some(0), "Small");
+        assert_eq!(reverb_selection(1), Some(1), "Medium");
+        assert_eq!(reverb_selection(2), Some(2), "Large");
+        assert_eq!(reverb_selection(3), None, "no certified pad");
+        assert_eq!(reverb_selection(255), None, "no certified pad");
+    }
+
+    /// Battery segments: ~20 % per segment, ceil, 0 unlit (presentation-
+    /// only thresholds — boundary sweep).
+    #[test]
+    fn battery_segment_count_boundaries() {
+        for (pct, want) in [
+            (0u8, 0), (1, 1), (19, 1), (20, 1), (21, 2), (40, 2),
+            (60, 3), (80, 4), (93, 5), (98, 5), (100, 5),
+        ] {
+            assert_eq!(battery_segment_count(pct), want, "battery {pct}%");
+        }
     }
 
     /// The writability table is a fixed contract: exactly the two
