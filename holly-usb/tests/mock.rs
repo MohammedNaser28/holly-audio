@@ -397,3 +397,267 @@ fn set_noise_level_rejects_abnormal_acks() {
     let err = c.set_noise_level(1).expect_err("2-byte ack must fail");
     assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
 }
+
+// ── EQ (cmd 7, SET_EQ) — Phase 1B route (b) ─────────────────────────────────
+// Owner rule (2026-11-09, docs/gui-roadmap.md §1(b)): Mock vectors are
+// RECOMPUTED FROM THE DOCS until the hardware run; real usbmon frames join
+// as replay vectors after it. Every frame below is computed from docs only:
+//   frame template       docs/protocol.md §2 (ProtocolV2.getData [code])
+//   cmd 7, payload       docs/set-gate-checklist.md §3 EQ row ([{value}])
+//   eqLevel map 1..=3    docs/protocol.md §5 + §5.2 (= Low/Bright/
+//                        "Equalization" [HLDevice6302Activity.java:729-749])
+// The heart reply is the wire-certified E1 heart (captures/
+// 2026-11-05-hearinfo-first-wire.txt, which already rests at eqLevel 3)
+// with only the value byte moved — the 17-byte heart layout is [wire].
+
+/// SET_EQ of pad 2 (BRIGHT) recomputed from the docs:
+/// `05 03 AA DD 07 00 01 02 EF` + zero padding to 64 (big-endian len 00 01).
+const SET_EQ_2_TX: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x07, 0x00, 0x01, 0x02, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// SET_EQ ack recomputed from the docs: reply header `05 03 BB DD` + cmd
+/// echo 07 + len 00 01 + status `00` (checklist §3 ACK rule: one status
+/// byte, `data[0] == 0` = success — uniform across `ProSet*`). The byte
+/// behind the payload follows the reply checksum rule
+/// XOR(frame[0..7+len)) ⊕ 0x07 — for cmd 07 that is `0x61`, matching the
+/// observed wire ack byte-for-byte (`SET_EQ_ACK_WIRE`, replay test) and
+/// NOT the NC family's 0x75 (that goes with cmd 13). The byte stays
+/// UNINTERPRETED by the crate — it must ignore everything past `7+len`,
+/// so the vector still doubles as an ignore-the-residue regression.
+const SET_EQ_ACK: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x07, 0x00, 0x01, 0x00, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The certified E1 heart with eqLevel (payload offset 12 = frame byte 19)
+/// moved 3 → 2: layout stays [wire] (E1); the flipped value byte is the
+/// doc-recomputed delta side of route (b), and the residue drops to 0x36
+/// per the reply checksum rule (XOR(payload[0..17]) ⊕ 0x68 — value 03^02
+/// flips that fold, 0x5F⊕0x68=0x37 → 0x5E⊕0x68=0x36;
+/// tools/residue_check.py verifies both).
+const HEART_RX_EQ2: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// set_eq(2) ("Bright" — the neighbouring pad of the certified rest state
+/// 3): the op must issue its own fresh GET first (uniform SET discipline),
+/// then the byte-exact doc-recomputed SET frame, and hand back the fresh
+/// GET's pad as the pre-write state.
+#[test]
+fn set_eq_tx_frame_is_the_apk_layout() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner fresh GET (device rests at eq 3)
+    mock.push_reply(SET_EQ_ACK);
+    let mut c = control(mock);
+
+    let previous = c.set_eq(2).expect("ack 00 must be accepted");
+    assert_eq!(
+        previous, 3,
+        "fresh GET inside set_eq = the pad before write"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(&written[0], &HEART_TX, "op must issue its own GET first");
+    assert_eq!(
+        &written[1], &SET_EQ_2_TX,
+        "SET EQ must be the doc-recomputed pad-2 frame"
+    );
+}
+
+/// The identity value space (1 = OVERCAST/"Low", 2 = BRIGHT, 3 = BALANCE/
+/// "Equalization" — checklist §3, `HLDevice6302Activity.java:729/:739/:749`):
+/// every SET differs from the pad-2 frame in the value byte only.
+#[test]
+fn set_eq_value_space_changes_only_the_value_byte() {
+    for value in [1u8, 3] {
+        let mut mock = MockTransport::new();
+        mock.push_reply(HEART_RX_E1);
+        mock.push_reply(SET_EQ_ACK);
+        let mut c = control(mock);
+
+        let previous = c.set_eq(value).expect("ack 00 must be accepted");
+        assert_eq!(previous, 3, "fresh GET reported pad {value} INCOMING");
+        let mut want = SET_EQ_2_TX;
+        want[7] = value; // value byte sits at frame offset 7 (tail EF at 8)
+        assert_eq!(&c.transport().written()[1], &want, "pad {value}");
+    }
+}
+
+/// Full doc-vector round trip (route (b), Mock half): device rests at
+/// eqLevel 3 ("Equalization" — E1 IS that state [wire]), write the
+/// neighbouring pad 2 ("Bright"), ack `00`, heart settles eqLevel → 2
+/// (§5 offset 12); restore pad 3, heart settles back. Frames asserted both
+/// ways round trip; the restore TARGET comes from set_eq's own return
+/// (the fresh GET inside the write), not a caller-side poll.
+#[test]
+fn set_eq_roundtrip_doc_vectors() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner GET of set_eq(2): device at 3
+    mock.push_reply(SET_EQ_ACK); // ack for SET_EQ [02]
+    mock.push_reply(HEART_RX_EQ2); // post-SET fresh GET: delta = 2
+    mock.push_reply(HEART_RX_EQ2); // inner GET of set_eq(prev): device at 2
+    mock.push_reply(SET_EQ_ACK); // ack for SET_EQ [03]
+    mock.push_reply(HEART_RX_E1); // post-restore fresh GET: delta = 3
+
+    let mut c = control(mock);
+    let previous = c.set_eq(2).expect("EQ write must be accepted");
+    assert_eq!(previous, 3, "pre-write pad from the op's own fresh GET");
+    let after = c.get_heart_info().expect("post-SET GET");
+    assert_eq!(after.eq_level, 2, "heart delta must equal the written pad");
+    let restore_previous = c.set_eq(previous).expect("restore must be accepted");
+    assert_eq!(restore_previous, 2, "fresh GET before restore saw pad 2");
+    let restored = c.get_heart_info().expect("post-restore GET");
+    assert_eq!(restored.eq_level, 3, "heart must be back at the start pad");
+
+    let written = c.transport().written();
+    let mut set3 = SET_EQ_2_TX;
+    set3[7] = previous; // value byte at frame offset 7 (tail EF at 8)
+    assert_eq!(&written[1], &SET_EQ_2_TX, "write leg is pad 2");
+    assert_eq!(&written[4], &set3, "restore leg is set_eq's OWN return");
+}
+
+/// Ack gates shared with the SET_NOISE family (checklist §3: uniform
+/// `data[0] == 0` success across all `ProSet*` classes): nonzero status =
+/// [`Error::Rejected`], wrong ack length = [`Error::BadAck`]. Reason same
+/// as `set_noise_level`: the ack shape has only ever been seen as `[00]`
+/// [wire E2/E4].
+#[test]
+fn set_eq_rejects_abnormal_acks() {
+    // nonzero status
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_EQ_ACK;
+    ack[7] = 0x03; // status byte != 0
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_eq(2).expect_err("nonzero ack must fail");
+    assert!(
+        matches!(err, Error::Rejected { status: 0x03, .. }),
+        "{err:?}"
+    );
+
+    // two-byte ack (echo shape) must not be accepted
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_EQ_ACK;
+    ack[6] = 0x02; // payload len 2
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_eq(2).expect_err("2-byte ack must fail");
+    assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
+}
+
+// ── Phase 1B route (b): REAL wire frames join as replay vectors ─────────────
+// Full 64-byte buffers from the owner-executed hardware run of
+// set_eq_roundtrip_guarded, captured 2026-11-09 (captures/raw/
+// set_eq_roundtrip.pcap → captures/set_eq_roundtrip.jsonl, bus 6 dev 2).
+// Owner hand-check + frame numbers from the export:
+//   #17/#21        heart, eqLevel 3, battery 0x54, residue byte 3C
+//   #22            SET_EQ `05 03 AA DD 07 00 01 02 EF`
+//   #25/#37        ack `05 03 BB DD 07 00 01 00 61` (status 00)
+//   #29/#33        heart, eqLevel 2, byte 3D
+//   #34            SET_EQ restore `05 03 AA DD 07 00 01 03 EF`
+//   #41/#45        heart, eqLevel 3, byte 3C
+// The byte AFTER the payload (frame 24) follows the reply checksum rule
+// XOR(payload[0..17]) ⊕ 0x68 — verified on EVERY reply captured so far
+// (12 packets: 9 distinct heart shapes over 4 sessions at salt 0x68,
+// plus both ACK shapes over the whole 7+len prefix at salt 0x07) by
+// `python3 tools/residue_check.py` [wire]; the crate ignores the byte
+// (past 7+len), which the replay below also proves.
+
+/// Real SET_EQ pad-2 frame of the run — byte-identical to the
+/// doc-recomputed [`SET_EQ_2_TX`] (cross-checked in the replay test).
+const SET_EQ_2_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x07, 0x00, 0x01, 0x02, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_EQ pad-3 restore frame (export frame 34).
+const SET_EQ_3_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x07, 0x00, 0x01, 0x03, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at eqLevel 3 (export frame 17; frames 21/41/45
+/// identical): rest state — TX1 connected 0x54 = 84, TX2 disconnected, NC on
+/// level 0, voice 3/0, light on (0x00 inverted), reverb off gear 0.
+const HEART_WIRE_EQ3: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x00, 0x54, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at eqLevel 2 (export frame 29; frame 33 identical):
+/// eqLevel byte moved 3 → 2 and the XOR checksum byte 3C → 3D, everything
+/// else untouched.
+const HEART_WIRE_EQ2: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x00, 0x54, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_EQ ack (export frames 25/37): 1-byte status 00 + session-residue
+/// byte 0x61 — the run's ack shape, identical to the E2/E4
+/// `… 13 00 01 00 75` family modulo cmd/values.
+const SET_EQ_ACK_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x07, 0x00, 0x01, 0x00, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Full real-session replay (route (b) closure): the export's control frames
+/// replayed through the op end-to-end. TX side asserts byte-exact equality
+/// with the captured SET frames; the lineage pin asserts the doc-recomputed
+/// vector EQUALS the observed wire frame; the restore leg targets the value
+/// set_eq itself returned from its fresh GET.
+#[test]
+fn set_eq_roundtrip_replays_the_real_session() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_WIRE_EQ3); // op's inner GET (= frames 17/21)
+    mock.push_reply(SET_EQ_ACK_WIRE); // ack of frame 22's SET [02]
+    mock.push_reply(HEART_WIRE_EQ2); // test's settle GET (frames 29/33)
+    mock.push_reply(HEART_WIRE_EQ2); // op's inner GET of the restore
+    mock.push_reply(SET_EQ_ACK_WIRE); // ack of frame 34's SET [03]
+    mock.push_reply(HEART_WIRE_EQ3); // test's post-restore GET (frames 41/45)
+
+    let mut c = control(mock);
+    let previous = c
+        .set_eq(2)
+        .expect("real ack [00]+61 must be accepted (residue ignored)");
+    assert_eq!(previous, 3, "frames 17/21 rest at pad 3");
+    let after = c.get_heart_info().expect("real heart (residue 3d) parses");
+    assert_eq!(after.eq_level, 2, "heart delta = written pad");
+    assert_eq!(after.tx1_battery, 0x54, "run's battery byte");
+    assert!(!after.tx2_status, "TX2 disconnected in the run");
+    let restore_previous = c.set_eq(previous).expect("real restore must be accepted");
+    assert_eq!(restore_previous, 2, "restore's fresh GET saw pad 2");
+    let restored = c.get_heart_info().expect("heart back at pad 3");
+    assert_eq!(restored.eq_level, 3, "restore delta verified");
+
+    let written = c.transport().written();
+    assert_eq!(&written[1], &SET_EQ_2_WIRE, "SET TX byte-exact frame 22");
+    assert_eq!(
+        &written[4], &SET_EQ_3_WIRE,
+        "restore TX byte-exact frame 34"
+    );
+    // Lineage pin (roadmap §1(b)): the doc-recomputed vectors and the
+    // hardware-observed frames are the SAME bytes.
+    assert_eq!(SET_EQ_2_TX, SET_EQ_2_WIRE, "doc vector == observed wire");
+    assert_eq!(SET_EQ_ACK, SET_EQ_ACK_WIRE, "ack lineage pin");
+}
