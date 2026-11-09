@@ -17,3 +17,5 @@ __pycache__/
 # binaries, NEVER commit — see tools/qemu-android.sh usage.
 android-x86-9.0-r2.iso
 tools/android-x86.qcow2
+tools/android-x86-v2.qcow2
+tools/android-x86-r2.qcow2
