@@ -1,0 +1,152 @@
+[15:45:38] polling node=/dev/bus/usb/006/010 interval=0.5s (GET-only)
+[15:45:38] baseline: 00 01 00 62 00 00 01 01 05 00 00 00 03 00 02 00 00
+[15:46:09] CHANGE #1: off 3 (tx2Battery): 62->61
+[15:46:09]   payload now: 00 01 00 61 00 00 01 01 05 00 00 00 03 00 02 00 00
+[15:51:47] CHANGE #2: off 3 (tx2Battery): 61->60
+[15:51:47]   payload now: 00 01 00 60 00 00 01 01 05 00 00 00 03 00 02 00 00
+[15:56:53] CHANGE #3: off 3 (tx2Battery): 60->5F
+[15:56:53]   payload now: 00 01 00 5F 00 00 01 01 05 00 00 00 03 00 02 00 00
+[16:00:49] device gone (ENODEV); waiting for a new node…
+[16:02:51] polling node=/dev/bus/usb/006/011 interval=0.5s (GET-only)
+[16:02:51] baseline: 00 01 00 5E 00 00 01 01 05 01 01 00 01 01 01 00 00
+[16:05:44] device gone (ENODEV); waiting for a new node…
+[16:05:45] poll error: [Errno 25] SET_REPORT
+[16:05:46] poll error: [Errno 25] SET_REPORT
+[16:05:46] poll error: [Errno 25] SET_REPORT
+[16:05:47] poll error: [Errno 25] SET_REPORT
+[16:05:47] poll error: [Errno 25] SET_REPORT
+[16:05:48] poll error: [Errno 25] SET_REPORT
+[16:05:48] poll error: [Errno 25] SET_REPORT
+[16:05:49] poll error: [Errno 25] SET_REPORT
+[16:05:49] poll error: [Errno 25] SET_REPORT
+[16:05:50] poll error: [Errno 25] SET_REPORT
+[16:05:50] poll error: [Errno 25] SET_REPORT
+[16:05:51] poll error: [Errno 25] SET_REPORT
+[16:05:51] poll error: [Errno 25] SET_REPORT
+[16:05:52] poll error: [Errno 25] SET_REPORT
+[16:05:52] poll error: [Errno 25] SET_REPORT
+[16:05:53] poll error: [Errno 25] SET_REPORT
+[16:05:53] poll error: [Errno 25] SET_REPORT
+[16:05:54] poll error: [Errno 25] SET_REPORT
+[16:05:54] poll error: [Errno 25] SET_REPORT
+[16:05:55] poll error: [Errno 25] SET_REPORT
+[16:05:55] poll error: [Errno 25] SET_REPORT
+[16:05:56] poll error: [Errno 25] SET_REPORT
+[16:05:56] poll error: [Errno 25] SET_REPORT
+[16:05:57] poll error: [Errno 25] SET_REPORT
+[16:05:57] poll error: [Errno 25] SET_REPORT
+[16:05:58] poll error: [Errno 25] SET_REPORT
+[16:05:58] poll error: [Errno 25] SET_REPORT
+[16:05:59] poll error: [Errno 25] SET_REPORT
+[16:05:59] poll error: [Errno 25] SET_REPORT
+[16:06:00] poll error: [Errno 25] SET_REPORT
+[16:06:00] poll error: [Errno 25] SET_REPORT
+[16:06:01] poll error: [Errno 25] SET_REPORT
+[16:06:01] poll error: [Errno 25] SET_REPORT
+[16:06:02] poll error: [Errno 25] SET_REPORT
+[16:06:02] poll error: [Errno 25] SET_REPORT
+[16:06:03] poll error: [Errno 25] SET_REPORT
+[16:06:03] poll error: [Errno 25] SET_REPORT
+[16:06:04] poll error: [Errno 25] SET_REPORT
+[16:06:04] poll error: [Errno 25] SET_REPORT
+[16:06:05] poll error: [Errno 25] SET_REPORT
+[16:06:05] poll error: [Errno 25] SET_REPORT
+[16:06:06] poll error: [Errno 25] SET_REPORT
+[16:06:06] poll error: [Errno 25] SET_REPORT
+[16:06:07] poll error: [Errno 25] SET_REPORT
+[16:06:07] poll error: [Errno 25] SET_REPORT
+[16:06:08] poll error: [Errno 25] SET_REPORT
+[16:06:08] poll error: [Errno 25] SET_REPORT
+[16:06:09] poll error: [Errno 25] SET_REPORT
+[16:06:09] poll error: [Errno 25] SET_REPORT
+[16:06:10] poll error: [Errno 25] SET_REPORT
+[16:06:10] poll error: [Errno 25] SET_REPORT
+[16:06:11] poll error: [Errno 25] SET_REPORT
+[16:06:11] poll error: [Errno 25] SET_REPORT
+[16:06:12] poll error: [Errno 25] SET_REPORT
+[16:06:12] poll error: [Errno 25] SET_REPORT
+[16:06:13] poll error: [Errno 25] SET_REPORT
+[16:06:13] poll error: [Errno 25] SET_REPORT
+[16:06:14] poll error: [Errno 25] SET_REPORT
+[16:06:14] poll error: [Errno 25] SET_REPORT
+[16:06:15] poll error: [Errno 25] SET_REPORT
+[16:06:15] poll error: [Errno 25] SET_REPORT
+[16:06:16] poll error: [Errno 25] SET_REPORT
+[16:06:16] poll error: [Errno 25] SET_REPORT
+[16:06:17] poll error: [Errno 25] SET_REPORT
+[16:06:17] poll error: [Errno 25] SET_REPORT
+[16:06:18] poll error: [Errno 25] SET_REPORT
+[16:06:18] poll error: [Errno 25] SET_REPORT
+[16:06:19] poll error: [Errno 25] SET_REPORT
+[16:06:19] poll error: [Errno 25] SET_REPORT
+[16:06:20] poll error: [Errno 25] SET_REPORT
+[16:06:20] poll error: [Errno 25] SET_REPORT
+[16:06:21] poll error: [Errno 25] SET_REPORT
+[16:06:21] poll error: [Errno 25] SET_REPORT
+[16:06:22] poll error: [Errno 25] SET_REPORT
+[16:06:22] poll error: [Errno 25] SET_REPORT
+[16:06:23] poll error: [Errno 25] SET_REPORT
+[16:06:23] poll error: [Errno 25] SET_REPORT
+[16:06:24] poll error: [Errno 25] SET_REPORT
+[16:06:24] poll error: [Errno 25] SET_REPORT
+[16:06:25] poll error: [Errno 25] SET_REPORT
+[16:06:25] poll error: [Errno 25] SET_REPORT
+[16:06:26] poll error: [Errno 25] SET_REPORT
+[16:06:26] poll error: [Errno 25] SET_REPORT
+[16:06:27] poll error: [Errno 25] SET_REPORT
+[16:06:27] poll error: [Errno 25] SET_REPORT
+[16:06:28] poll error: [Errno 25] SET_REPORT
+[16:06:28] poll error: [Errno 25] SET_REPORT
+[16:06:29] poll error: [Errno 25] SET_REPORT
+[16:06:29] poll error: [Errno 25] SET_REPORT
+[16:06:30] poll error: [Errno 25] SET_REPORT
+[16:06:30] poll error: [Errno 25] SET_REPORT
+[16:06:31] poll error: [Errno 25] SET_REPORT
+[16:06:31] poll error: [Errno 25] SET_REPORT
+[16:06:32] poll error: [Errno 25] SET_REPORT
+[16:06:32] poll error: [Errno 25] SET_REPORT
+[16:06:33] poll error: [Errno 25] SET_REPORT
+[16:06:33] poll error: [Errno 25] SET_REPORT
+[16:06:34] poll error: [Errno 25] SET_REPORT
+[16:06:34] poll error: [Errno 25] SET_REPORT
+[16:06:35] poll error: [Errno 25] SET_REPORT
+[16:06:35] poll error: [Errno 25] SET_REPORT
+[16:06:36] poll error: [Errno 25] SET_REPORT
+[16:06:36] poll error: [Errno 25] SET_REPORT
+[16:06:37] poll error: [Errno 25] SET_REPORT
+[16:06:37] poll error: [Errno 25] SET_REPORT
+[16:06:38] poll error: [Errno 25] SET_REPORT
+[16:06:38] poll error: [Errno 25] SET_REPORT
+[16:06:39] poll error: [Errno 25] SET_REPORT
+[16:06:39] poll error: [Errno 25] SET_REPORT
+[16:06:40] poll error: [Errno 25] SET_REPORT
+[16:06:40] poll error: [Errno 25] SET_REPORT
+[16:06:41] poll error: [Errno 25] SET_REPORT
+[16:06:41] poll error: [Errno 25] SET_REPORT
+[16:06:42] poll error: [Errno 25] SET_REPORT
+[16:06:42] poll error: [Errno 25] SET_REPORT
+[16:06:43] poll error: [Errno 25] SET_REPORT
+[16:06:43] poll error: [Errno 25] SET_REPORT
+[16:06:44] poll error: [Errno 25] SET_REPORT
+[16:06:44] poll error: [Errno 25] SET_REPORT
+[16:06:45] poll error: [Errno 25] SET_REPORT
+[16:06:45] poll error: [Errno 25] SET_REPORT
+[16:06:46] poll error: [Errno 25] SET_REPORT
+[16:06:46] poll error: [Errno 25] SET_REPORT
+[16:06:47] poll error: [Errno 25] SET_REPORT
+[16:06:47] poll error: [Errno 25] SET_REPORT
+[16:06:48] poll error: [Errno 25] SET_REPORT
+[16:06:48] poll error: [Errno 25] SET_REPORT
+[16:06:49] poll error: [Errno 25] SET_REPORT
+[16:06:49] poll error: [Errno 25] SET_REPORT
+[16:06:50] poll error: [Errno 25] SET_REPORT
+[16:06:50] poll error: [Errno 25] SET_REPORT
+[16:06:51] poll error: [Errno 25] SET_REPORT
+[16:07:36] polling node=/dev/bus/usb/006/012 interval=0.5s (GET-only)
+[16:07:36] baseline: 00 01 00 5D 00 00 01 01 05 00 01 00 03 01 00 00 00
+[16:10:53] transfer error ([Errno 19] SET_REPORT); reconnecting…
+[16:11:28] reconnected: polling node=/dev/bus/usb/006/013
+[16:11:28] CHANGE #1: off 10 (shutdownTime): 01->00; off 12 (eqLevel): 03->02; off 14 (reverbLevel): 00->02
+[16:11:28]   payload now: 00 01 00 5D 00 00 01 01 05 00 00 00 02 01 02 00 00
+[16:11:38] CHANGE #2: off 3 (tx2Battery): 5D->5C
+[16:11:38]   payload now: 00 01 00 5C 00 00 01 01 05 00 00 00 02 01 02 00 00
