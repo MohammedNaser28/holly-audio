@@ -2,9 +2,13 @@
 //!
 //! Nothing here invents protocol bytes — TX frames are built by
 //! [`holly_proto::Frame`] (APK-exact encoder), replies are gated the same way
-//! the capture tooling gates them, and the two operations are
+//! the capture tooling gates them, and the operations are
 //!   - `get_heart_info()`  (cmd 31, GET path [wire] since the first capture)
 //!   - `set_noise(bool)`   (cmd 19, SET path [wire] since Task 1's capture)
+//!   - `set_noise_level(u8)` (cmd 19 level-write; settled round trip 2026-11-05)
+//!   - `set_eq(u8)` — cmd 7, returns the pad from ITS fresh GET (the value in
+//!     force before the write); frames verified [wire] by the guarded
+//!     PC-side round trip 2026-11-09 (captures/set_eq_roundtrip.jsonl).
 
 use nusb::MaybeFuture;
 
@@ -112,6 +116,54 @@ impl<T: Transport> HollyControl<T> {
         let (reply, raw) = self.exchange(request)?;
         match reply.payload.as_slice() {
             [0x00] => Ok(()),
+            [status] => Err(Error::Rejected {
+                status: *status,
+                raw,
+            }),
+            other => Err(Error::BadAck {
+                len: other.len(),
+                raw,
+            }),
+        }
+    }
+
+    /// Write the receiver EQ pad — cmd 7, single-byte payload `[{value}]`
+    /// [code docs/set-gate-checklist.md §3 EQ row:
+    /// `setEq(EQ.OVERCAST/BRIGHT/BALANCE.getType())` = 1/2/3
+    /// (`HLDevice6302Activity.java:729/:739/:749`); read side
+    /// `eqLevel` = docs/protocol.md §5 offset 12, wire-mapped
+    /// 1..=3 = Low/Bright/"Equalization" (§5.2)]. Frames verified [wire]:
+    /// guarded PC-side round trip 2026-11-09
+    /// (captures/raw/set_eq_roundtrip.pcap → captures/
+    /// set_eq_roundtrip.jsonl — `05 03 AA DD 07 00 01 {02,03} EF` → ack
+    /// `05 03 BB DD 07 00 01 00 61` → hearts settled on the written pad).
+    ///
+    /// Returns the eq pad THIS call's fresh `get_heart_info()` reported —
+    /// the value in force on the device immediately **before** the write.
+    /// The fresh GET is the crate's uniform SET discipline (one fresh GET
+    /// inside every SET call; no observable device state is ever cached),
+    /// it gates the SET on a live, answering device, and its pad now goes
+    /// back to the caller instead of being dropped: a guarded round trip's
+    /// restore leg targets THAT value, not a possibly older pre-run poll —
+    /// if another client moved EQ between the caller's own GET and this
+    /// SET, the returned pad is the freshest memory the device has. (The
+    /// SET frame itself still carries only `[{value}]` — no preserved byte
+    /// exists in this payload, §3 EQ row.)
+    ///
+    /// Ack gating is identical to [`HollyControl::set_noise`] (`[00]` =
+    /// success; anything else surfaces as [`Error::Rejected`]/[`Error::BadAck`]
+    /// — no retry). Values outside the certified space are the caller's
+    /// responsibility, not assumed here — mirror of
+    /// [`HollyControl::set_noise_level`]'s stance on unobserved bytes.
+    pub fn set_eq(&mut self, value: u8) -> Result<u8, Error> {
+        // Fresh GET inside every SET (crate rule). The EQ payload has no
+        // preserved byte (§3 EQ row); the snapshot's pad is returned to the
+        // caller as the pre-write state.
+        let state = self.get_heart_info()?;
+        let request = Frame::new(cmd::SET_EQ, vec![value]);
+        let (reply, raw) = self.exchange(request)?;
+        match reply.payload.as_slice() {
+            [0x00] => Ok(state.eq_level),
             [status] => Err(Error::Rejected {
                 status: *status,
                 raw,

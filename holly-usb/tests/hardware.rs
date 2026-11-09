@@ -5,9 +5,15 @@
 //! `open_and_read_heart_info` is read-only (GET_HEART_INFO only). The
 //! Task-4b `set_noise_roundtrip_guarded` DOES exercise SET_NOISE on
 //! hardware, guarded: it restores the original state on every exit path.
+//! Phase 1B adds `set_eq_roundtrip_guarded` (roadmap §1 route (b)): the
+//! doc-recomputed SET_EQ frame round-trips on hardware under the same
+//! restore-on-every-exit-path guarantee; its rules (ACK-failure probe +
+//! single restore, fixed settle poll, neighbouring-value target, owner-
+//! gated usbmon capture) are spelled out in docs/gui-roadmap.md §1(b).
 
 use holly_usb::{HollyControl, NusbTransport};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 /// The single physical dongle must not be claimed twice at once: the test
 /// harness runs tests in parallel threads, and two concurrent IF0 claims
@@ -295,4 +301,211 @@ fn set_noise_level_roundtrip_guarded() {
         "level did not return to original; guard will retry on exit"
     );
     eprintln!("restore confirmed: level={}", restored.noise_level);
+}
+
+// ── Phase 1B route (b): EQ (cmd 7) ------------------------------------------------
+
+/// Bounded read-only settle poll (route (b), owner rule 2026-11-09):
+/// a FIXED number of fresh GETs spanning about 2 s run before any heart
+/// mismatch is declared — a slow heart is not a dropped write. GET-only;
+/// the SET behind this poll is never retried.
+/// `Ok(())` = a fresh GET reported `eqLevel == want`;
+/// `Err(Some(last))` = the fixed budget ran out (`last` = the final
+/// `eqLevel` seen); `Err(None)` = no parseable heart within the budget.
+fn settle_eq_level(ctl: &mut HollyControl<NusbTransport>, want: u8) -> Result<(), Option<u8>> {
+    /// Fixed settle budget: 4 fresh GETs ≈ 2 s — deterministic, not
+    /// adaptive; nothing beyond this count.
+    const POLLS: u32 = 4;
+    let mut last = None;
+    for poll in 0..POLLS {
+        if poll > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        match ctl.get_heart_info() {
+            Ok(info) => {
+                if info.eq_level == want {
+                    return Ok(());
+                }
+                last = Some(info.eq_level);
+            }
+            Err(e) => eprintln!("settle poll {poll:>2}/{POLLS}: GET failed: {e:?}"),
+        }
+    }
+    Err(last)
+}
+
+/// Drop guard for the EQ test: on any exit path — normal return, failed
+/// assert, or panic unwind — poll the device afresh and, IF the current
+/// `eqLevel` differs from the run's starting pad, make ONE verified restore
+/// attempt (route (b) rule: the "no retry" clause applies to the SET, and
+/// this guard is the restore-of-last-resort, not a second write scheme).
+/// Errors are logged, never raised from `drop`.
+struct EqRestoreGuard {
+    ctl: Option<HollyControl<NusbTransport>>,
+    original: u8,
+}
+
+impl EqRestoreGuard {
+    fn ctl(&mut self) -> &mut HollyControl<NusbTransport> {
+        self.ctl
+            .as_mut()
+            .expect("guard.ctl() may be called only while Some")
+    }
+}
+
+impl Drop for EqRestoreGuard {
+    fn drop(&mut self) {
+        let Some(ctl) = self.ctl.as_mut() else {
+            return;
+        };
+        // Restore decisions come only from a fresh GET, never cached state.
+        match ctl.get_heart_info() {
+            Err(e) => eprintln!("guard: state poll failed, cannot verify restore: {e:?}"),
+            Ok(info) => {
+                if info.eq_level == self.original {
+                    eprintln!(
+                        "guard: EQ already at original pad {}, nothing to do",
+                        self.original
+                    );
+                } else {
+                    eprintln!(
+                        "guard: EQ at pad {}, original {} — sending one restore SET",
+                        info.eq_level, self.original
+                    );
+                    if let Err(e) = ctl.set_eq(self.original) {
+                        eprintln!(
+                            "guard: RESTORE FAILED ({e:?}) — device left at pad {} while original was {}",
+                            info.eq_level, self.original
+                        );
+                    }
+                    // Verify what the single restore attempt actually did.
+                    match ctl.get_heart_info() {
+                        Ok(post) => eprintln!("guard: post-restore eqLevel = {}", post.eq_level),
+                        Err(e) => eprintln!("guard: post-restore GET failed: {e:?}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Phase 1B route (b): guarded SET_EQ round trip on real hardware —
+/// substitute evidence for roadmap §1 step 2; on success the protocol.md
+/// row tags `[wire] PC-originated round trip`.
+///
+/// Rules (docs/gui-roadmap.md §1(b), owner rules 2026-11-09):
+///   fresh GET → SET → ACK gate (`data[0]==0`) → settle-verified heart
+///   delta on `eqLevel` (§5 offset 12, RECEIVER-level) → restore →
+///   settled verify. Restore attempted on every exit path.
+/// - ACK ≠ 0: NO SET retry — one fresh GET; if the pad moved from the
+///   start, ONE verified restore attempt; abort either way.
+/// - Any heart mismatch is declared only AFTER the fixed ~2 s settle poll.
+/// - Target = the NEIGHBOURING wire-mapped pad (1=Low / 2=Bright /
+///   3="Equalization", checklist §3 EQ row), never an extreme.
+/// - The SET leg's own fresh-GET return (the pad in force just before the
+///   write) is the restore target; drift vs the pre-run GET retargets the
+///   guard, and the restore leg's return must report the written pad.
+/// - usbmon (owner-executed) captures the run; the .pcap + exported .jsonl
+///   land in captures/ as the evidence files.
+///
+/// Run only at the owner's explicit go, usbmon running:
+///   cargo test -p holly-usb --test hardware -- set_eq_roundtrip_guarded -- --ignored --nocapture
+#[test]
+#[ignore = "mutates device state; owner-gated run with usbmon capture active"]
+fn set_eq_roundtrip_guarded() {
+    let _dev = device_lock();
+    let mut ctl = HollyControl::open().expect("open + claim IF0");
+    let original = ctl.get_heart_info().expect("state poll failed");
+    assert_eq!(original.raw.len(), 17, "certified 17-byte payload shape");
+    eprintln!(
+        "original eqLevel = {} (wire-mapped space 1..=3)",
+        original.eq_level
+    );
+
+    // Neighbouring valid value — never an extreme (route (b) rule).
+    let target = match original.eq_level {
+        1 => 2,
+        2 => 1,
+        3 => 2,
+        other => {
+            panic!("eqLevel {other} is outside the wire-mapped space 1..=3 — refusing the run")
+        }
+    };
+    eprintln!("writing neighbouring pad {target}");
+
+    let mut guard = EqRestoreGuard {
+        ctl: Some(ctl),
+        original: original.eq_level,
+    };
+
+    // SET leg — the op's own fresh GET happens inside set_eq, and the u8
+    // it returns is the pad in force JUST before the write: the freshest
+    // restore memory the device has. It wins over the pre-run poll; if
+    // another client moved EQ between the two GETs, the difference is
+    // reported and the exit guard retargets.
+    let start = match guard.ctl().set_eq(target) {
+        Ok(previous) => {
+            if previous != original.eq_level {
+                eprintln!(
+                    "DRIFT: pre-run GET said eq {}, op's fresh GET reported eq {} — restore retargeted to {}",
+                    original.eq_level, previous, previous
+                );
+                guard.original = previous;
+            }
+            previous
+        }
+        Err(e) => {
+            // Route (b) ACK ≠ 0 path: NO SET retry. One fresh GET decides.
+            eprintln!("SET failed: {e:?} — probing once before the single restore");
+            let now = guard
+                .ctl()
+                .get_heart_info()
+                .expect("post-reject GET failed");
+            eprintln!("eqLevel after reject: {}", now.eq_level);
+            if now.eq_level != original.eq_level {
+                eprintln!(
+                    "pad moved ({} -> {}): ONE verified restore attempt",
+                    original.eq_level, now.eq_level
+                );
+                if let Err(e) = guard.ctl().set_eq(original.eq_level) {
+                    eprintln!("reject-path restore SET failed: {e:?}");
+                }
+                match settle_eq_level(guard.ctl(), original.eq_level) {
+                    Ok(()) => {
+                        eprintln!(
+                            "reject-path restore verified: eqLevel={}",
+                            original.eq_level
+                        )
+                    }
+                    Err(last) => eprintln!("reject-path restore NOT settled (last seen {last:?})"),
+                }
+            }
+            panic!("SET rejected (ack gate) — aborting with no retry per route (b)");
+        }
+    };
+
+    // Heart-delta verify through the bounded settle poll (route (b) rule).
+    match settle_eq_level(guard.ctl(), target) {
+        Ok(()) => eprintln!("EQ write confirmed: eqLevel={target}"),
+        Err(last) => panic!(
+            "heart never reported eqLevel {target} within the fixed settle budget (last seen: {last:?}) — guard restores the original on the way out"
+        ),
+    }
+
+    // Explicit restore leg (the guard double-covers mid-run panics).
+    // The restore TARGET is `start` — set_eq's own returned previous —
+    // and the leg's return must report the pad the SET leg wrote, which
+    // cross-checks that the fresh GET inside a SET sees that SET's own
+    // effect on the device.
+    let restore_previous = guard.ctl().set_eq(start).expect("restore SET failed");
+    assert_eq!(
+        restore_previous, target,
+        "restore leg's fresh GET must report the pad the SET leg wrote"
+    );
+    match settle_eq_level(guard.ctl(), start) {
+        Ok(()) => eprintln!("restore confirmed: eqLevel={start}"),
+        Err(last) => panic!(
+            "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
+        ),
+    }
 }
