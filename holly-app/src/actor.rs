@@ -8,9 +8,10 @@
 //!
 //! Commands: one SET in flight at a time; queued requests coalesce to the
 //! latest (`Core::pump` collapses `SetNoise(true)…SetNoise(false)` to a
-//! single false). Every SET uses holly-usb's existing path (fresh GET
-//! inside `set_noise`) and is followed by a fresh poll so subscribers see
-//! the DEVICE's verdict, not the request.
+//! single false, and `SetEq(2)…SetEq(3)` — or any SET command at all — to a
+//! single newest intent, see `Command::SetEq`). Every SET uses holly-usb's
+//! existing path (fresh GET inside `set_noise`/`set_eq`) and is followed by
+//! a fresh poll so subscribers see the DEVICE's verdict, not the request.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -35,9 +36,9 @@ fn unix_secs() -> u64 {
 }
 
 /// The in-flight noise write — which NC byte is being changed. This is the
-/// pending-type of [`Snapshot::pending_set`] (serde for the JSON snapshot
-/// test): RENAMES are for serialization only; the variants carry exactly what
-/// the corresponding holly-usb operation sends.
+/// Noise variant's payload type of [`PendingWrite`] (serde for the JSON
+/// snapshot test): RENAMES are for serialization only; the variants carry
+/// exactly what the corresponding holly-usb operation sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoiseWrite {
@@ -51,6 +52,21 @@ pub enum NoiseWrite {
     Level(u8),
 }
 
+/// WHAT is in flight when a SET is between "accepted" and "device verdict"
+/// — the payload type of [`Snapshot::pending_set`]. One slot (one SET runs
+/// at a time), so the variants are exclusive by construction. UI shows
+/// "applying" ONLY from a snapshot's pending — never optimistically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingWrite {
+    /// A NC write (toggle flip or level pick) is in flight.
+    Noise(NoiseWrite),
+    /// An EQ pad write is in flight: the byte is the WIRE pad being written
+    /// (`0x02` = Bright on the wire — the display-order mapping lives in
+    /// `vm::eq_selection`/`vm::eq_pad_wire`, never here).
+    Eq(u8),
+}
+
 /// Commands the UI/frontend may send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -60,6 +76,15 @@ pub enum Command {
     /// a later Level replaces an earlier Switch in the same batch and vice
     /// versa — one SET goes out per batch, always the newest intent).
     SetNoiseLevel(u8),
+    /// Request an EQ pad write, `pad` in the WIRE value space 1..=3
+    /// (1=Low/OVERCAST, 2=Bright, 3="Equalization"/BALANCE — checklist §3
+    /// EQ row, §5.2); the DISPLAY-order translation lives in the VM
+    /// (`eq_pad_wire`), never in a frontend. Coalesces to the latest like
+    /// every other SET: one SET goes out per batch, always the newest
+    /// intent (an `Eq` replacing a `SetNoise*` or the reverse is the same
+    /// latest-wins rule — the UI never queues a second write in flight, so
+    /// the replacement only spans one batch window).
+    SetEq(u8),
     /// Force one fresh poll/reconnect attempt now.
     Refresh,
 }
@@ -132,6 +157,13 @@ impl DeviceHandle {
         let _ = self.tx.send(Command::SetNoiseLevel(level));
     }
 
+    /// Request an EQ pad write (WIRE pad 1..=3; display-order translation
+    /// is the VM's `eq_pad_wire`). Fire-and-forget like every other send:
+    /// the snapshot stream reports "pending" then the device verdict.
+    pub fn set_eq(&self, pad: u8) {
+        let _ = self.tx.send(Command::SetEq(pad));
+    }
+
     pub fn refresh(&self) {
         let _ = self.tx.send(Command::Refresh);
     }
@@ -167,7 +199,7 @@ pub struct Core {
     detail: Option<String>,
     heart: Option<HeartInfo>,
     /// A SET that was accepted but not yet executed (latest-wins).
-    pending: Option<NoiseWrite>,
+    pending: Option<PendingWrite>,
     /// UNIX-epoch seconds of the last successful poll (wall clock, set by
     /// the actor — app-side metadata, never device data). `None` until the
     /// first successful GET; cleared when the claim is lost. Lives on the
@@ -228,33 +260,36 @@ impl Core {
     }
 
     /// Process ONE batch of queued commands with coalescing (latest-wins:
-    /// within the batch, any noise write — switch or level — replaces its
-    /// predecessor; only the newest SET goes out).
+    /// within the batch, any SET command — NC switch, NC level, or EQ pad —
+    /// replaces its predecessor; only the newest SET goes out).
     pub fn pump<I: IntoIterator<Item = Command>>(&mut self, cmds: I) {
         let mut refresh = false;
-        let mut nc: Option<NoiseWrite> = None;
+        let mut write: Option<PendingWrite> = None;
         for cmd in cmds {
             match cmd {
                 Command::Refresh => refresh = true,
-                Command::SetNoise(on) => nc = Some(NoiseWrite::Switch(on)),
-                Command::SetNoiseLevel(l) => nc = Some(NoiseWrite::Level(l)),
+                Command::SetNoise(on) => write = Some(PendingWrite::Noise(NoiseWrite::Switch(on))),
+                Command::SetNoiseLevel(l) => {
+                    write = Some(PendingWrite::Noise(NoiseWrite::Level(l)))
+                }
+                Command::SetEq(pad) => write = Some(PendingWrite::Eq(pad)),
             }
         }
         if self.device.is_none() {
             // Requests while disconnected are dropped (UI disables its
             // controls when no heart exists); refresh doubles as an
             // immediate reconnect attempt.
-            if refresh || nc.is_some() {
+            if refresh || write.is_some() {
                 self.open_attempt();
             }
             return;
         }
-        if let Some(nc) = nc {
+        if let Some(write) = write {
             // Pending visible in the snapshot stream BEFORE the blocking
             // SET runs — humans see it if the 3 s control budget stalls.
-            self.pending = Some(nc);
+            self.pending = Some(write);
             self.emit();
-            self.execute_set(nc);
+            self.execute_set(write);
         } else if refresh {
             self.poll_and_emit();
         }
@@ -338,14 +373,19 @@ impl Core {
     }
 
     /// One SET round trip — the single in-flight SET — then a fresh poll
-    /// so subscribers always see the DEVICE's verdict.
-    fn execute_set(&mut self, nc: NoiseWrite) {
+    /// so subscribers always see the DEVICE's verdict. For EQ, holly-usb's
+    /// `set_eq` additionally returns the fresh GET's pre-write pad; nothing
+    /// here consumes it for STATE (the post-SET poll is the verdict the
+    /// snapshot carries — never optimistic); the value exists for the
+    /// guarded restore flows (holly-usb tests).
+    fn execute_set(&mut self, write: PendingWrite) {
         let Some(source) = self.device.as_mut() else {
             return;
         };
-        let result = match nc {
-            NoiseWrite::Switch(on) => source.set_noise(on),
-            NoiseWrite::Level(level) => source.set_noise_level(level),
+        let result = match write {
+            PendingWrite::Noise(NoiseWrite::Switch(on)) => source.set_noise(on),
+            PendingWrite::Noise(NoiseWrite::Level(level)) => source.set_noise_level(level),
+            PendingWrite::Eq(pad) => source.set_eq(pad).map(|_previous| ()),
         };
         match result {
             Ok(()) => {

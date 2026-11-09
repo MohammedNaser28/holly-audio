@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use holly_app::vm::view_model;
-use holly_app::{Command, ConnStatus, Core, Hub, NoiseWrite, OpenFn, Snapshot, StatusSource, vm};
+use holly_app::{
+    Command, ConnStatus, Core, Hub, NoiseWrite, OpenFn, PendingWrite, Snapshot, StatusSource, vm,
+};
 use holly_usb::{Error, HollyControl, Transport};
 
 const REPORT: usize = 64;
@@ -36,6 +38,16 @@ const HEART_E3: [u8; REPORT] = [
 /// E2/E4 RX: SET ack — one status byte 0x00, residue 0x75 behind it.
 const SET_ACK_OK: [u8; REPORT] = [
     0x05, 0x03, 0xBB, 0xDD, 0x13, 0x00, 0x01, 0x00, 0x75, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+/// Real SET_EQ ack (holly-usb tests/mock.rs `SET_EQ_ACK_WIRE` — export
+/// frames 25/37 of the 2026-11-09 capture): cmd echo 07 + status 00 + the
+/// cmd-07 residue 0x61 (reply checksum rule XOR(7+len prefix) ⊕ 0x07; the
+/// NC family's 0x75 belongs to cmd 13). The crate ignores the residue.
+const SET_EQ_ACK: [u8; REPORT] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x07, 0x00, 0x01, 0x00, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -301,7 +313,7 @@ fn set_coalesces_to_latest() {
     // Pending became visible in the stream BEFORE execution: the pending
     // emission precedes the fresh-GET/SET/verify sequence.
     let stream = drain(&mut rx);
-    let seq: Vec<(ConnStatus, Option<NoiseWrite>)> = stream
+    let seq: Vec<(ConnStatus, Option<PendingWrite>)> = stream
         .iter()
         .map(|s| (s.status.clone(), s.pending_set))
         .collect();
@@ -313,7 +325,7 @@ fn set_coalesces_to_latest() {
             (ConnStatus::Connected, None), // first heart poll
             (
                 ConnStatus::Connected,
-                Some(NoiseWrite::Switch(true)) // pending BEFORE the SET
+                Some(PendingWrite::Noise(NoiseWrite::Switch(true))) // pending BEFORE the SET
             ),
             (ConnStatus::Connected, None), // device verdict after the SET
         ]
@@ -464,7 +476,7 @@ fn thread_loop_end_to_end() {
                 verdict = Some(s);
                 break;
             }
-            Ok(s) if s.pending_set == Some(NoiseWrite::Switch(false)) => {
+            Ok(s) if s.pending_set == Some(PendingWrite::Noise(NoiseWrite::Switch(false))) => {
                 pending_seen = true;
             }
             Ok(_) => {}
@@ -509,7 +521,7 @@ fn snapshot_json_shape() {
         status: ConnStatus::Connected,
         detail: None,
         heart: Some(heart),
-        pending_set: Some(NoiseWrite::Switch(true)),
+        pending_set: Some(PendingWrite::Noise(NoiseWrite::Switch(true))),
         received_at: None,
     };
     let value: serde_json::Value = serde_json::to_value(&snap).expect("serializable");
@@ -543,7 +555,7 @@ fn snapshot_json_shape() {
             "tx4_mute": null,
             "raw": [0, 1, 0, 93, 0, 0, 1, 0, 3, 0, 0, 0, 3, 0, 2, 0, 0]
         },
-        "pending_set": {"switch": true},
+        "pending_set": {"noise": {"switch": true}},
         "received_at": null
     });
     assert_eq!(value, expected, "published JSON shape changed");
@@ -563,7 +575,7 @@ fn view_model_connected_shape() {
         status: ConnStatus::Connected,
         detail: None,
         heart: Some(heart),
-        pending_set: Some(NoiseWrite::Switch(false)),
+        pending_set: Some(PendingWrite::Noise(NoiseWrite::Switch(false))),
         received_at: None,
     });
     assert_eq!(vm.banner, None);
@@ -580,7 +592,13 @@ fn view_model_connected_shape() {
         "actor-reported pending passes through"
     );
     assert_eq!(vm.voice_level, Some(3));
-    assert_eq!(vm.eq_level, Some(3));
+    assert_eq!(
+        vm.eq,
+        vm::EqVm {
+            selected: Some(0), // wire pad 3 = "Equalization"
+            applying: false    // NC pending must not dim the EQ panel
+        }
+    );
     assert_eq!(
         vm.reverb,
         Some(vm::ReverbVm {
@@ -638,10 +656,10 @@ fn set_noise_level_coalesces_to_latest() {
     assert_eq!(final_snap.pending_set, None);
 
     let stream = drain(&mut rx);
-    let pendings: Vec<Option<NoiseWrite>> = stream.iter().map(|s| s.pending_set).collect();
+    let pendings: Vec<Option<PendingWrite>> = stream.iter().map(|s| s.pending_set).collect();
     let last_pending = pendings.last().copied().flatten();
     assert_eq!(last_pending, None, "verdict snapshot clears pending");
-    let seq: Vec<Option<NoiseWrite>> = pendings;
+    let seq: Vec<Option<PendingWrite>> = pendings;
     let some_count = seq.iter().filter(|p| p.is_some()).count();
     assert_eq!(
         some_count, 1,
@@ -649,7 +667,122 @@ fn set_noise_level_coalesces_to_latest() {
     );
     assert_eq!(
         seq.iter().find(|p| p.is_some()).copied().flatten(),
-        Some(NoiseWrite::Level(2)),
+        Some(PendingWrite::Noise(NoiseWrite::Level(2))),
         "the single pending is the winning Level(2)"
+    );
+}
+
+/// The EQ write path through the actor: ONE SetEq round trip on holly-usb's
+/// `set_eq` (fresh GET inside, cmd-07 ack), then the actor's post-SET poll
+/// carries the DEVICE's verdict — the wire pad, byte for byte (frame 19 =
+/// `eqLevel` [wire E1]). The pending appears exactly once as `Eq(pad)`.
+#[test]
+fn set_eq_roundtrip_through_the_actor() {
+    let session = MockShared::default();
+    session.push_reply(HEART_E1); // connect poll (eqLevel 3)
+    session.push_reply(HEART_E1); // fresh GET inside set_eq
+    session.push_reply(SET_EQ_ACK); // cmd-07 ack (status 00, residue 61)
+    let mut verdict = HEART_E1;
+    verdict[19] = 0x02; // payload[12] = eqLevel 03 -> 02 (wire pad 2 = Bright)
+    session.push_reply(verdict); // actor's verification poll
+
+    let (mut core, mut rx) = core_of(VecDeque::from([Ok(session.clone())]));
+    core.tick();
+    assert_eq!(core.snapshot().status, ConnStatus::Connected);
+
+    core.pump([Command::SetEq(2)]);
+
+    let final_snap = core.snapshot();
+    assert_eq!(final_snap.status, ConnStatus::Connected);
+    assert_eq!(
+        final_snap.heart.expect("connected").eq_level,
+        2,
+        "device verdict: the written pad"
+    );
+    assert_eq!(final_snap.pending_set, None, "verdict clears pending");
+
+    let written = session.written();
+    assert_eq!(written.len(), 4);
+    assert_eq!(written[2][4], 0x07, "SET_EQ");
+    assert_eq!(written[2][6], 0x01, "payload len 1");
+    assert_eq!(written[2][7], 0x02, "wire pad = request");
+    assert_eq!(written[3][4], 0x1F, "verification GET");
+
+    let stream = drain(&mut rx);
+    let pendings: Vec<Option<PendingWrite>> = stream.iter().map(|s| s.pending_set).collect();
+    assert_eq!(
+        pendings.iter().filter(|p| p.is_some()).count(),
+        1,
+        "EQ pending appears exactly once"
+    );
+    assert_eq!(
+        pendings.iter().find(|p| p.is_some()).copied().flatten(),
+        Some(PendingWrite::Eq(2)),
+        "the single pending is the EQ write on the wire"
+    );
+}
+
+/// Coalescing is ONE bucket across control families: a batch's LAST SET
+/// command wins and the earlier ones vanish — cross-family (an NC switch
+/// replaced by an EQ pad) and within EQ itself (pad 2 replaced by pad 2's
+/// … the winning pad is the newest request). The final SET is byte-checked
+/// on the wire, and each batch's pending shows ONLY its winner.
+#[test]
+fn set_commands_coalesce_across_families_to_one_set() {
+    let session = MockShared::default();
+    // Batch 1 script: [SetNoise(true), SetEq(3)] -> the EQ SET goes out.
+    session.push_reply(HEART_E1); // connect poll
+    session.push_reply(HEART_E1); // fresh GET inside set_eq
+    session.push_reply(SET_EQ_ACK); // ack of the winning SET_EQ
+    session.push_reply(HEART_E1); // verification poll (eq stays 3 = wire)
+
+    let (mut core, mut rx) = core_of(VecDeque::from([Ok(session.clone())]));
+    core.tick();
+    assert_eq!(core.snapshot().status, ConnStatus::Connected);
+
+    core.pump([Command::SetNoise(true), Command::SetEq(3)]);
+
+    // Batch 2 script: [SetEq(2), SetEq(3)] — within-family latest-wins:
+    // the newest pad (3) is the only one written.
+    session.push_reply(HEART_E1); // fresh GET for the second SET
+    session.push_reply(SET_EQ_ACK); // its ack
+    let mut verdict2 = HEART_E1;
+    verdict2[19] = 0x03; // device settles on the winning pad 3
+    session.push_reply(verdict2); // verification poll
+
+    core.pump([Command::SetEq(2), Command::SetEq(3)]);
+
+    let final_snap = core.snapshot();
+    assert_eq!(final_snap.status, ConnStatus::Connected);
+    assert_eq!(final_snap.heart.expect("connected").eq_level, 3);
+    assert_eq!(final_snap.pending_set, None);
+
+    // Transcript: connect GET + batch-1 SET round trip + batch-2 SET round
+    // trip, NOTHING else — no SET_NOISE frame from the replaced command,
+    // no second SET for the replaced pad.
+    let written = session.written();
+    assert_eq!(written.len(), 7);
+    assert_eq!(written[2][4], 0x07, "batch 1: the ONLY SET is SET_EQ");
+    assert_eq!(written[2][7], 0x03, "batch 1: request");
+    assert_eq!(written[5][4], 0x07, "batch 2: the ONLY SET is SET_EQ");
+    assert_eq!(written[5][7], 0x03, "batch 2: the NEWEST pad wins");
+    for (i, frame) in written.iter().enumerate() {
+        if i != 2 && i != 5 {
+            assert_ne!(frame[4], 0x07, "no extra SET frame at {i}");
+            assert_ne!(frame[4], 0x13, "no SET_NOISE frame at {i}");
+        }
+    }
+
+    // Stream: one pending per batch — the winners only.
+    let stream = drain(&mut rx);
+    let pendings: Vec<Option<PendingWrite>> = stream.iter().map(|s| s.pending_set).collect();
+    let some: Vec<PendingWrite> = pendings.iter().filter_map(|p| *p).collect();
+    assert_eq!(
+        some,
+        vec![
+            PendingWrite::Eq(3), // batch 1 winner
+            PendingWrite::Eq(3), // batch 2 winner
+        ],
+        "exactly the two winning writes ever pended"
     );
 }

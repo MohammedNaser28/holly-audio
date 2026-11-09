@@ -121,6 +121,19 @@ impl StatusSource for DemoDevice {
         self.heart.lock().unwrap().noise_level = level;
         Ok(())
     }
+
+    fn set_eq(&mut self, pad: u8) -> Result<u8, Error> {
+        // Same shape as holly-usb's set_eq: the RETURN is the pad the heart
+        // held BEFORE the write (guarded flows restore from it); the write
+        // mutates only the eqLevel byte, everything else stays scripted.
+        // Pending scenario: stall BEFORE mutation and outside the lock, so
+        // `poll()` is never blocked behind a sleeping setter.
+        let mut heart = self.heart.lock().unwrap();
+        let previous = heart.eq_level;
+        std::thread::sleep(self.stall);
+        heart.eq_level = pad;
+        Ok(previous)
+    }
 }
 
 /// The OS busy condition, byte-for-byte the real claim failure shape

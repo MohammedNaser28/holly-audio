@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-use crate::actor::NoiseWrite;
+use crate::actor::{NoiseWrite, PendingWrite};
 use crate::{ConnStatus, Snapshot};
 
 /// Banner the UI should show (or `None` while clean/connected).
@@ -56,9 +56,14 @@ pub const VID_PID: &str = "3547:0407";
 ///   captures/2026-11-05-set-noise.txt E2/E4]; `nc_level` — the same
 ///   frame's second byte, written + verified [wire
 ///   captures/2026-11-05-noise-level-medium.txt session 3a]
+/// - `eq` — SET_EQ (cmd 7) [wire] PC-originated guarded round trip
+///   2026-11-09: frame `05 03 AA DD 07 00 01 {02,03} EF` → ack `00` →
+///   hearts settled on the written pad
+///   (captures/raw/set_eq_roundtrip.pcap + captures/set_eq_roundtrip.jsonl;
+///   roadmap §1 route (b), checklist §3 EQ row)
 /// - everything else is [code] at best (mic mute cmd 22, light cmd 33,
-///   reverb 5, eq 7, shutdown 39/40 …) and has never been captured, so it
-///   stays read-only today.
+///   reverb 5, shutdown 39/40 …) and has never been captured, so it stays
+///   read-only today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Writable {
     pub nc_toggle: bool,
@@ -80,7 +85,7 @@ pub const WRITABLE: Writable = Writable {
     mic_mute: false,
     volume: false,
     channel_mode: false,
-    eq: false,
+    eq: true,
     reverb: false,
     mic_recognition: false,
     schedule_power_off: false,
@@ -181,6 +186,19 @@ pub fn eq_selection(eq_level: u8) -> Option<usize> {
     }
 }
 
+/// The inverse translation a UI click needs: a DISPLAY-order pad index
+/// ([`EqVm::selected`]'s space) -> the WIRE byte `set_eq` writes. Pure
+/// function so the mapping is tested once here and frontends never
+/// hardcode device values; unmapped (out of 0..2) returns None.
+pub fn eq_pad_wire(index: usize) -> Option<u8> {
+    match index {
+        0 => Some(3), // Balance  ("Equalization")
+        1 => Some(1), // Overcast ("Low")
+        2 => Some(2), // Bright   ("Bright")
+        _ => None,
+    }
+}
+
 /// The Reverb panel's selected pad ["Small", "Medium", "Large"]:
 /// GEAR_ONE = 0, GEAR_TWO = 1, GEAR_THREE = 2 [code
 /// `DeviceConnectVariable.Reverb` (:629-632), selected by
@@ -260,6 +278,19 @@ pub struct NcVm {
     pub last_error: Option<String>,
 }
 
+/// EQ pad state: the DEVICE's current pad in DISPLAY (APK) order, plus
+/// whether an EQ write is in flight. `selected` is None for any
+/// non-certified byte (the pad space is 1-based; see [`eq_selection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EqVm {
+    /// Display-order index of the active pad (0 = "Equalization",
+    /// 1 = "Low", 2 = "Bright" [code DeviceConnectVariable.EQ]).
+    pub selected: Option<usize>,
+    /// An EQ SET (only ever [`PendingWrite::Eq`]) is in flight — the
+    /// selector dims and ignores picks until the device's verdict.
+    pub applying: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ReverbVm {
     pub enabled: bool,
@@ -286,9 +317,11 @@ pub struct ViewModel {
     pub light: Option<bool>,
     /// Gain (§5 field `voiceLevel`).
     pub voice_level: Option<u8>,
-    /// EQ level (§5 field `eqLevel`). Pads select via [`eq_selection`]
-    /// (byte space is 1/2/3 [code DeviceConnectVariable.EQ]).
-    pub eq_level: Option<u8>,
+    /// EQ pads ([`EqVm`]): display-order selection from the device's
+    /// `eqLevel` byte (§5 field, offset 12; pad space is 1/2/3 [code
+    /// DeviceConnectVariable.EQ]), plus the in-flight flag for its own
+    /// panel only.
+    pub eq: EqVm,
     /// Identify-beep state (§5 offset 15, `== 1` semantics [code
     /// ProGetHearInfo.java:88]). The Mic-recognition panel's switch reads
     /// THIS — it used to be hardcoded `false` in the view, which could
@@ -331,7 +364,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
             },
             light: None,
             voice_level: None,
-            eq_level: None,
+            eq: EqVm {
+                selected: None,
+                applying: false,
+            },
             mic_recognition: None,
             channel_mode: None,
             shutdown: None,
@@ -394,12 +430,21 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 nc: NcVm {
                     state: Some(heart.noise_switch),
                     level: Some(heart.noise_level),
-                    pending: s.pending_set,
+                    // Only a NC write pends THIS panel: the one-bucket
+                    // pending is filtered down per family so an EQ write
+                    // never greys the NC controls (and vice versa).
+                    pending: match s.pending_set {
+                        Some(PendingWrite::Noise(w)) => Some(w),
+                        Some(PendingWrite::Eq(_)) | None => None,
+                    },
                     last_error: None,
                 },
                 light: Some(heart.light_on),
                 voice_level: Some(heart.voice_level),
-                eq_level: Some(heart.eq_level),
+                eq: EqVm {
+                    selected: eq_selection(heart.eq_level),
+                    applying: matches!(s.pending_set, Some(PendingWrite::Eq(_))),
+                },
                 mic_recognition: Some(heart.tx_identify),
                 channel_mode: channel_mode_selection(heart.voice_mode),
                 shutdown: shutdown_selection(heart.shutdown_time),
@@ -430,7 +475,10 @@ fn disconnected_core() -> ViewModel {
         },
         light: None,
         voice_level: None,
-        eq_level: None,
+        eq: EqVm {
+            selected: None,
+            applying: false,
+        },
         mic_recognition: None,
         channel_mode: None,
         shutdown: None,
@@ -483,7 +531,7 @@ mod tests {
     fn snap(
         status: ConnStatus,
         heart: Option<HeartInfo>,
-        pending: Option<NoiseWrite>,
+        pending: Option<PendingWrite>,
         detail: Option<&str>,
     ) -> Snapshot {
         Snapshot {
@@ -595,7 +643,7 @@ mod tests {
         let vm = view_model(&snap(
             ConnStatus::Connected,
             Some(e1()),
-            Some(NoiseWrite::Switch(false)),
+            Some(PendingWrite::Noise(NoiseWrite::Switch(false))),
             None,
         ));
         assert_eq!(
@@ -614,7 +662,7 @@ mod tests {
         let vm = view_model(&snap(
             ConnStatus::Connected,
             Some(off),
-            Some(NoiseWrite::Switch(true)),
+            Some(PendingWrite::Noise(NoiseWrite::Switch(true))),
             None,
         ));
         assert_eq!(vm.nc.state, Some(false));
@@ -625,7 +673,7 @@ mod tests {
         let vm = view_model(&snap(
             ConnStatus::Connected,
             Some(e1()),
-            Some(NoiseWrite::Level(2)),
+            Some(PendingWrite::Noise(NoiseWrite::Level(2))),
             None,
         ));
         assert_eq!(vm.nc.state, Some(true));
@@ -649,7 +697,13 @@ mod tests {
         assert_eq!(vm.tx3, None, "tail TXs absent in the 17-byte shape");
         assert_eq!(vm.tx4, None);
         assert_eq!(vm.voice_level, Some(3));
-        assert_eq!(vm.eq_level, Some(3));
+        assert_eq!(
+            vm.eq,
+            EqVm {
+                selected: Some(0), // wire pad 3 = "Equalization" (balance)
+                applying: false
+            }
+        );
         assert_eq!(
             vm.reverb,
             Some(ReverbVm {
@@ -775,6 +829,61 @@ mod tests {
         assert_eq!(eq_selection(255), None, "no certified pad");
     }
 
+    /// The click path's inverse: every display pad round-trips through the
+    /// wire bytes (selection -> wire -> selection is identity), and
+    /// unmapped indices stay unmapped.
+    #[test]
+    fn eq_pad_wire_roundtrips_eq_selection() {
+        for (index, wire) in [(0usize, 3u8), (1, 1), (2, 2)] {
+            assert_eq!(eq_pad_wire(index), Some(wire), "pad {index}");
+            assert_eq!(eq_selection(wire), Some(index), "wire {wire}");
+            let mut heart = e1();
+            heart.eq_level = wire;
+            // The VM's connected shape carries the pad as `selected`; a UI
+            // sending `eq_pad_wire(selected)` lands on the same byte.
+            let vm = view_model(&snap(ConnStatus::Connected, Some(heart), None, None));
+            assert_eq!(vm.eq.selected, Some(index), "heart wire {wire}");
+            assert_eq!(
+                eq_pad_wire(vm.eq.selected.expect("mapped above")),
+                Some(wire)
+            );
+        }
+        assert_eq!(eq_pad_wire(3), None, "out of the three-pad range");
+        assert_eq!(eq_pad_wire(usize::MAX), None);
+    }
+
+    /// Panels gate on their OWN pending only: an in-flight EQ write
+    /// (`PendingWrite::Eq`) shows `applying` on the EQ panel while the NC
+    /// panel stays untouched (pending None), and the reverse.
+    #[test]
+    fn pending_is_filtered_by_control_family() {
+        let eq_vm = view_model(&snap(
+            ConnStatus::Connected,
+            Some(e1()),
+            Some(PendingWrite::Eq(2)),
+            None,
+        ));
+        assert!(eq_vm.eq.applying, "EQ write dims the EQ panel");
+        assert_eq!(eq_vm.eq.selected, Some(0), "selection stays the device's");
+        assert_eq!(eq_vm.nc.pending, None, "NC panel never sees an EQ write");
+
+        let nc_vm = view_model(&snap(
+            ConnStatus::Connected,
+            Some(e1()),
+            Some(PendingWrite::Noise(NoiseWrite::Level(1))),
+            None,
+        ));
+        assert_eq!(nc_vm.nc.pending, Some(NoiseWrite::Level(1)));
+        assert_eq!(
+            nc_vm.eq,
+            EqVm {
+                selected: Some(0),
+                applying: false
+            },
+            "NC write never dims the EQ panel"
+        );
+    }
+
     /// Reverb pads: Small/Medium/Large = wire bytes 0/1/2 (identity) [code
     /// DeviceConnectVariable.Reverb + gear strings]; anything else unselected.
     #[test]
@@ -791,16 +900,27 @@ mod tests {
     #[test]
     fn battery_segment_count_boundaries() {
         for (pct, want) in [
-            (0u8, 0), (1, 1), (19, 1), (20, 1), (21, 2), (40, 2),
-            (60, 3), (80, 4), (93, 5), (98, 5), (100, 5),
+            (0u8, 0),
+            (1, 1),
+            (19, 1),
+            (20, 1),
+            (21, 2),
+            (40, 2),
+            (60, 3),
+            (80, 4),
+            (93, 5),
+            (98, 5),
+            (100, 5),
         ] {
             assert_eq!(battery_segment_count(pct), want, "battery {pct}%");
         }
     }
 
-    /// The writability table is a fixed contract: exactly the two
+    /// The writability table is a fixed contract: exactly the
     /// wire-certified SET paths are true, everything else read-only until
-    /// its capture lands (docs/gui-roadmap.md §1 gate).
+    /// its capture lands (docs/gui-roadmap.md §1 gate). EQ joined via the
+    /// PC-originated guarded round trip ([wire] PC-originated round trip;
+    /// captures/set_eq_roundtrip.jsonl).
     #[test]
     fn writable_table_matches_the_certified_chain() {
         let all_read_only = Writable {
@@ -820,6 +940,7 @@ mod tests {
             Writable {
                 nc_toggle: true,
                 nc_level: true,
+                eq: true,
                 ..all_read_only
             }
         );

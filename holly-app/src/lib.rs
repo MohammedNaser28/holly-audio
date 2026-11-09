@@ -6,10 +6,10 @@
 //! (gpui, Tauri, CLI, ...) adapts it by driving a
 //! `frontends/.../main.rs` against [`start`] / [`DeviceHandle`].
 //!
-//! Safety posture is unchanged from holly-usb: only GET_HEART_INFO and
-//! SET_NOISE are ever issued; no OTA/reset/pairing; Rejected/BadAck are
-//! surfaced, never swallowed; a malformed heartbeat is an abort, not a
-//! retry (docs/protocol.md §2/§5).
+//! Safety posture is unchanged from holly-usb: only GET_HEART_INFO,
+//! SET_NOISE and SET_EQ are ever issued; no OTA/reset/pairing; Rejected/
+//! BadAck are surfaced, never swallowed; a malformed heartbeat is an abort,
+//! not a retry (docs/protocol.md §2/§5).
 //!
 //! Layering (project rule — logic never duplicates across layers):
 //! - framing: `holly-proto` (untouched here)
@@ -27,7 +27,9 @@ pub mod actor;
 pub mod demo;
 pub mod vm;
 
-pub use actor::{Command, Core, DeviceHandle, Hub, NoiseWrite, start, start_with_factory};
+pub use actor::{
+    Command, Core, DeviceHandle, Hub, NoiseWrite, PendingWrite, start, start_with_factory,
+};
 
 /// Default poll interval for the connected state (1 s, per spec).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -74,8 +76,10 @@ pub struct Snapshot {
     pub heart: Option<HeartInfo>,
     /// A SET the actor accepted and is executing / will execute (latest
     /// request wins). This is pending-state information the frontend only
-    /// ever RENDERS — never invents.
-    pub pending_set: Option<NoiseWrite>,
+    /// ever RENDERS — never invents. The enum tells WHICH control family is
+    /// in flight (NC toggle/level vs EQ pad), so the UI greys out only the
+    /// affected panel.
+    pub pending_set: Option<PendingWrite>,
     /// UNIX-epoch seconds of the last successful GET in this session
     /// (actor-stamped; footer presentation + staleness display). `None`
     /// until the first poll succeeds, cleared on disconnect.
@@ -130,6 +134,11 @@ pub trait StatusSource {
     /// HLDevice6302Activity level buttons [code, wire-exercised in
     /// captures/2026-11-05-noise-level-medium.txt]).
     fn set_noise_level(&mut self, level: u8) -> Result<(), Error>;
+    /// One SET_EQ round trip — `pad` in the WIRE value space 1..=3 (§5.2);
+    /// holly-usb's set_eq returns the fresh GET's PRE-write pad (the value
+    /// in force before the write — the restore-flow datum; the actor's
+    /// verdict comes from its own post-SET poll, see execute_set).
+    fn set_eq(&mut self, pad: u8) -> Result<u8, Error>;
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {
@@ -143,6 +152,10 @@ impl<T: Transport> StatusSource for HollyControl<T> {
 
     fn set_noise_level(&mut self, level: u8) -> Result<(), Error> {
         HollyControl::set_noise_level(self, level)
+    }
+
+    fn set_eq(&mut self, pad: u8) -> Result<u8, Error> {
+        HollyControl::set_eq(self, pad)
     }
 }
 
