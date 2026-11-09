@@ -98,14 +98,23 @@ use gpui::{
 use holly_app::DeviceHandle;
 use holly_app::demo::DemoScenario;
 use holly_app::vm::{
-    Banner, DEVICE_NAME, NcVm, TxVm, VID_PID, ViewModel, battery_segment_count, conn_status_word,
-    eq_selection, mic_status, mute_label, nc_level_label, nc_status, reverb_selection,
-    view_model, volume_selection,
+    Banner, DEVICE_NAME, EqVm, NcVm, TxVm, VID_PID, ViewModel, WRITABLE, battery_segment_count,
+    conn_status_word, eq_pad_wire, mic_status, mute_label, nc_level_label, nc_status,
+    reverb_selection, view_model, volume_selection,
 };
 
 actions!(
     holly,
-    [ToggleNoise, NcLow, NcMedium, NcStrong, Refresh, Quit]
+    [
+        ToggleNoise,
+        NcLow,
+        NcMedium,
+        NcStrong,
+        EqPrev,
+        EqNext,
+        Refresh,
+        Quit
+    ]
 );
 
 mod fonts;
@@ -523,6 +532,37 @@ fn nc_write_accepted(nc: &NcVm) -> bool {
     nc.pending.is_none() && nc.state.is_some()
 }
 
+/// May THIS EQ request go out right now? Guard for the EQ pads: the family
+/// must be writable (`WRITABLE.eq` — true only since the guarded round trip;
+/// if a later regression demoted it, the click path goes inert WITHOUT
+/// re-touching every view) and nothing may be in flight (ONE SET runs at a
+/// time; any pending — NC or EQ — blocks: the actor's latest-wins
+/// coalescing stays the ONLY queue, the UI never queues a second write).
+fn eq_write_accepted(eq: &EqVm) -> bool {
+    WRITABLE.eq && !eq.applying
+}
+
+/// Decision for ONE EQ pad pick — parallel to [`LevelPick`]: blocked (the
+/// family is read-only or an EQ write is in flight), noop (that pad is
+/// already the device's verified selection), else write. NO pending target
+/// is ever displayed — the selection moves on the device's verdict only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EqPick {
+    Blocked,
+    Noop,
+    Write,
+}
+
+fn eq_pick(index: usize, eq: &EqVm) -> EqPick {
+    if !eq_write_accepted(eq) {
+        return EqPick::Blocked;
+    }
+    if eq.selected == Some(index) {
+        return EqPick::Noop;
+    }
+    EqPick::Write
+}
+
 /// Banner decoration per kind, decided ONLY from `Banner` (the design
 /// colour rule: amber = needs attention, red = error, grey = everything
 /// else; container stays on the designed BANNER_BG/BANNER_LINE). The
@@ -590,6 +630,10 @@ fn nc_led(nc: &NcVm) -> LedLit {
 /// inside its `key_context`; see `main`), so it owns the FocusHandle.
 struct AppModel {
     focus: FocusHandle,
+    /// The EQ selector's keyboard handle — its own (separate from the
+    /// rocker) so the "eq_selector" context keys (Left/Right) dispatch only
+    /// while that well is focused.
+    eq_focus: FocusHandle,
     vm: ViewModel,
     device: DeviceHandle,
     demo: Option<DemoScenario>,
@@ -642,6 +686,41 @@ impl AppModel {
         if nc_write_accepted(&self.vm.nc) && self.vm.nc.state != Some(request) {
             self.device.set_noise(request);
         }
+    }
+
+    /// One EQ pad pick for mouse AND keyboard — [`eq_pick`] is the whole
+    /// decision (read-only family or an in-flight EQ write: blocked;
+    /// already-selected: noop; else write). The WIRE byte comes from the
+    /// VM's tested translation (`eq_pad_wire`) — this file never names a
+    /// device pad value.
+    fn set_eq_pad(&mut self, index: usize, _: &mut Context<Self>) {
+        if eq_pick(index, &self.vm.eq) == EqPick::Write
+            && let Some(wire) = eq_pad_wire(index)
+        {
+            self.device.set_eq(wire);
+        }
+    }
+
+    /// Left/Right stepping over the pads (the design's arrow-key spec does
+    /// not exist — mirroring the rocker's context-scoped keyboard rule;
+    /// NC's global 1/2/3 stay untouched). With no verified selection the
+    /// step is a noop: the VM's `selected` is the only cursor, matching the
+    /// "no pending target" rule.
+    fn eq_step(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some(selected) = self.vm.eq.selected {
+            let next = selected as isize + step;
+            if (0..=2).contains(&next) {
+                self.set_eq_pad(next as usize, cx);
+            }
+        }
+    }
+
+    fn on_eq_prev(&mut self, _: &EqPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.eq_step(-1, cx);
+    }
+
+    fn on_eq_next(&mut self, _: &EqNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.eq_step(1, cx);
     }
 
     fn refresh_now(&mut self, _: &mut Context<Self>) {
@@ -891,19 +970,7 @@ impl AppModel {
                             .flex_none()
                             .flex()
                             .gap(px(theme::metrics::SPACE_4))
-                            .child(
-                                self.audio_panel(
-                                    "EQ adjustment",
-                                    &["Equalization", "Low", "Bright"], // [code index.html:262]
-                                    // Display order = APK visual order
-                                    // [balance, overcast, bright] = wire
-                                    // bytes [3,1,2] [code
-                                    // DeviceConnectVariable.EQ +
-                                    // hldevice_6108.xml:156-166/:1290-1292].
-                                    self.vm.eq_level.and_then(eq_selection),
-                                )
-                                .flex_1(),
-                            )
+                            .child(self.eq_panel(cx).flex_1())
                             .child(self.reverb_panel().flex_1()),
                     )
                     .child(
@@ -1295,15 +1362,111 @@ impl AppModel {
         group
     }
 
-    /// The read-only audio panels (Volume / Channel / EQ / Schedule): a
-    /// title and a selector group. Selection comes ONLY from the heart's
+    /// EQ panel — the reference's title + selector row, now INTERACTIVE:
+    /// picks send `set_eq` (wire pads via `eq_pad_wire`) through the same
+    /// actor path as the NC controls, gated by `eq_pick`. While an EQ write
+    /// is in flight (`EqVm.applying`) the selector dims to 0.5 and both
+    /// mouse and keyboard picks are ignored — the snapshot's POST-SET poll
+    /// moves the selection (no pending target is ever shown; same rule as
+    /// the NC level selector). Left/Right step the pads while the well is
+    /// focused ("eq_selector" key context — bindings in main); the
+    /// DEVISION dim (busy → 0.6) intentionally NOT applied (README).
+    fn eq_panel(&self, cx: &Context<Self>) -> gpui::Div {
+        let eq = &self.vm.eq;
+        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
+            .flex_1()
+            .min_w(px(0.))
+            .p(px(theme::metrics::SELECTOR_PADDING))
+            .gap(px(theme::metrics::SELECTOR_GAP))
+            .track_focus(&self.eq_focus)
+            .key_context("eq_selector")
+            // focus-visible outline = the rocker's rule (2px tungsten).
+            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
+            .when(eq.applying, |g| g.opacity(0.5));
+        // Display order = APK visual order [balance, overcast, bright] =
+        // wire bytes [3,1,2] [code DeviceConnectVariable.EQ + reference
+        // radio "Equalization/Low/Bright" (hldevice_6108.xml:156-166,
+        // :1290-1292; index.html:262)] — translation is the VM's tested
+        // `eq_pad_wire`, never a literal here.
+        const EQ_LABELS: [&str; 3] = ["Equalization", "Low", "Bright"];
+        for (index, label) in EQ_LABELS.iter().enumerate() {
+            let selected = eq.selected == Some(index);
+            let pick = eq_pick(index, eq);
+            let mut option = div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
+                .text_size(px(theme::text::BODY_SIZE))
+                .when(selected, |o| {
+                    o.bg(linear_gradient(
+                        180.,
+                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
+                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
+                    ))
+                    .text_color(solid(theme::color::TEXT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .shadow(matte_under_edge(1.))
+                })
+                .when(!selected, |o| {
+                    o.text_color(solid(theme::color::TEXT_2))
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .child(label.to_string())
+                .relative();
+            if selected {
+                // Same tungsten indicator bar as the NC level selector.
+                option = option.child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(5.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
+                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
+                                .rounded(px(1.))
+                                .bg(solid(theme::color::TUNGSTEN))
+                                .shadow(vec![BoxShadow {
+                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
+                                        .opacity(0.6),
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(6.),
+                                    spread_radius: px(0.),
+                                }]),
+                        ),
+                );
+            }
+            let option = if pick != EqPick::Blocked {
+                option
+                    .id(ElementId::named_usize("eq-pad", index))
+                    .hover(|s| s.cursor_pointer())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_eq_pad(index, cx);
+                    }))
+                    .into_any_element()
+            } else {
+                option.into_any_element()
+            };
+            group = group.child(option);
+        }
+        group
+    }
+
+    /// The read-only audio panels (Volume / Channel / Schedule): a title
+    /// and a selector group. Selection comes ONLY from the heart's
     /// certified byte→pad mapping — Volume lights the device's current stop
-    /// (`volume_selection`, protocol.md:246-249), Channel mode maps
-    /// mono=0/stereo=1, Schedule maps quarter("15min")=0/never=1, and EQ
-    /// maps the 1-based byte space 3/1/2 onto the design's pad order
-    /// (each with its `HLDevice6302Activity.java` [code] citation at the
-    /// call site). A byte outside its panel's certified set (e.g. eq 0)
-    /// passes None and renders the no-selection rule.
+    /// (`volume_selection`, protocol.md:246-249) and Channel mode maps
+    /// mono=0/stereo=1 (each with its `HLDevice6302Activity.java` [code]
+    /// citation at the call site). A byte outside a panel's certified set
+    /// passes None and renders the no-selection rule. EQ no longer routes
+    /// here — it graduated to the INTERACTIVE [`AppModel::eq_panel`] once
+    /// its SET path was wire-certified; Schedule stays read-only.
     /// The DEVISION-chart dim (busy → 0.6) is intentionally NOT applied:
     /// unknown is not disabled-looking (documented deviation in README).
     fn audio_panel(
@@ -1553,6 +1716,8 @@ impl Render for AppModel {
             .on_action(cx.listener(Self::on_nc_low))
             .on_action(cx.listener(Self::on_nc_medium))
             .on_action(cx.listener(Self::on_nc_strong))
+            .on_action(cx.listener(Self::on_eq_prev))
+            .on_action(cx.listener(Self::on_eq_next))
             .on_action(cx.listener(Self::on_refresh))
             .child(self.render_titlebar())
             .children(self.render_banner(cx))
@@ -1607,10 +1772,15 @@ fn main() {
             // focused (key context "nc_rocker"); 1/2/3 and ctrl-r are global
             // bindings — with nothing focused their actions dispatch at the
             // window ROOT (window.rs:3982-3988), which carries the
-            // corresponding on_action listeners.
+            // corresponding on_action listeners. Left/Right step the EQ
+            // pads ONLY while the EQ well is focused (key context
+            // "eq_selector") — the design defines no EQ arrow keys (no
+            // invented global bindings stealing NC's 1/2/3).
             cx.bind_keys([
                 KeyBinding::new("space", ToggleNoise, Some("nc_rocker")),
                 KeyBinding::new("enter", ToggleNoise, Some("nc_rocker")),
+                KeyBinding::new("left", EqPrev, Some("eq_selector")),
+                KeyBinding::new("right", EqNext, Some("eq_selector")),
                 KeyBinding::new("1", NcLow, None),
                 KeyBinding::new("2", NcMedium, None),
                 KeyBinding::new("3", NcStrong, None),
@@ -1680,8 +1850,10 @@ fn main() {
                             // (on_window_close_quit.rs:58 pattern).
                             let focus = cx.focus_handle();
                             focus.focus(window);
+                            let eq_focus = cx.focus_handle();
                             AppModel {
                                 focus,
+                                eq_focus,
                                 vm: ViewModel::default(),
                                 device,
                                 demo,
@@ -1735,11 +1907,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        LedLit, LevelPick, banner_palette, battery_digits, level_pick, nc_led, nc_write_accepted,
-        vm_led,
+        EqPick, LedLit, LevelPick, banner_palette, battery_digits, eq_pick, eq_write_accepted,
+        level_pick, nc_led, nc_write_accepted, vm_led,
     };
     use holly_app::NoiseWrite;
-    use holly_app::vm::{Banner, NcVm, TxVm, ViewModel, battery_class};
+    use holly_app::vm::{Banner, EqVm, NcVm, TxVm, ViewModel, battery_class};
 
     /// A rocker/VM shape straight from the VM fields.
     fn nc(level: Option<u8>, state: Option<bool>, pending: Option<NoiseWrite>) -> NcVm {
@@ -1749,6 +1921,11 @@ mod tests {
             pending,
             last_error: None,
         }
+    }
+
+    /// An EQ panel shape straight from the VM fields.
+    fn eq(selected: Option<usize>, applying: bool) -> EqVm {
+        EqVm { selected, applying }
     }
 
     fn tx(connected: bool, battery: u8) -> TxVm {
@@ -1771,7 +1948,7 @@ mod tests {
             nc: nc(None, None, None),
             light: None,
             voice_level: None,
-            eq_level: None,
+            eq: eq(None, false),
             mic_recognition: None,
             channel_mode: None,
             shutdown: None,
@@ -1841,6 +2018,39 @@ mod tests {
             Some(true),
             Some(NoiseWrite::Level(1))
         )));
+    }
+
+    /// EQ write gate: writable family AND nothing in flight. A demoted
+    /// family is unreachable with today's `WRITABLE.eq = true` (the pinned
+    /// contract is vm.rs's own table test); the conjunction's `applying`
+    /// half is exercised to full coverage here.
+    #[test]
+    fn eq_write_accepted_matrix() {
+        // Verified selection, nothing in flight: accepted.
+        assert!(eq_write_accepted(&eq(Some(0), false)));
+        // Unknown selection (device at an uncertified byte): still accepted —
+        // a click may move ONTO a certified pad.
+        assert!(eq_write_accepted(&eq(None, false)));
+        // An EQ write in flight: blocked regardless of selection.
+        assert!(!eq_write_accepted(&eq(Some(0), true)));
+        assert!(!eq_write_accepted(&eq(None, true)));
+    }
+
+    /// EQ pick decision: same matric family as `level_pick` — blocked while
+    /// applying (or an unwritable family), noop on the device's own pad,
+    /// write otherwise. NO pending target is ever displayed.
+    #[test]
+    fn eq_pick_matrix() {
+        let idle = eq(Some(1), false);
+        assert_eq!(eq_pick(1, &idle), EqPick::Noop, "the device's own pad");
+        assert_eq!(eq_pick(0, &idle), EqPick::Write);
+        assert_eq!(eq_pick(2, &idle), EqPick::Write);
+        assert_eq!(
+            eq_pick(1, &eq(Some(1), true)),
+            EqPick::Blocked,
+            "an in-flight EQ write blocks every pick"
+        );
+        assert_eq!(eq_pick(0, &eq(None, false)), EqPick::Write);
     }
 
     /// Banner palette per kind (colour rule: amber = attention, red = error,
