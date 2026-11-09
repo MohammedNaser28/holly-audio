@@ -98,8 +98,9 @@ use gpui::{
 use holly_app::DeviceHandle;
 use holly_app::demo::DemoScenario;
 use holly_app::vm::{
-    Banner, DEVICE_NAME, NcVm, TxVm, VID_PID, ViewModel, conn_status_word, mic_status, mute_label,
-    nc_level_label, nc_status, view_model,
+    Banner, DEVICE_NAME, NcVm, TxVm, VID_PID, ViewModel, battery_segment_count, conn_status_word,
+    eq_selection, mic_status, mute_label, nc_level_label, nc_status, reverb_selection,
+    view_model, volume_selection,
 };
 
 actions!(
@@ -866,12 +867,21 @@ impl AppModel {
                                         self.audio_panel(
                                             "Volume adjustment",
                                             &["1", "2", "3", "4", "5", "6"], // [code index.html:260]
+                                            // byte N = stop N+1 (session 3b);
+                                            // pad index = byte (0..=5 only).
+                                            self.vm.voice_level.and_then(volume_selection),
                                         )
                                         .flex_1(),
                                     )
                                     .child(
-                                        self.audio_panel("Channel mode", &["Mono", "Stereo"])
-                                            .flex_1(),
+                                        self.audio_panel(
+                                            "Channel mode",
+                                            &["Mono", "Stereo"], // [code index.html:258]
+                                            // mono = wire 0, stereo = wire 1 [code
+                                            // HLDevice6302Activity.java:1803-1805].
+                                            self.vm.channel_mode,
+                                        )
+                                        .flex_1(),
                                     ),
                             ),
                     )
@@ -885,6 +895,12 @@ impl AppModel {
                                 self.audio_panel(
                                     "EQ adjustment",
                                     &["Equalization", "Low", "Bright"], // [code index.html:262]
+                                    // Display order = APK visual order
+                                    // [balance, overcast, bright] = wire
+                                    // bytes [3,1,2] [code
+                                    // DeviceConnectVariable.EQ +
+                                    // hldevice_6108.xml:156-166/:1290-1292].
+                                    self.vm.eq_level.and_then(eq_selection),
                                 )
                                 .flex_1(),
                             )
@@ -900,6 +916,10 @@ impl AppModel {
                                 self.audio_panel(
                                     "Schedule power off",
                                     &["15min", "Never"], // [code index.html:264]
+                                    // quarter("15min") = wire 0,
+                                    // never("Never") = wire 1 [code
+                                    // HLDevice6302Activity.java:1864-1866].
+                                    self.vm.shutdown,
                                 )
                                 .flex_1(),
                             )
@@ -909,7 +929,16 @@ impl AppModel {
                                     .flex()
                                     .flex_col()
                                     .gap(px(theme::metrics::SPACE_4))
-                                    .child(self.led_toggle_panel("Mic recognition", false).flex_1())
+                                    .child(
+                                        self.led_toggle_panel(
+                                            "Mic recognition",
+                                            // §5 offset 15 read (`vm.mic_recognition`), not
+                                            // a hardcoded false; unknown => off like
+                                            // `light.unwrap_or` below.
+                                            self.vm.mic_recognition.unwrap_or(false),
+                                        )
+                                        .flex_1(),
+                                    )
                                     .child(
                                         self.led_toggle_panel(
                                             "Indicator light",
@@ -929,13 +958,18 @@ impl AppModel {
     /// segments, and an UNLIT 20-segment level meter (no wire source for
     /// the meter: always unlit, per the writability/evidence rules).
     fn mic_card(&self, id: &'static str, tx: Option<&TxVm>) -> gpui::Div {
-        let (name, status, muted, digits, live) = match tx {
+        let (name, status, muted, digits, live, lit) = match tx {
             Some(tx) => (
                 name_for(id),
                 mic_status(tx.connected).to_string(),
                 mute_label(tx.muted),
                 battery_digits(tx),
                 tx.connected,
+                if tx.connected {
+                    battery_segment_count(tx.battery)
+                } else {
+                    0
+                },
             ),
             None => (
                 name_for(id),
@@ -943,6 +977,7 @@ impl AppModel {
                 "Mute",
                 "--".to_string(),
                 false,
+                0,
             ),
         };
         let glyph_color = solid(if live {
@@ -1028,7 +1063,7 @@ impl AppModel {
                     .flex()
                     .flex_col()
                     .gap(px(10.))
-                    .child(battery_block(&digits, live))
+                    .child(battery_block(&digits, live, lit))
                     .child(level_meter_block()),
             )
     }
@@ -1261,15 +1296,22 @@ impl AppModel {
     }
 
     /// The read-only audio panels (Volume / Channel / EQ / Schedule): a
-    /// title and a selector group whose options are UNMAPPED — no HeartInfo
-    /// field→control mapping has ever been captured for them, so they render
-    /// at full opacity with NO selection (the "--"/no-selection rule) and
-    /// STAY read-only until a capture passes the roadmap gate
-    /// (`WRITABLE.*` false). Panels are justify-center with a 12px gap per
-    /// the reference (index.html:107). The DEVISION-chart dim (busy → 0.6)
-    /// is intentionally NOT applied: unknown is not disabled-looking
-    /// (documented deviation in README).
-    fn audio_panel(&self, title: &'static str, labels: &[&'static str]) -> gpui::Div {
+    /// title and a selector group. Selection comes ONLY from the heart's
+    /// certified byte→pad mapping — Volume lights the device's current stop
+    /// (`volume_selection`, protocol.md:246-249), Channel mode maps
+    /// mono=0/stereo=1, Schedule maps quarter("15min")=0/never=1, and EQ
+    /// maps the 1-based byte space 3/1/2 onto the design's pad order
+    /// (each with its `HLDevice6302Activity.java` [code] citation at the
+    /// call site). A byte outside its panel's certified set (e.g. eq 0)
+    /// passes None and renders the no-selection rule.
+    /// The DEVISION-chart dim (busy → 0.6) is intentionally NOT applied:
+    /// unknown is not disabled-looking (documented deviation in README).
+    fn audio_panel(
+        &self,
+        title: &'static str,
+        labels: &[&'static str],
+        selected: Option<usize>,
+    ) -> gpui::Div {
         panel()
             .flex_1()
             .justify_center()
@@ -1280,13 +1322,13 @@ impl AppModel {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
-            .child(radio_group(labels, None))
+            .child(radio_group(labels, selected))
     }
 
     /// Reverb panel: title + read-only state toggle (`ReverbVm.enabled`,
     /// wire-read) + the size selector row, shown only while reverb is ON
-    /// (reference `sc-if reverbOn`, index.html:139); no selection (the
-    /// reverb level→label mapping is undocumented).
+    /// (reference `sc-if reverbOn`, index.html:139); the gear pads
+    /// select the wire byte identically (0..=2 — `reverb_selection`).
     fn reverb_panel(&self) -> gpui::Div {
         let enabled = self.vm.reverb.is_some_and(|reverb| reverb.enabled);
         panel()
@@ -1306,7 +1348,18 @@ impl AppModel {
                     )
                     .child(toggle_switch(enabled)),
             )
-            .children(enabled.then(|| radio_group(&["Small", "Medium", "Large"], None)))
+            .children(enabled.then(|| {
+                radio_group(
+                    &["Small", "Medium", "Large"], // [code index.html:140]
+                    // GEAR_ONE..THREE = wire 0..2, and the APK's gear
+                    // strings ARE these words [code
+                    // DeviceConnectVariable.Reverb + hldevice_6108.xml:792-794].
+                    self.vm
+                        .reverb
+                        .as_ref()
+                        .and_then(|reverb| reverb_selection(reverb.level)),
+                )
+            }))
     }
 
     /// Mic recognition / Indicator light panels (the 120px row halves): the
@@ -1370,9 +1423,12 @@ fn name_for(id: &str) -> &'static str {
 }
 
 /// The reference battery block: 64px/300 digits + (live) 20px "%" suffix +
-/// right "Battery" label; 5 segments h8 r3 gap 4, lit = TEXT white when
-/// live, RAISED when not.
-fn battery_block(digits: &str, live: bool) -> gpui::Div {
+/// right "Battery" label; 5 segments h8 r3 gap 4. `lit` segments take the
+/// TEXT white fill (the device's real charge via `battery_segment_count`);
+/// the rest stay the unlit RAISED fill. DEVIATION from the mock, which
+/// lit all five on any live link regardless of percent (index.html:229) —
+/// kept proportional so the bar agrees with the digits (README).
+fn battery_block(digits: &str, live: bool, lit: usize) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -1408,16 +1464,16 @@ fn battery_block(digits: &str, live: bool) -> gpui::Div {
                 ),
         )
         .child(
-            // 5 segments, h8 r3, gap 4; the reference lights ALL of them on a
-            // live link (`seg(5, live ? 5 : 0, TEXT)`, index.html:229) and
-            // leaves every segment the unlit RAISED fill otherwise.
+            // 5 segments, h8 r3, gap 4; `lit` of them white (real %), the
+            // rest the unlit RAISED fill (proportional deviation from the
+            // mock's light-all-five, documented in README).
             div().flex().gap(px(theme::metrics::SPACE_1)).children(
-                (0..theme::metrics::BATTERY_SEGMENTS).map(|_| {
+                (0..theme::metrics::BATTERY_SEGMENTS).map(|segment| {
                     div()
                         .flex_1()
                         .h(px(8.))
                         .rounded(px(theme::metrics::BATTERY_SEGMENT_RADIUS))
-                        .bg(solid(if live {
+                        .bg(solid(if live && segment < lit {
                             theme::color::TEXT
                         } else {
                             theme::color::RAISED
@@ -1579,6 +1635,7 @@ fn main() {
                 None => holly_app::start(),
             };
             let rx = device.subscribe();
+            eprintln!("[holly] demo={demo:?} subscribed"); // TEMP-DEBUG
 
             let window = cx
                 .open_window(
@@ -1642,6 +1699,10 @@ fn main() {
                 .name("holly-gpui-pump".to_string())
                 .spawn(move || {
                     for snap in rx {
+                        eprintln!(
+                            "[holly] pump -> {:?} detail={:?} pending={:?}",
+                            snap.status, snap.detail, snap.pending_set
+                        ); // TEMP-DEBUG
                         if snap_tx.unbounded_send(snap).is_err() {
                             break; // UI side is gone
                         }
@@ -1655,10 +1716,12 @@ fn main() {
             cx.spawn(async move |cx| {
                 // snap_rx.next() requires `futures::StreamExt` (import above).
                 while let Some(snap) = snap_rx.next().await {
+                    eprintln!("[holly] ui <- {:?}", snap.status); // TEMP-DEBUG
                     if view
                         .update(cx, |model, cx| model.apply_snapshot(snap, cx))
                         .is_err()
                     {
+                        eprintln!("[holly] ui update FAILED; breaking"); // TEMP-DEBUG
                         break; // view released (window closed)
                     }
                 }
@@ -1709,6 +1772,10 @@ mod tests {
             light: None,
             voice_level: None,
             eq_level: None,
+            mic_recognition: None,
+            channel_mode: None,
+            shutdown: None,
+            signal_mode: None,
             reverb: None,
             updated: None,
         }

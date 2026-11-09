@@ -137,6 +137,13 @@ All deferred with a reason; none invented:
   have never decoded — HeartInfo exposes no per-mic level — so the meter is
   ALWAYS-UNLIT (`METER_PEAK_FROM` similarly parked). This is a decode
   requirement, not a UI decision.
+- **Battery segments.** The mock lights ALL five battery segments whenever
+  the link is live, regardless of the percent shown next to it
+  (index.html:229). The desktop bar lights `battery_segment_count(pct)`
+  segments (~20 % each, ceil) instead, so the bar agrees with the digits —
+  a documented deviation, deliberate (vm.rs marks the thresholds
+  presentation-only; 93 % lights 5, 80 % lights 4, 20 % lights 1, a dead
+  link stays fully unlit).
 - **Busy-mode global 0.6 dim.** The mock dims the WHOLE page while busy. The
   design brief says unknown/recovering states must not look disabled —
   banners already say what is wrong, so the dim is NOT applied (this is a
