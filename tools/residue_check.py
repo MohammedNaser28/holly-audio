@@ -79,6 +79,14 @@ FRAMES: list[tuple[str, bytes, str]] = [
     _heart("eqB eq2 lv0 b0x54", "01 00 54 00 00 00 01 00 03 00 00 00 02 00 00 00 00", 0x3D),
     _heart("eqC eq3 lv0 b0x54 r41", "01 00 54 00 00 00 01 00 03 00 00 00 03 00 00 00 00", 0x3C),
     _ack("eqW/r ack", 0x07, 0x61),
+    # Gain round trip — captures/raw/set_gain_roundtrip.pcap exported as
+    # captures/set_gain_roundtrip.jsonl frames 17/21/41/45 (gA, voice 2),
+    # 29/33 (gB, voice 1), 25/37 (ack cmd 03): TX1 connected, battery 0x2B,
+    # NC on level 2, EQ pad 1, light on, reverb off; voiceLevel 2 -> 1 -> 2.
+    # Bodies read VERBATIM from the jsonl `hex` column (frame bytes 7..24+residue).
+    _heart("gA lv2 b0x2B r17", "01 00 2B 00 00 00 01 02 02 00 00 00 01 00 00 00 00", 0x42),
+    _heart("gB lv1 b0x2B r29", "01 00 2B 00 00 00 01 02 01 00 00 00 01 00 00 00 00", 0x41),
+    _ack("gW/r ack", 0x03, 0x65),
 ]
 
 # ── hypotheses ──────────────────────────────────────────────────────────────
@@ -155,7 +163,8 @@ def main() -> None:
     hearts_n = sum(1 for _, _, k in FRAMES if k == "heart")
     acks_n = sum(1 for _, _, k in FRAMES if k == "ack")
     print(f"vectors: {hearts_n} heart replies, {acks_n} SET ACKs "
-          "(captures/2026-11-05-*.txt + captures/set_eq_roundtrip.jsonl)\n")
+          "(captures/2026-11-05-*.txt + captures/set_eq_roundtrip.jsonl +\n"
+          "captures/set_gain_roundtrip.jsonl)\n")
 
     print(f"{'hypothesis':42} {'hearts':>9} {'acks':>7} {'total':>7}")
     # aggregate per (hypothesis, window) across both kinds; only hypotheses
