@@ -661,3 +661,188 @@ fn set_eq_roundtrip_replays_the_real_session() {
     assert_eq!(SET_EQ_2_TX, SET_EQ_2_WIRE, "doc vector == observed wire");
     assert_eq!(SET_EQ_ACK, SET_EQ_ACK_WIRE, "ack lineage pin");
 }
+
+// ── Gain (cmd 3, SET_VOICE_LEVEL) — Phase 1B route (b) ──────────────────────
+// Owner rule (2026-11-10): Mock vectors are RECOMPUTED FROM THE DOCS until
+// the hardware run; real usbmon frames join as replay vectors after it —
+// the same flow as EQ (roadmap §1 route (b)). Every frame below is computed
+// from docs only:
+//   frame template  docs/protocol.md §2 (ProtocolV2.getData [code])
+//   cmd 3, payload  docs/set-gate-checklist.md §3 Gain row ([{value}]:
+//                   identity — the seekbar's select index, byte N = display
+//                   stop N+1; HLDevice6302Activity.java:840-846 [code])
+//   value space     0..=5 = the READ space (§5.2 Volume row + §5.1: the
+//                   bar works in a 0-based index space, touch coerceIn
+//                   (0..5), draws "1".."6" — write space == read space, no
+//                   inversion; session 3b read voiceLevel 03 ↔ phone stop
+//                   "4" [wire captures/2026-11-05-noise-level-medium.txt])
+// The heart reply is the wire-certified E1 heart (captures/
+// 2026-11-05-hearinfo-first-wire.txt) with only the value byte moved: the
+// 17-byte heart layout is [wire] and E1 already rests at the session-3b
+// voice level (payload[8] = 03 → frame byte 15).
+
+/// SET_GAIN of stop 2 (display stop "3" — one below the certified rest
+/// state 3/"4") recomputed from the docs:
+/// `05 03 AA DD 03 00 01 02 EF` + zero padding to 64 (big-endian len 00 01).
+const SET_GAIN_2_TX: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x03, 0x00, 0x01, 0x02, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// SET_GAIN ack recomputed from the docs: reply header `05 03 BB DD` + cmd
+/// echo 03 + len 00 01 + status `00` (checklist §3 ACK rule: one status
+/// byte, `data[0] == 0` = success — uniform across `ProSet*` incl.
+/// `ProSetVoiceLevel.receiveData` [code]). The byte behind the payload
+/// follows the reply-checksum rule the EQ session certified on the wire:
+/// XOR(frame[0..7+len)) ⊕ 0x07 — for cmd 03 the prefix `05 03 BB DD 03 00
+/// 01 00` folds to 0x62, so the vector carries `0x65` (EQ: cmd 07 → 0x61;
+/// NC: cmd 13 → 0x75; both wire-matched). docs/protocol.md open question 2
+/// still calls the ACK tail a per-session constant with the classification
+/// open — under THAT reading this byte is unknowable pre-run. Either way
+/// the crate stays byte-agnostic: everything past `7+len` is discarded, so
+/// the vector doubles as an ignore-the-residue regression and the byte is
+/// NOT part of the doc-recomputed contract.
+const SET_GAIN_ACK: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x03, 0x00, 0x01, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The certified E1 heart with voiceLevel (payload offset 8 = frame byte
+/// 15) moved 3 → 2: layout stays [wire] (E1); the flipped value byte is the
+/// doc-recomputed delta side of route (b), and the residue drops to 0x36
+/// per the heart reply checksum rule (XOR(payload[0..17]) ⊕ 0x68 — the
+/// 03→02 flip lands the fold 0x5F → 0x5E, 0x5E⊕0x68 = 0x36; the identical
+/// arithmetic the EQ-2 heart vector verified, since EQ2 flipped 03→02 too).
+/// voiceMode (payload[9], §5 offset 9) is a SEPARATE field and stays 0.
+const HEART_RX_GAIN2: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x01, 0x00, 0x02,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// set_gain(2) (display stop "3" — the neighbouring stop BELOW the
+/// certified rest state 3/"4", quieter): the op must issue its own fresh
+/// GET first (uniform SET discipline), then the byte-exact doc-recomputed
+/// SET frame, and hand back the fresh GET's stop as the pre-write state.
+#[test]
+fn set_gain_tx_frame_is_the_apk_layout() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner fresh GET (device rests at voice 3)
+    mock.push_reply(SET_GAIN_ACK);
+    let mut c = control(mock);
+
+    let previous = c.set_gain(2).expect("ack 00 must be accepted");
+    assert_eq!(
+        previous, 3,
+        "fresh GET inside set_gain = the stop before write"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(&written[0], &HEART_TX, "op must issue its own GET first");
+    assert_eq!(
+        &written[1], &SET_GAIN_2_TX,
+        "SET gain must be the doc-recomputed stop-2 frame"
+    );
+}
+
+/// The identity value space (stops 0..=5 = display "1".."6" — §3 Gain row
+/// write space == §5.2 read space): every SET differs from the stop-2
+/// frame in the value byte only (cmd stays 03; no second payload byte —
+/// voiceMode is a separate heart field and has no payload slot).
+#[test]
+fn set_gain_value_space_changes_only_the_value_byte() {
+    for value in [0u8, 1, 3, 4, 5] {
+        let mut mock = MockTransport::new();
+        mock.push_reply(HEART_RX_E1);
+        mock.push_reply(SET_GAIN_ACK);
+        let mut c = control(mock);
+
+        let previous = c.set_gain(value).expect("ack 00 must be accepted");
+        assert_eq!(previous, 3, "fresh GET reported stop {value} INCOMING");
+        let mut want = SET_GAIN_2_TX;
+        want[7] = value; // value byte sits at frame offset 7 (tail EF at 8)
+        assert_eq!(&c.transport().written()[1], &want, "stop {value}");
+    }
+}
+
+/// Full doc-vector round trip (route (b), Mock half): device rests at
+/// voiceLevel 3 (display "4" — E1 IS that state [wire session 3b]), write
+/// the neighbouring stop 2 below it ("3", quieter), ack `00`, heart
+/// settles voiceLevel → 2 (§5 offset 8) with voiceMode untouched; restore
+/// stop 3, heart settles back. Frames asserted both ways round trip; the
+/// restore TARGET comes from set_gain's own return (the fresh GET inside
+/// the write), not a caller-side poll.
+#[test]
+fn set_gain_roundtrip_doc_vectors() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner GET of set_gain(2): device at 3
+    mock.push_reply(SET_GAIN_ACK); // ack for SET_GAIN [02]
+    mock.push_reply(HEART_RX_GAIN2); // post-SET fresh GET: delta = 2
+    mock.push_reply(HEART_RX_GAIN2); // inner GET of set_gain(prev): device at 2
+    mock.push_reply(SET_GAIN_ACK); // ack for SET_GAIN [03]
+    mock.push_reply(HEART_RX_E1); // post-restore fresh GET: delta = 3
+
+    let mut c = control(mock);
+    let previous = c.set_gain(2).expect("gain write must be accepted");
+    assert_eq!(previous, 3, "pre-write stop from the op's own fresh GET");
+    let after = c.get_heart_info().expect("post-SET GET");
+    assert_eq!(
+        after.voice_level, 2,
+        "heart delta must equal the written stop"
+    );
+    assert_eq!(
+        after.voice_mode, 0,
+        "voiceMode (§5 offset 9) must never move"
+    );
+    let restore_previous = c.set_gain(previous).expect("restore must be accepted");
+    assert_eq!(restore_previous, 2, "fresh GET before restore saw stop 2");
+    let restored = c.get_heart_info().expect("post-restore GET");
+    assert_eq!(
+        restored.voice_level, 3,
+        "heart must be back at the start stop"
+    );
+    assert_eq!(restored.voice_mode, 0, "voiceMode still untouched");
+
+    let written = c.transport().written();
+    let mut set3 = SET_GAIN_2_TX;
+    set3[7] = previous; // value byte at frame offset 7 (tail EF at 8)
+    assert_eq!(&written[1], &SET_GAIN_2_TX, "write leg is stop 2");
+    assert_eq!(&written[4], &set3, "restore leg is set_gain's OWN return");
+}
+
+/// Ack gates shared with the SET_NOISE/SET_EQ families (checklist §3:
+/// uniform `data[0] == 0` success across all `ProSet*` classes —
+/// `ProSetVoiceLevel.receiveData` [code]): nonzero status =
+/// [`Error::Rejected`], wrong ack length = [`Error::BadAck`]. Reason same
+/// as the EQ tests: the ack shape has only ever been seen as `[00]`
+/// [wire E2/E4].
+#[test]
+fn set_gain_rejects_abnormal_acks() {
+    // nonzero status
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_GAIN_ACK;
+    ack[7] = 0x03; // status byte != 0
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_gain(2).expect_err("nonzero ack must fail");
+    assert!(
+        matches!(err, Error::Rejected { status: 0x03, .. }),
+        "{err:?}"
+    );
+
+    // two-byte ack (echo shape) must not be accepted
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_GAIN_ACK;
+    ack[6] = 0x02; // payload len 2
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_gain(2).expect_err("2-byte ack must fail");
+    assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
+}
