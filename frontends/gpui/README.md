@@ -53,7 +53,7 @@ shows the Busy banner instead of the dashboard.
 ```text
 holly-app actor thread ──Snapshot──▶ hub subscriber (pump thread)
         ▲                                   │ forwards into
-        │ commands (set_noise /set_noise_level /set_eq /refresh) ▼
+        │ commands (set_noise /set_noise_level /set_eq /set_gain /refresh) ▼
    DeviceHandle                      gpui executor (cx.spawn → Entity::update)
 ```
 
@@ -78,16 +78,19 @@ holly-app actor thread ──Snapshot──▶ hub subscriber (pump thread)
 | NC rocker (On/Off pads + Space/Enter) | verified `nc.state` only | click on a pad, or Space/Enter while the well is focused (`key_context "nc_rocker"`) | `nc_write_accepted`: nothing in flight, state verified; a pad requests THAT pad's state and dedups on the verified state |
 | NC level (Weak/Medium/Strong = `nc_level_label`) | verified `nc.state == some(true) && nc.level` — no pending target ever shown as selected | click a row (`named_usize("nc-level", L)`), or keys 1/2/3 | `level_pick`: blocked while ANY SET is in flight, blocked while the switch is not verified on, noop on the device's own level |
 | EQ selector (Equalization/Low/Bright = display order) | verified `eq.selection` only (wire bytes 3/1/2 via `vm::eq_selection`; no pending target ever shown as selected) | click a pad (`named_usize("eq-pad", N)`), or Left/Right while the well is focused (`key_context "eq_selector"`) | `eq_pick` + `vm::eq_pad_wire`: blocked while an EQ write is in flight or `WRITABLE.eq` is false, noop on the device's own pad; the wire byte comes from the VM translation — never a literal here |
-| Mic mute chips, volume/channel/schedule selectors, reverb size + toggle, mic-recognition + indicator toggles | read-only snaps of the VM's known fields; unknown = no selection, full opacity | none | nothing is sent — every one of these is `WRITABLE.*: false` until a §1-gated capture exists (`docs/gui-roadmap.md`) |
+| Volume selector (stops "1".."6" = display order) | verified `volume.selected` only (the §5.2 read space 0..=5 via `vm::volume_selection`; no pending target ever shown as selected) | click a stop (`named_usize("volume-stop", N)`), or Left/Right while the well is focused (`key_context "volume_selector"`) | `volume_pick` + `vm::volume_pad_wire`: blocked while a gain write is in flight or `WRITABLE.volume` is false, noop on the device's own stop; the wire byte comes from the VM translation — never a literal here |
+| Mic mute chips, channel/schedule selectors, reverb size + toggle, mic-recognition + indicator toggles | read-only snaps of the VM's known fields; unknown = no selection, full opacity | none | nothing is sent — every one of these is `WRITABLE.*: false` until a §1-gated capture exists (`docs/gui-roadmap.md`) |
 | Refresh ("Try again") | — | banner button | `DeviceHandle::refresh()` (actor re-open attempt) |
 
 Pending semantics (single rule, applied by `nc_write_accepted`/`level_pick`/
-`eq_write_accepted`): ANY SET in flight blocks its OWN control family only
-(`PendingWrite::Noise` dims the NC controls, `PendingWrite::Eq` dims the EQ
-selector — never both): the affected controls ignore picks, the family's
-status word reads "Applying", the lit pad renders the tungsten gradient at 40%
-element opacity with no glow, and the family's selector dims to 0.5. Nothing
-greys-out for "unknown": a state the wire never reported displays as-is.
+`eq_write_accepted`/`volume_write_accepted`): ANY SET in flight blocks its OWN
+control family only (`PendingWrite::Noise` dims the NC controls,
+`PendingWrite::Eq` dims the EQ selector, `PendingWrite::Gain` dims the Volume
+selector — never two at once): the affected controls ignore picks, the
+family's status word reads "Applying", the lit pad renders the tungsten
+gradient at 40% element opacity with no glow, and the family's selector dims
+to 0.5. Nothing greys-out for "unknown": a state the wire never reported
+displays as-is.
 
 ## Theme: graphite and tungsten
 
@@ -201,6 +204,7 @@ sessions, sequentially (the claim is single-holder by design).
 | Space / Enter | flip the NC switch (target computed from the verified state — equivalent to clicking the OPPOSITE pad) | only while the rocker well is focused (`nc_rocker` context) |
 | `1` / `2` / `3` | NC level Weak / Medium / Strong | global |
 | Left / Right | step the EQ selection one pad (from the device's verified pad; no verified pad = noop) | only while the EQ well is focused (`eq_selector` context) |
+| Left / Right | step the Volume selection one stop (from the device's verified stop; no verified stop = noop) | only while the Volume well is focused (`volume_selector` context — disjoint from the EQ well's identical keys) |
 | ctrl-r | refresh (same as "Try again") | global |
 | ctrl-q | quit | global, app-level action |
 | Mouse drag (titlebar strip) | move window | CSD: `start_window_move` |
@@ -250,13 +254,13 @@ window, both `--demo` and real-device runs):
 
 ## Current limitations
 
-- NC (switch + level, cmd 19) and EQ (cmd 7) are writable — wire-exercised
-  (captures/2026-11-05-noise-level-medium.txt; captures/
-  set_eq_roundtrip.jsonl + docs/protocol.md). Volume, channel, schedule,
-  reverb, mute, mic-recognition, and the indicator light are rendered but
-  read-only until their per-control capture procedures
-  ([`../../docs/gui-roadmap.md`](../../docs/gui-roadmap.md)) pass the §1
-  gate.
+- NC (switch + level, cmd 19), EQ (cmd 7), and Volume (cmd 3) are writable —
+  wire-exercised (captures/2026-11-05-noise-level-medium.txt;
+  captures/set_eq_roundtrip.jsonl + captures/set_gain_roundtrip.jsonl;
+  docs/protocol.md). Channel, schedule, reverb, mute, mic-recognition, and
+  the indicator light are rendered but read-only until their per-control
+  capture procedures ([`../../docs/gui-roadmap.md`](../../docs/gui-roadmap.md))
+  pass the §1 gate.
 - **niri repaint stall** (see the known issue above): until traced, keep
   the window widened after launch.
 - Linux only (wayland/x11 via gpui 0.2.2). No settings persistence, no tray.

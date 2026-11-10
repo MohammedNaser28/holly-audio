@@ -98,9 +98,9 @@ use gpui::{
 use holly_app::DeviceHandle;
 use holly_app::demo::DemoScenario;
 use holly_app::vm::{
-    Banner, DEVICE_NAME, EqVm, NcVm, TxVm, VID_PID, ViewModel, WRITABLE, battery_segment_count,
-    conn_status_word, eq_pad_wire, mic_status, mute_label, nc_level_label, nc_status,
-    reverb_selection, view_model, volume_selection,
+    Banner, DEVICE_NAME, EqVm, GainVm, NcVm, TxVm, VID_PID, ViewModel, WRITABLE,
+    battery_segment_count, conn_status_word, eq_pad_wire, mic_status, mute_label, nc_level_label,
+    nc_status, reverb_selection, view_model, volume_pad_wire,
 };
 
 actions!(
@@ -112,6 +112,8 @@ actions!(
         NcStrong,
         EqPrev,
         EqNext,
+        VolumePrev,
+        VolumeNext,
         Refresh,
         Quit
     ]
@@ -563,6 +565,35 @@ fn eq_pick(index: usize, eq: &EqVm) -> EqPick {
     EqPick::Write
 }
 
+/// Write gate for the Volume panel: the certified family AND nothing in
+/// flight — the same conjunction as [`eq_write_accepted`] (the
+/// `WRITABLE.volume` half is vm.rs's pinned table; the `applying` half
+/// comes from the actor-reported `GainVm`).
+fn volume_write_accepted(volume: &GainVm) -> bool {
+    WRITABLE.volume && !volume.applying
+}
+
+/// Decision for ONE Volume-stop pick — parallel to [`EqPick`]: blocked (the
+/// family is read-only or a gain write is in flight), noop (that stop is
+/// already the device's verified selection), else write. NO pending target
+/// is ever displayed — the selection moves on the device's verdict only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumePick {
+    Blocked,
+    Noop,
+    Write,
+}
+
+fn volume_pick(index: usize, volume: &GainVm) -> VolumePick {
+    if !volume_write_accepted(volume) {
+        return VolumePick::Blocked;
+    }
+    if volume.selected == Some(index) {
+        return VolumePick::Noop;
+    }
+    VolumePick::Write
+}
+
 /// Banner decoration per kind, decided ONLY from `Banner` (the design
 /// colour rule: amber = needs attention, red = error, grey = everything
 /// else; container stays on the designed BANNER_BG/BANNER_LINE). The
@@ -634,6 +665,10 @@ struct AppModel {
     /// rocker) so the "eq_selector" context keys (Left/Right) dispatch only
     /// while that well is focused.
     eq_focus: FocusHandle,
+    /// The Volume selector's keyboard handle — same rule as `eq_focus`,
+    /// its own "volume_selector" key context (Left/Right there step the six
+    /// stops, disjoint from the EQ well's bindings).
+    volume_focus: FocusHandle,
     vm: ViewModel,
     device: DeviceHandle,
     demo: Option<DemoScenario>,
@@ -721,6 +756,40 @@ impl AppModel {
 
     fn on_eq_next(&mut self, _: &EqNext, _: &mut Window, cx: &mut Context<Self>) {
         self.eq_step(1, cx);
+    }
+
+    /// One Volume-stop pick for mouse AND keyboard — [`volume_pick`] is the
+    /// whole decision (read-only family or an in-flight gain write:
+    /// blocked; already-selected: noop; else write). The WIRE byte comes
+    /// from the VM's tested translation (`volume_pad_wire`) — this file
+    /// never names a device stop value.
+    fn set_gain_stop(&mut self, index: usize, _: &mut Context<Self>) {
+        if volume_pick(index, &self.vm.volume) == VolumePick::Write
+            && let Some(wire) = volume_pad_wire(index)
+        {
+            self.device.set_gain(wire);
+        }
+    }
+
+    /// Left/Right stepping over the six stops (same context-scoped rule as
+    /// the EQ well; the two selectors' bindings are disjoint key contexts).
+    /// With no verified selection the step is a noop: the VM's `selected`
+    /// is the only cursor, matching the "no pending target" rule.
+    fn volume_step(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some(selected) = self.vm.volume.selected {
+            let next = selected as isize + step;
+            if (0..=5).contains(&next) {
+                self.set_gain_stop(next as usize, cx);
+            }
+        }
+    }
+
+    fn on_volume_prev(&mut self, _: &VolumePrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.volume_step(-1, cx);
+    }
+
+    fn on_volume_next(&mut self, _: &VolumeNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.volume_step(1, cx);
     }
 
     fn refresh_now(&mut self, _: &mut Context<Self>) {
@@ -943,14 +1012,10 @@ impl AppModel {
                                     .flex_col()
                                     .gap(px(theme::metrics::SPACE_4))
                                     .child(
-                                        self.audio_panel(
-                                            "Volume adjustment",
-                                            &["1", "2", "3", "4", "5", "6"], // [code index.html:260]
-                                            // byte N = stop N+1 (session 3b);
-                                            // pad index = byte (0..=5 only).
-                                            self.vm.voice_level.and_then(volume_selection),
-                                        )
-                                        .flex_1(),
+                                        // Interactive since the gain round trip
+                                        // (2026-11-10): the six-stop selector route
+                                        // moved to volume_panel.
+                                        self.volume_panel(cx).flex_1(),
                                     )
                                     .child(
                                         self.audio_panel(
@@ -1458,16 +1523,126 @@ impl AppModel {
         group
     }
 
-    /// The read-only audio panels (Volume / Channel / Schedule): a title
-    /// and a selector group. Selection comes ONLY from the heart's
-    /// certified byte→pad mapping — Volume lights the device's current stop
-    /// (`volume_selection`, protocol.md:246-249) and Channel mode maps
-    /// mono=0/stereo=1 (each with its `HLDevice6302Activity.java` [code]
-    /// citation at the call site). A byte outside a panel's certified set
-    /// passes None and renders the no-selection rule. EQ no longer routes
-    /// here — it graduated to the INTERACTIVE [`AppModel::eq_panel`] once
-    /// its SET path was wire-certified; Schedule stays read-only.
-    /// The DEVISION-chart dim (busy → 0.6) is intentionally NOT applied:
+    /// Volume panel — the reference's title + six-stop selector row, now
+    /// INTERACTIVE: picks send `set_gain` (wire stops via `volume_pad_wire`)
+    /// through the same actor path as the NC/EQ controls, gated by
+    /// `volume_pick`. While a gain write is in flight (`GainVm.applying`)
+    /// the selector dims to 0.5 and both mouse and keyboard picks are
+    /// ignored — the snapshot's POST-SET poll moves the selection (no
+    /// pending target is ever shown; same rule as the EQ selector). Stop
+    /// order IS byte order ("1".."6" [code index.html:260]; byte N = stop
+    /// N+1, §5.2 Volume row [wire session 3b + the 2026-11-10 round trip]).
+    /// Left/Right step the stops while the well is focused
+    /// ("volume_selector" key context — bindings in main); the DEVISION
+    /// dim (busy → 0.6) intentionally NOT applied (README).
+    fn volume_panel(&self, cx: &Context<Self>) -> gpui::Div {
+        let volume = &self.vm.volume;
+        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
+            .flex_1()
+            .min_w(px(0.))
+            .p(px(theme::metrics::SELECTOR_PADDING))
+            .gap(px(theme::metrics::SELECTOR_GAP))
+            .track_focus(&self.volume_focus)
+            .key_context("volume_selector")
+            // focus-visible outline = the rocker's rule (2px tungsten).
+            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
+            .when(volume.applying, |g| g.opacity(0.5));
+        const VOLUME_STOPS: [&str; 6] = ["1", "2", "3", "4", "5", "6"];
+        for (index, label) in VOLUME_STOPS.iter().enumerate() {
+            let selected = volume.selected == Some(index);
+            let pick = volume_pick(index, volume);
+            let mut option = div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
+                .text_size(px(theme::text::BODY_SIZE))
+                .when(selected, |o| {
+                    o.bg(linear_gradient(
+                        180.,
+                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
+                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
+                    ))
+                    .text_color(solid(theme::color::TEXT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .shadow(matte_under_edge(1.))
+                })
+                .when(!selected, |o| {
+                    o.text_color(solid(theme::color::TEXT_2))
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .child(label.to_string())
+                .relative();
+            if selected {
+                // Same tungsten indicator bar as the NC/EQ selectors.
+                option = option.child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(5.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
+                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
+                                .rounded(px(1.))
+                                .bg(solid(theme::color::TUNGSTEN))
+                                .shadow(vec![BoxShadow {
+                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
+                                        .opacity(0.6),
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(6.),
+                                    spread_radius: px(0.),
+                                }]),
+                        ),
+                );
+            }
+            let option = if pick != VolumePick::Blocked {
+                option
+                    .id(ElementId::named_usize("volume-stop", index))
+                    .hover(|s| s.cursor_pointer())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_gain_stop(index, cx);
+                    }))
+                    .into_any_element()
+            } else {
+                option.into_any_element()
+            };
+            group = group.child(option);
+        }
+        // The reference keeps the Volume panel's own titled shell around the
+        // radiogroup (`index.html:106-108` — the radio group lives INSIDE
+        // the panel with the "Volume adjustment" heading), so unlike the
+        // EQ graduation's bare well the interactivity wraps in the same
+        // shell the read-only panel had.
+        panel()
+            .flex_1()
+            .justify_center()
+            .gap(px(theme::metrics::SPACE_3))
+            .child(
+                div()
+                    .text_size(px(theme::text::TITLE_SIZE))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    // [code index.html:108]
+                    .child("Volume adjustment"),
+            )
+            .child(group)
+    }
+
+    /// The read-only audio panels (Channel mode / Schedule): a title and a
+    /// selector group. Selection comes ONLY from the heart's certified
+    /// byte→pad mapping — Channel mode maps mono=0/stereo=1 (each with its
+    /// `HLDevice6302Activity.java` [code] citation at the call site). A
+    /// byte outside a panel's certified set passes None and renders the
+    /// no-selection rule. EQ and Volume no longer route here — they
+    /// graduated to the INTERACTIVE [`AppModel::eq_panel`]
+    /// /[`AppModel::volume_panel`] once their SET paths were wire-certified
+    /// (2026-11-09 EQ, 2026-11-10 gain); Schedule stays read-only. The
+    /// DEVISION-chart dim (busy → 0.6) is intentionally NOT applied:
     /// unknown is not disabled-looking (documented deviation in README).
     fn audio_panel(
         &self,
@@ -1718,6 +1893,8 @@ impl Render for AppModel {
             .on_action(cx.listener(Self::on_nc_strong))
             .on_action(cx.listener(Self::on_eq_prev))
             .on_action(cx.listener(Self::on_eq_next))
+            .on_action(cx.listener(Self::on_volume_prev))
+            .on_action(cx.listener(Self::on_volume_next))
             .on_action(cx.listener(Self::on_refresh))
             .child(self.render_titlebar())
             .children(self.render_banner(cx))
@@ -1774,13 +1951,21 @@ fn main() {
             // window ROOT (window.rs:3982-3988), which carries the
             // corresponding on_action listeners. Left/Right step the EQ
             // pads ONLY while the EQ well is focused (key context
-            // "eq_selector") — the design defines no EQ arrow keys (no
-            // invented global bindings stealing NC's 1/2/3).
+            // "eq_selector"), and the Volume stops ONLY while the volume
+            // well is focused ("volume_selector") — the design defines no
+            // inter-selector arrow keys (no invented global bindings
+            // stealing NC's 1/2/3).
             cx.bind_keys([
                 KeyBinding::new("space", ToggleNoise, Some("nc_rocker")),
                 KeyBinding::new("enter", ToggleNoise, Some("nc_rocker")),
                 KeyBinding::new("left", EqPrev, Some("eq_selector")),
                 KeyBinding::new("right", EqNext, Some("eq_selector")),
+                // Left/Right step the Volume stops ONLY while the volume
+                // well is focused ("volume_selector" context) — disjoint
+                // from the EQ well's identical keys, no invented global
+                // bindings.
+                KeyBinding::new("left", VolumePrev, Some("volume_selector")),
+                KeyBinding::new("right", VolumeNext, Some("volume_selector")),
                 KeyBinding::new("1", NcLow, None),
                 KeyBinding::new("2", NcMedium, None),
                 KeyBinding::new("3", NcStrong, None),
@@ -1851,9 +2036,11 @@ fn main() {
                             let focus = cx.focus_handle();
                             focus.focus(window);
                             let eq_focus = cx.focus_handle();
+                            let volume_focus = cx.focus_handle();
                             AppModel {
                                 focus,
                                 eq_focus,
+                                volume_focus,
                                 vm: ViewModel::default(),
                                 device,
                                 demo,
@@ -1911,7 +2098,7 @@ mod tests {
         level_pick, nc_led, nc_write_accepted, vm_led,
     };
     use holly_app::NoiseWrite;
-    use holly_app::vm::{Banner, EqVm, NcVm, TxVm, ViewModel, battery_class};
+    use holly_app::vm::{Banner, EqVm, GainVm, NcVm, TxVm, ViewModel, battery_class};
 
     /// A rocker/VM shape straight from the VM fields.
     fn nc(level: Option<u8>, state: Option<bool>, pending: Option<NoiseWrite>) -> NcVm {
@@ -1947,7 +2134,10 @@ mod tests {
             tx4: None,
             nc: nc(None, None, None),
             light: None,
-            voice_level: None,
+            volume: GainVm {
+                selected: None,
+                applying: false,
+            },
             eq: eq(None, false),
             mic_recognition: None,
             channel_mode: None,
