@@ -139,6 +139,11 @@ pub trait StatusSource {
     /// in force before the write — the restore-flow datum; the actor's
     /// verdict comes from its own post-SET poll, see execute_set).
     fn set_eq(&mut self, pad: u8) -> Result<u8, Error>;
+    /// One SET_VOICE_LEVEL round trip — `stop` in the WIRE value space
+    /// 0..=5 (§5.2 Volume row; write space == read space, identity); set_gain
+    /// returns the fresh GET's PRE-write stop (restore-flow datum) exactly
+    /// like set_eq; the actor's verdict comes from its own post-SET poll.
+    fn set_gain(&mut self, stop: u8) -> Result<u8, Error>;
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {
@@ -156,6 +161,10 @@ impl<T: Transport> StatusSource for HollyControl<T> {
 
     fn set_eq(&mut self, pad: u8) -> Result<u8, Error> {
         HollyControl::set_eq(self, pad)
+    }
+
+    fn set_gain(&mut self, stop: u8) -> Result<u8, Error> {
+        HollyControl::set_gain(self, stop)
     }
 }
 

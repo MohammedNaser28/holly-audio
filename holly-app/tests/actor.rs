@@ -52,6 +52,16 @@ const SET_EQ_ACK: [u8; REPORT] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+/// Real SET_GAIN ack (holly-usb tests/mock.rs `SET_GAIN_ACK_WIRE` — export
+/// frames 25/37 of the 2026-11-10 gain capture): cmd echo 03 + status 00 +
+/// the cmd-03 residue 0x65 (reply checksum rule XOR(7+len prefix) ⊕ 0x07;
+/// the EQ family's 0x61 belongs to cmd 07). The crate ignores the residue.
+const SET_GAIN_ACK: [u8; REPORT] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x03, 0x00, 0x01, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
 
 /// Never-captured shape: nonzero ack status byte. Per
 /// `ProSetNoise.receiveData` [code], only `data[0] == 0` is success — the
@@ -591,7 +601,13 @@ fn view_model_connected_shape() {
         Some(NoiseWrite::Switch(false)),
         "actor-reported pending passes through"
     );
-    assert_eq!(vm.voice_level, Some(3));
+    assert_eq!(
+        vm.volume,
+        vm::GainVm {
+            selected: Some(3), // wire byte 3 = the phone's stop "4"
+            applying: false    // an NC pending must not dim the volume panel
+        }
+    );
     assert_eq!(
         vm.eq,
         vm::EqVm {
@@ -722,11 +738,62 @@ fn set_eq_roundtrip_through_the_actor() {
     );
 }
 
+/// The gain write path through the actor: ONE SetGain round trip on
+/// holly-usb's `set_gain` (fresh GET inside, cmd-03 ack — the 2026-11-10
+/// wire shape `… 03 00 01 00 65`), then the actor's post-SET poll carries
+/// the DEVICE's verdict — the wire stop, byte for byte (payload[8] =
+/// `voiceLevel`, buffer index 15 [wire E1]). The pending appears exactly
+/// once as `Gain(stop)`.
+#[test]
+fn set_gain_roundtrip_through_the_actor() {
+    let session = MockShared::default();
+    session.push_reply(HEART_E1); // connect poll (voiceLevel 3)
+    session.push_reply(HEART_E1); // fresh GET inside set_gain
+    session.push_reply(SET_GAIN_ACK); // cmd-03 ack (status 00, residue 65)
+    let mut verdict = HEART_E1;
+    verdict[15] = 0x02; // payload[8] = voiceLevel 03 -> 02 (wire stop 2)
+    session.push_reply(verdict); // actor's verification poll
+
+    let (mut core, mut rx) = core_of(VecDeque::from([Ok(session.clone())]));
+    core.tick();
+    assert_eq!(core.snapshot().status, ConnStatus::Connected);
+
+    core.pump([Command::SetGain(2)]);
+
+    let final_snap = core.snapshot();
+    assert_eq!(final_snap.status, ConnStatus::Connected);
+    let heart = final_snap.heart.expect("connected");
+    assert_eq!(heart.voice_level, 2, "device verdict: the written stop");
+    assert_eq!(heart.voice_mode, 0, "voiceMode never moves");
+    assert_eq!(final_snap.pending_set, None, "verdict clears pending");
+
+    let written = session.written();
+    assert_eq!(written.len(), 4);
+    assert_eq!(written[2][4], 0x03, "SET_GAIN");
+    assert_eq!(written[2][6], 0x01, "payload len 1");
+    assert_eq!(written[2][7], 0x02, "wire stop = request");
+    assert_eq!(written[3][4], 0x1F, "verification GET");
+
+    let stream = drain(&mut rx);
+    let pendings: Vec<Option<PendingWrite>> = stream.iter().map(|s| s.pending_set).collect();
+    assert_eq!(
+        pendings.iter().filter(|p| p.is_some()).count(),
+        1,
+        "gain pending appears exactly once"
+    );
+    assert_eq!(
+        pendings.iter().find(|p| p.is_some()).copied().flatten(),
+        Some(PendingWrite::Gain(2)),
+        "the single pending is the gain write on the wire"
+    );
+}
+
 /// Coalescing is ONE bucket across control families: a batch's LAST SET
 /// command wins and the earlier ones vanish — cross-family (an NC switch
-/// replaced by an EQ pad) and within EQ itself (pad 2 replaced by pad 2's
-/// … the winning pad is the newest request). The final SET is byte-checked
-/// on the wire, and each batch's pending shows ONLY its winner.
+/// replaced by an EQ pad; an EQ pad replaced by a gain stop) and within EQ
+/// itself (pad 2 replaced by pad 3 — the winning pad is the newest
+/// request). The final SET is byte-checked on the wire, and each batch's
+/// pending shows ONLY its winner.
 #[test]
 fn set_commands_coalesce_across_families_to_one_set() {
     let session = MockShared::default();
@@ -752,24 +819,40 @@ fn set_commands_coalesce_across_families_to_one_set() {
 
     core.pump([Command::SetEq(2), Command::SetEq(3)]);
 
+    // Batch 3 script: [SetGain(1)] — a THIRD family joins the one bucket:
+    // a newer gain write replaces an EQ intent across batches the same way
+    // the EQ replaced the NC write in batch 1.
+    session.push_reply(HEART_E1); // fresh GET for the gain SET
+    session.push_reply(SET_GAIN_ACK); // its ack
+    let mut verdict3 = HEART_E1;
+    verdict3[15] = 0x01; // device settles on the winning stop 1
+    session.push_reply(verdict3); // verification poll
+
+    core.pump([Command::SetGain(1)]);
+
     let final_snap = core.snapshot();
     assert_eq!(final_snap.status, ConnStatus::Connected);
-    assert_eq!(final_snap.heart.expect("connected").eq_level, 3);
+    let heart = final_snap.heart.expect("connected");
+    assert_eq!(heart.voice_level, 1, "batch 3 verdict: the gain stop");
+    assert_eq!(heart.eq_level, 3, "EQ stayed at its own verified pad");
     assert_eq!(final_snap.pending_set, None);
 
     // Transcript: connect GET + batch-1 SET round trip + batch-2 SET round
-    // trip, NOTHING else — no SET_NOISE frame from the replaced command,
-    // no second SET for the replaced pad.
+    // trip + batch-3 SET round trip, NOTHING else — no SET_NOISE frame from
+    // the replaced command, no second SET for a replaced pad.
     let written = session.written();
-    assert_eq!(written.len(), 7);
+    assert_eq!(written.len(), 10);
     assert_eq!(written[2][4], 0x07, "batch 1: the ONLY SET is SET_EQ");
     assert_eq!(written[2][7], 0x03, "batch 1: request");
     assert_eq!(written[5][4], 0x07, "batch 2: the ONLY SET is SET_EQ");
     assert_eq!(written[5][7], 0x03, "batch 2: the NEWEST pad wins");
+    assert_eq!(written[8][4], 0x03, "batch 3: the ONLY SET is SET_GAIN");
+    assert_eq!(written[8][7], 0x01, "batch 3: the gain stop");
     for (i, frame) in written.iter().enumerate() {
-        if i != 2 && i != 5 {
-            assert_ne!(frame[4], 0x07, "no extra SET frame at {i}");
+        if i != 2 && i != 5 && i != 8 {
+            assert_ne!(frame[4], 0x07, "no extra SET_EQ frame at {i}");
             assert_ne!(frame[4], 0x13, "no SET_NOISE frame at {i}");
+            assert_ne!(frame[4], 0x03, "no extra SET_GAIN frame at {i}");
         }
     }
 
@@ -780,9 +863,10 @@ fn set_commands_coalesce_across_families_to_one_set() {
     assert_eq!(
         some,
         vec![
-            PendingWrite::Eq(3), // batch 1 winner
-            PendingWrite::Eq(3), // batch 2 winner
+            PendingWrite::Eq(3),   // batch 1 winner
+            PendingWrite::Eq(3),   // batch 2 winner
+            PendingWrite::Gain(1), // batch 3 winner
         ],
-        "exactly the two winning writes ever pended"
+        "exactly the three winning writes ever pended"
     );
 }

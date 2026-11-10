@@ -134,6 +134,20 @@ impl StatusSource for DemoDevice {
         heart.eq_level = pad;
         Ok(previous)
     }
+
+    fn set_gain(&mut self, stop: u8) -> Result<u8, Error> {
+        // Same shape as holly-usb's set_gain: the RETURN is the stop the
+        // heart held BEFORE the write (guarded flows restore from it); the
+        // write mutates only the voiceLevel byte (§5 offset 8 — voiceMode
+        // offset 9 is a separate heart field), everything else stays
+        // scripted. Pending scenario: stall BEFORE mutation and outside
+        // the lock, so `poll()` is never blocked behind a sleeping setter.
+        let mut heart = self.heart.lock().unwrap();
+        let previous = heart.voice_level;
+        std::thread::sleep(self.stall);
+        heart.voice_level = stop;
+        Ok(previous)
+    }
 }
 
 /// The OS busy condition, byte-for-byte the real claim failure shape

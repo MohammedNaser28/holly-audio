@@ -61,6 +61,11 @@ pub const VID_PID: &str = "3547:0407";
 ///   hearts settled on the written pad
 ///   (captures/raw/set_eq_roundtrip.pcap + captures/set_eq_roundtrip.jsonl;
 ///   roadmap §1 route (b), checklist §3 EQ row)
+/// - `volume` — SET_VOICE_LEVEL (cmd 3) [wire] PC-originated guarded
+///   round trip 2026-11-10: frames `05 03 AA DD 03 00 01 {01,02} EF` →
+///   ack `00` → hearts settled on the written stop
+///   (captures/raw/set_gain_roundtrip.pcap + captures/
+///   set_gain_roundtrip.jsonl; roadmap §1 route (b), checklist §3 Gain row)
 /// - everything else is [code] at best (mic mute cmd 22, light cmd 33,
 ///   reverb 5, shutdown 39/40 …) and has never been captured, so it stays
 ///   read-only today.
@@ -83,7 +88,7 @@ pub const WRITABLE: Writable = Writable {
     nc_toggle: true,
     nc_level: true,
     mic_mute: false,
-    volume: false,
+    volume: true,
     channel_mode: false,
     eq: true,
     reverb: false,
@@ -148,6 +153,17 @@ pub fn nc_level_label(level: u8) -> &'static str {
 /// has no certified pad and maps to None (no selection, never a guess).
 pub fn volume_selection(voice_level: u8) -> Option<usize> {
     (voice_level <= 5).then_some(voice_level as usize)
+}
+
+/// The inverse translation a UI click needs: a Volume pad index
+/// ([`GainVm::selected`]'s space) -> the WIRE byte `set_gain` writes.
+/// Identity on 0..=5: the §3 Gain row's write space IS the §5.2 read
+/// space — no stop inversion exists to undo (write space == read space
+/// [wire round trip 2026-11-10, checklist §3 Gain row]). Pure function
+/// like [`eq_pad_wire`] so frontends never hardcode device values;
+/// unmapped (out of 0..=5) returns None.
+pub fn volume_pad_wire(index: usize) -> Option<u8> {
+    (index <= 5).then_some(index as u8)
 }
 
 /// The Channel-mode panel's selected pad. Identity on the wire byte:
@@ -291,6 +307,20 @@ pub struct EqVm {
     pub applying: bool,
 }
 
+/// Gain (Volume adjustment) state: the DEVICE's current stop in pad
+/// order, plus whether a gain write is in flight. `selected` is None for
+/// any non-certified byte outside 0..=5 (see [`volume_selection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GainVm {
+    /// Pad index of the active stop (0..=5 = the phone's "1".."6" —
+    /// [wire session 3b, byte N = stop N+1  identity on the wire byte
+    /// for every value the round trip exercised, 01/02/03]).
+    pub selected: Option<usize>,
+    /// A gain SET (only ever [`PendingWrite::Gain`]) is in flight — the
+    /// selector dims and ignores picks until the device's verdict.
+    pub applying: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ReverbVm {
     pub enabled: bool,
@@ -315,8 +345,11 @@ pub struct ViewModel {
     /// inverted — 0 means on `[code ProGetHearInfo.java:75-76]`, captured
     /// value [wire]). Read-only until SET_LIGHT (cmd 33) passes the §1 gate.
     pub light: Option<bool>,
-    /// Gain (§5 field `voiceLevel`).
-    pub voice_level: Option<u8>,
+    /// Gain (§5 field `voiceLevel`) as the selector's VM state
+    /// ([`GainVm`]): display-order selection from the device's byte
+    /// (§5 offset 8; write space == read space, 0..=5 — checklist §3
+    /// Gain row), plus the in-flight flag for its own panel only.
+    pub volume: GainVm,
     /// EQ pads ([`EqVm`]): display-order selection from the device's
     /// `eqLevel` byte (§5 field, offset 12; pad space is 1/2/3 [code
     /// DeviceConnectVariable.EQ]), plus the in-flight flag for its own
@@ -363,7 +396,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 last_error: None,
             },
             light: None,
-            voice_level: None,
+            volume: GainVm {
+                selected: None,
+                applying: false,
+            },
             eq: EqVm {
                 selected: None,
                 applying: false,
@@ -435,12 +471,15 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                     // never greys the NC controls (and vice versa).
                     pending: match s.pending_set {
                         Some(PendingWrite::Noise(w)) => Some(w),
-                        Some(PendingWrite::Eq(_)) | None => None,
+                        Some(PendingWrite::Eq(_)) | Some(PendingWrite::Gain(_)) | None => None,
                     },
                     last_error: None,
                 },
                 light: Some(heart.light_on),
-                voice_level: Some(heart.voice_level),
+                volume: GainVm {
+                    selected: volume_selection(heart.voice_level),
+                    applying: matches!(s.pending_set, Some(PendingWrite::Gain(_))),
+                },
                 eq: EqVm {
                     selected: eq_selection(heart.eq_level),
                     applying: matches!(s.pending_set, Some(PendingWrite::Eq(_))),
@@ -474,7 +513,10 @@ fn disconnected_core() -> ViewModel {
             last_error: None,
         },
         light: None,
-        voice_level: None,
+        volume: GainVm {
+            selected: None,
+            applying: false,
+        },
         eq: EqVm {
             selected: None,
             applying: false,
@@ -696,7 +738,13 @@ mod tests {
         assert!(!tx2.muted);
         assert_eq!(vm.tx3, None, "tail TXs absent in the 17-byte shape");
         assert_eq!(vm.tx4, None);
-        assert_eq!(vm.voice_level, Some(3));
+        assert_eq!(
+            vm.volume,
+            GainVm {
+                selected: Some(3), // wire byte 3 = the phone's stop "4"
+                applying: false
+            }
+        );
         assert_eq!(
             vm.eq,
             EqVm {
@@ -852,6 +900,51 @@ mod tests {
         assert_eq!(eq_pad_wire(usize::MAX), None);
     }
 
+    /// The click path's inverse for Volume: display pads 0..=5 map to the
+    /// wire bytes 0..=5 — IDENTITY, because the §3 Gain row's write space
+    /// is the §5.2 read space (no stop inversion; [wire round trip
+    /// 2026-11-10, stop 1/2 on the wire byte-exact]). Unmapped indices
+    /// stay unmapped, and a gain write in flight dims ONLY the volume
+    /// panel (`applying` per family, selection still the device's).
+    #[test]
+    fn volume_pad_wire_roundtrips_volume_selection() {
+        for wire in 0..=5u8 {
+            assert_eq!(
+                volume_pad_wire(wire as usize),
+                Some(wire),
+                "pad {wire} is its own wire byte"
+            );
+            assert_eq!(volume_selection(wire), Some(wire as usize), "wire {wire}");
+            // The VM's connected shape carries the stop as `selected`; a UI
+            // sending `volume_pad_wire(selected)` lands on the same byte.
+            let mut heart = e1();
+            heart.voice_level = wire;
+            let vm = view_model(&snap(ConnStatus::Connected, Some(heart), None, None));
+            assert_eq!(vm.volume.selected, Some(wire as usize), "heart wire {wire}");
+            assert_eq!(
+                volume_pad_wire(vm.volume.selected.expect("mapped above")),
+                Some(wire)
+            );
+        }
+        assert_eq!(volume_pad_wire(6), None, "out of the six-pad space");
+        assert_eq!(volume_pad_wire(usize::MAX), None);
+
+        let gain = view_model(&snap(
+            ConnStatus::Connected,
+            Some(e1()),
+            Some(PendingWrite::Gain(2)),
+            None,
+        ));
+        assert!(gain.volume.applying, "a gain write dims the volume panel");
+        assert_eq!(
+            gain.volume.selected,
+            Some(3),
+            "selection stays the device's"
+        );
+        assert_eq!(gain.nc.pending, None, "NC panel never sees a gain write");
+        assert!(!gain.eq.applying, "EQ panel never sees a gain write");
+    }
+
     /// Panels gate on their OWN pending only: an in-flight EQ write
     /// (`PendingWrite::Eq`) shows `applying` on the EQ panel while the NC
     /// panel stays untouched (pending None), and the reverse.
@@ -918,9 +1011,10 @@ mod tests {
 
     /// The writability table is a fixed contract: exactly the
     /// wire-certified SET paths are true, everything else read-only until
-    /// its capture lands (docs/gui-roadmap.md §1 gate). EQ joined via the
-    /// PC-originated guarded round trip ([wire] PC-originated round trip;
-    /// captures/set_eq_roundtrip.jsonl).
+    /// its capture lands (docs/gui-roadmap.md §1 gate). EQ joined via its
+    /// PC-originated guarded round trip ([wire] 2026-11-09;
+    /// captures/set_eq_roundtrip.jsonl); Volume joined the same route
+    /// (b) on 2026-11-10 (captures/set_gain_roundtrip.jsonl).
     #[test]
     fn writable_table_matches_the_certified_chain() {
         let all_read_only = Writable {
@@ -941,6 +1035,7 @@ mod tests {
                 nc_toggle: true,
                 nc_level: true,
                 eq: true,
+                volume: true,
                 ..all_read_only
             }
         );

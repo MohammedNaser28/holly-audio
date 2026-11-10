@@ -65,6 +65,10 @@ pub enum PendingWrite {
     /// (`0x02` = Bright on the wire — the display-order mapping lives in
     /// `vm::eq_selection`/`vm::eq_pad_wire`, never here).
     Eq(u8),
+    /// A gain (Volume adjustment) write is in flight: the byte is the WIRE
+    /// stop being written (0..=5 = the display stops "1".."6"; the identity
+    /// lives in `vm::volume_selection`/`vm::volume_pad_wire`, never here).
+    Gain(u8),
 }
 
 /// Commands the UI/frontend may send.
@@ -85,6 +89,12 @@ pub enum Command {
     /// latest-wins rule — the UI never queues a second write in flight, so
     /// the replacement only spans one batch window).
     SetEq(u8),
+    /// Request a Volume-stop write, `stop` in the WIRE value space 0..=5
+    /// (the display stops "1".."6" — checklist §3 Gain row: write space ==
+    /// read space, identity). The DISPLAY-order translation lives in the
+    /// VM (`volume_pad_wire`), never in a frontend. Coalesces to the
+    /// latest like every other SET (one SET per batch, newest intent).
+    SetGain(u8),
     /// Force one fresh poll/reconnect attempt now.
     Refresh,
 }
@@ -162,6 +172,14 @@ impl DeviceHandle {
     /// the snapshot stream reports "pending" then the device verdict.
     pub fn set_eq(&self, pad: u8) {
         let _ = self.tx.send(Command::SetEq(pad));
+    }
+
+    /// Request a Volume-stop write (WIRE stop 0..=5; display-order
+    /// translation is the VM's `volume_pad_wire`). Fire-and-forget like
+    /// every other send: the snapshot stream reports "pending" then the
+    /// device verdict.
+    pub fn set_gain(&self, stop: u8) {
+        let _ = self.tx.send(Command::SetGain(stop));
     }
 
     pub fn refresh(&self) {
@@ -260,8 +278,9 @@ impl Core {
     }
 
     /// Process ONE batch of queued commands with coalescing (latest-wins:
-    /// within the batch, any SET command — NC switch, NC level, or EQ pad —
-    /// replaces its predecessor; only the newest SET goes out).
+    /// within the batch, any SET command — NC switch, NC level, EQ pad, or
+    /// Volume stop — replaces its predecessor; only the newest SET goes
+    /// out).
     pub fn pump<I: IntoIterator<Item = Command>>(&mut self, cmds: I) {
         let mut refresh = false;
         let mut write: Option<PendingWrite> = None;
@@ -273,6 +292,7 @@ impl Core {
                     write = Some(PendingWrite::Noise(NoiseWrite::Level(l)))
                 }
                 Command::SetEq(pad) => write = Some(PendingWrite::Eq(pad)),
+                Command::SetGain(stop) => write = Some(PendingWrite::Gain(stop)),
             }
         }
         if self.device.is_none() {
@@ -373,11 +393,11 @@ impl Core {
     }
 
     /// One SET round trip — the single in-flight SET — then a fresh poll
-    /// so subscribers always see the DEVICE's verdict. For EQ, holly-usb's
-    /// `set_eq` additionally returns the fresh GET's pre-write pad; nothing
-    /// here consumes it for STATE (the post-SET poll is the verdict the
-    /// snapshot carries — never optimistic); the value exists for the
-    /// guarded restore flows (holly-usb tests).
+    /// so subscribers always see the DEVICE's verdict. For EQ/gain,
+    /// holly-usb's `set_eq`/`set_gain` additionally return the fresh GET's
+    /// pre-write value; nothing here consumes it for STATE (the post-SET
+    /// poll is the verdict the snapshot carries — never optimistic); the
+    /// value exists for the guarded restore flows (holly-usb tests).
     fn execute_set(&mut self, write: PendingWrite) {
         let Some(source) = self.device.as_mut() else {
             return;
@@ -386,6 +406,7 @@ impl Core {
             PendingWrite::Noise(NoiseWrite::Switch(on)) => source.set_noise(on),
             PendingWrite::Noise(NoiseWrite::Level(level)) => source.set_noise_level(level),
             PendingWrite::Eq(pad) => source.set_eq(pad).map(|_previous| ()),
+            PendingWrite::Gain(stop) => source.set_gain(stop).map(|_previous| ()),
         };
         match result {
             Ok(()) => {
