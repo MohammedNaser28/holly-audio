@@ -846,3 +846,123 @@ fn set_gain_rejects_abnormal_acks() {
     let err = c.set_gain(2).expect_err("2-byte ack must fail");
     assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
 }
+
+// ── Gain route (b): REAL wire frames join as replay vectors ─────────────────
+// Full 64-byte buffers from the owner-executed hardware run of
+// set_gain_roundtrip_guarded, captured 2026-11-10 (captures/raw/
+// set_gain_roundtrip.pcap → captures/set_gain_roundtrip.jsonl, bus 6 dev 5).
+// Frame numbers from the export:
+//   #17/#21/#41/#45  heart, voice 2, battery 0x2B, tail 42 (#41 = the
+//                    settle heart, #45 = the guard's exit poll; #54/#57 is
+//                    the owner's post-run `holly status` 13.5 s later —
+//                    voice 2 again, state restored)
+//   #22              SET_GAIN `05 03 AA DD 03 00 01 01 EF`
+//   #25/#37          ack `05 03 BB DD 03 00 01 00 65` (status 00)
+//   #29/#33          heart, voice 1, tail 41
+//   #34              SET_GAIN restore `05 03 AA DD 03 00 01 02 EF`
+// The run's live start state was wire stop 2 (NOT the certified rest
+// 3/"4" — the phone had drifted): the guard computed the neighbour below
+// from the fresh GET, so the write leg landed on value 01 and the restore
+// on 02. Heart tail bytes follow XOR(payload[0..17]) ⊕ 0x68 (0x42 at voice
+// 2, 0x41 at voice 1, both verified); the ack tail 0x65 is the 4th command
+// shape matching XOR(whole 7+len prefix) ⊕ 0x07 — it was doc-recomputed
+// pre-run and byte-matched on the wire (SET_GAIN_ACK == SET_GAIN_ACK_WIRE),
+// refuting the "per-session constant" reading of protocol.md open
+// question 2 for this shape.
+
+/// Real SET_GAIN stop-1 frame of the run (export frame 22) — the
+/// neighbouring stop below the live start 2. Same layout as
+/// [`SET_GAIN_2_TX`] with the value byte moved.
+const SET_GAIN_1_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x03, 0x00, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_GAIN stop-2 RESTORE frame (export frame 34) — byte-identical to
+/// the doc-recomputed [`SET_GAIN_2_TX`] (cross-checked in the replay test).
+const SET_GAIN_2_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x03, 0x00, 0x01, 0x02, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at voice 2 (export frames 17/21/41/45): TX1
+/// connected battery 0x2B, NC on level 2, voice 2/0, EQ pad 1, light on
+/// (0x00 inverted), reverb off, tail 0x42.
+const HEART_WIRE_VOICE2: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x00, 0x2B, 0x00, 0x00, 0x00, 0x01, 0x02, 0x02,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at voice 1 (export frames 29/33): the voice byte
+/// moved 2 → 1 and the tail byte 42 → 41, everything else untouched.
+const HEART_WIRE_VOICE1: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x00, 0x2B, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_GAIN ack (export frames 25/37): 1-byte status 00 + tail 0x65 —
+/// equal to the doc-recomputed [`SET_GAIN_ACK`], which closes the residue
+/// question for this command shape (see the section comment).
+const SET_GAIN_ACK_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x03, 0x00, 0x01, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Full real-session replay (gain's route (b) closure): the export's control
+/// frames replayed through the op end-to-end. TX side asserts byte-exact
+/// equality with the captured SET frames; the lineage pin asserts the
+/// doc-recomputed vector EQUALS the observed wire frame; the restore leg
+/// targets the value set_gain itself returned from its fresh GET.
+#[test]
+fn set_gain_roundtrip_replays_the_real_session() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_WIRE_VOICE2); // op's inner GET (= frames 18/21)
+    mock.push_reply(SET_GAIN_ACK_WIRE); // ack of frame 22's SET [01]
+    mock.push_reply(HEART_WIRE_VOICE1); // test's settle GET (frames 26/29)
+    mock.push_reply(HEART_WIRE_VOICE1); // op's inner GET of the restore
+    mock.push_reply(SET_GAIN_ACK_WIRE); // ack of frame 34's SET [02]
+    mock.push_reply(HEART_WIRE_VOICE2); // test's post-restore GET (frames 38/41)
+
+    let mut c = control(mock);
+    let previous = c
+        .set_gain(1)
+        .expect("real ack [00]+65 must be accepted (residue ignored)");
+    assert_eq!(previous, 2, "frames 18/21 rest at voice 2");
+    let after = c.get_heart_info().expect("real heart (residue 41) parses");
+    assert_eq!(after.voice_level, 1, "heart delta = written stop");
+    assert_eq!(
+        after.voice_mode, 0,
+        "voiceMode (§5 offset 9) must never move"
+    );
+    assert_eq!(after.tx1_battery, 0x2B, "run's battery byte");
+    assert!(!after.tx2_status, "TX2 disconnected in the run");
+    let restore_previous = c.set_gain(previous).expect("real restore must be accepted");
+    assert_eq!(restore_previous, 1, "restore's fresh GET saw voice 1");
+    let restored = c.get_heart_info().expect("heart back at voice 2");
+    assert_eq!(restored.voice_level, 2, "restore delta verified");
+
+    let written = c.transport().written();
+    assert_eq!(&written[1], &SET_GAIN_1_WIRE, "SET TX byte-exact frame 22");
+    assert_eq!(
+        &written[4], &SET_GAIN_2_WIRE,
+        "restore TX byte-exact frame 34"
+    );
+    // Lineage pin (roadmap §1(b)): the doc-recomputed vectors and the
+    // hardware-observed frames are the SAME bytes — including the ack tail
+    // 0x65 the checksum rule predicted before the run.
+    assert_eq!(
+        SET_GAIN_2_TX, SET_GAIN_2_WIRE,
+        "doc vector == observed wire"
+    );
+    assert_eq!(SET_GAIN_ACK, SET_GAIN_ACK_WIRE, "ack lineage pin");
+}
