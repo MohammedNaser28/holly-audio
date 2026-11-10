@@ -9,6 +9,8 @@
 //!   - `set_eq(u8)` — cmd 7, returns the pad from ITS fresh GET (the value in
 //!     force before the write); frames verified [wire] by the guarded
 //!     PC-side round trip 2026-11-09 (captures/set_eq_roundtrip.jsonl).
+//!   - `set_gain(u8)` — cmd 3, same set_* shape as set_eq (fresh GET inside,
+//!     returns the pre-write stop); [code] until the guarded round trip runs.
 
 use nusb::MaybeFuture;
 
@@ -164,6 +166,65 @@ impl<T: Transport> HollyControl<T> {
         let (reply, raw) = self.exchange(request)?;
         match reply.payload.as_slice() {
             [0x00] => Ok(state.eq_level),
+            [status] => Err(Error::Rejected {
+                status: *status,
+                raw,
+            }),
+            other => Err(Error::BadAck {
+                len: other.len(),
+                raw,
+            }),
+        }
+    }
+
+    /// Write the receiver gain — the "Volume adjustment" control — cmd 3
+    /// SET_VOICE_LEVEL, single-byte payload `[{value}]` [code
+    /// docs/set-gate-checklist.md §3 Gain row: payload `[{value}]`, identity
+    /// write semantics from the APK's own seekbar caller (`setVoice` →
+    /// `ProSetVoiceLevel`, `HLDevice6302Activity.java:840-846`,
+    /// docs/protocol.md §5.1); cmd number re-derived from
+    /// `ProSetVoiceLevel.getCmd()`]. The write space EQUALS the read space
+    /// (no inversion): heart `voiceLevel` (§5 offset 8) is the same
+    /// 0..=5 index the APK's 6-stop bar maps to display stops "1".."6"
+    /// (stop N+1 — §5.2 Volume row; §5.1). Session 3b read voiceLevel 03
+    /// [wire] while the phone showed stop "4" — the UI-stop ↔ wire-byte
+    /// equation's read side; the WRITE side (this frame) stays [code]
+    /// until the guarded round trip captures it on the wire (that run is
+    /// exactly what settles the §3 row).
+    ///
+    /// Returns the voice stop THIS call's fresh `get_heart_info()` reported —
+    /// the value in force on the device immediately **before** the write.
+    /// The fresh GET is the crate's uniform SET discipline (one fresh GET
+    /// inside every SET call; no observable device state is ever cached),
+    /// it gates the SET on a live, answering device, and its stop goes back
+    /// to the caller instead of being dropped: a guarded round trip's
+    /// restore leg targets THAT value, not a possibly older pre-run poll —
+    /// if another client moved gain between the caller's own GET and this
+    /// SET, the returned stop is the freshest memory the device has. (The
+    /// SET frame itself still carries only `[{value}]` — this payload has
+    /// no preserved byte, §3 Gain row. `voiceMode` is a separate heart
+    /// field (§5 offset 9) and is never written.)
+    ///
+    /// Ack gating is identical to [`HollyControl::set_eq`] (checklist §3:
+    /// the `data[0] == 0` status rule is uniform across all `ProSet*`
+    /// classes; `ProSetVoiceLevel.receiveData` [code]): `[00]` = success;
+    /// anything else surfaces as [`Error::Rejected`]/[`Error::BadAck`] — no
+    /// retry. Reply-tail bytes stay uninterpreted: heart replies carry
+    /// XOR(payload[0..17]) ⊕ 0x68 [wire ×10], ACK tails are per-session
+    /// constants (docs/protocol.md §2 — decode discards everything past
+    /// `7+len`, so no decode behaviour changes here either way). Values
+    /// outside the certified 0..=5 stop space are the caller's
+    /// responsibility, not assumed here — mirror of
+    /// [`HollyControl::set_eq`]'s stance on unobserved bytes.
+    pub fn set_gain(&mut self, stop: u8) -> Result<u8, Error> {
+        // Fresh GET inside every SET (crate rule). The gain payload has no
+        // preserved byte (§3 Gain row); the snapshot's stop is returned to
+        // the caller as the pre-write state.
+        let state = self.get_heart_info()?;
+        let request = Frame::new(cmd::SET_VOICE_LEVEL, vec![stop]);
+        let (reply, raw) = self.exchange(request)?;
+        match reply.payload.as_slice() {
+            [0x00] => Ok(state.voice_level),
             [status] => Err(Error::Rejected {
                 status: *status,
                 raw,

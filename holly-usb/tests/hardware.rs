@@ -10,6 +10,9 @@
 //! restore-on-every-exit-path guarantee; its rules (ACK-failure probe +
 //! single restore, fixed settle poll, neighbouring-value target, owner-
 //! gated usbmon capture) are spelled out in docs/gui-roadmap.md §1(b).
+//! `set_gain_roundtrip_guarded` (2026-11-10) applies the SAME rules to the
+//! gain control — cmd 3 SET_VOICE_LEVEL, "Volume adjustment" — with the
+//! target bound to the neighbouring stop BELOW the current one (quieter).
 
 use holly_usb::{HollyControl, NusbTransport};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -504,6 +507,246 @@ fn set_eq_roundtrip_guarded() {
     );
     match settle_eq_level(guard.ctl(), start) {
         Ok(()) => eprintln!("restore confirmed: eqLevel={start}"),
+        Err(last) => panic!(
+            "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
+        ),
+    }
+}
+
+// ── Phase 1B route (b): gain / Volume adjustment (cmd 3) ─────────────────────
+
+/// Bounded read-only settle poll for `voiceLevel` — same shape as
+/// [`settle_eq_level`] (route (b) owner rule): a FIXED number of fresh GETs
+/// spanning about 2 s run before any heart mismatch is declared — a slow
+/// heart is not a dropped write. GET-only; the SET behind this poll is never
+/// retried. A poll CONFIRMS only when the voice byte matches AND `voiceMode`
+/// is still `mode`: the SET payload is a single byte, so a mode movement
+/// would be a protocol violation, reported as a settle failure (§5 offset 9
+/// is a separate heart field; we never write it).
+/// `Ok(())` = a fresh GET reported `voiceLevel == want` with `voiceMode`
+/// unchanged; `Err(Some(last))` = the fixed budget ran out (`last` = the
+/// final voice stop seen); `Err(None)` = no parseable heart within the
+/// budget.
+fn settle_voice_level(
+    ctl: &mut HollyControl<NusbTransport>,
+    want: u8,
+    mode: u8,
+) -> Result<(), Option<u8>> {
+    /// Fixed settle budget: 4 fresh GETs ≈ 2 s — deterministic, not
+    /// adaptive; nothing beyond this count.
+    const POLLS: u32 = 4;
+    let mut last = None;
+    for poll in 0..POLLS {
+        if poll > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        match ctl.get_heart_info() {
+            Ok(info) => {
+                if info.voice_level == want {
+                    if info.voice_mode == mode {
+                        return Ok(());
+                    }
+                    eprintln!(
+                        "settle poll {poll:>2}/{POLLS}: voice matched {} but voiceMode moved {} -> {} — treating as a mismatch",
+                        info.voice_level, mode, info.voice_mode
+                    );
+                }
+                last = Some(info.voice_level);
+            }
+            Err(e) => eprintln!("settle poll {poll:>2}/{POLLS}: GET failed: {e:?}"),
+        }
+    }
+    Err(last)
+}
+
+/// Drop guard for the gain test: mirrors [`EqRestoreGuard`] — on any exit
+/// path (normal return, failed assert, panic unwind) poll the device afresh
+/// and, IF the current `voiceLevel` differs from the run's starting stop,
+/// make ONE verified restore attempt (route (b) rule: the "no retry"
+/// clause applies to the SET; this guard is the restore-of-last-resort,
+/// not a second write scheme). Errors are logged, never raised from `drop`.
+struct GainRestoreGuard {
+    ctl: Option<HollyControl<NusbTransport>>,
+    original: u8,
+}
+
+impl GainRestoreGuard {
+    fn ctl(&mut self) -> &mut HollyControl<NusbTransport> {
+        self.ctl
+            .as_mut()
+            .expect("guard.ctl() may be called only while Some")
+    }
+}
+
+impl Drop for GainRestoreGuard {
+    fn drop(&mut self) {
+        let Some(ctl) = self.ctl.as_mut() else {
+            return;
+        };
+        // Restore decisions come only from a fresh GET, never cached state.
+        match ctl.get_heart_info() {
+            Err(e) => eprintln!("guard: state poll failed, cannot verify restore: {e:?}"),
+            Ok(info) => {
+                if info.voice_level == self.original {
+                    eprintln!(
+                        "guard: gain already at original stop {}, nothing to do",
+                        self.original
+                    );
+                } else {
+                    eprintln!(
+                        "guard: gain at stop {}, original {} — sending one restore SET",
+                        info.voice_level, self.original
+                    );
+                    if let Err(e) = ctl.set_gain(self.original) {
+                        eprintln!(
+                            "guard: RESTORE FAILED ({e:?}) — device left at stop {} while original was {}",
+                            info.voice_level, self.original
+                        );
+                    }
+                    // Verify what the single restore attempt actually did.
+                    match ctl.get_heart_info() {
+                        Ok(post) => {
+                            eprintln!("guard: post-restore voiceLevel = {}", post.voice_level)
+                        }
+                        Err(e) => eprintln!("guard: post-restore GET failed: {e:?}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Phase 1B route (b): guarded SET_VOICE_LEVEL (gain / "Volume adjustment")
+/// round trip on real hardware — substitute evidence for the §1 step-2
+/// gate; on success the checklist §3 Gain row + protocol.md §4 SET_VOICE_LEVEL
+/// row tag `[wire] PC-originated round trip`.
+///
+/// Rules — the set_eq_roundtrip_guarded rule set applied to gain:
+///   fresh GET → SET → ACK gate (`data[0]==0`) → bounded settle-verified
+///   heart delta on `voiceLevel` (§5 offset 8) → restore → settled verify.
+///   Restore attempted on every exit path.
+/// - ACK ≠ 0: NO SET retry — one fresh GET; if the stop moved from the
+///   start, ONE verified restore attempt; abort either way.
+/// - Any heart mismatch is declared only AFTER the fixed ~2 s settle poll.
+/// - Target = the NEIGHBOURING stop BELOW the current one (quieter —
+///   volume goes down, never up, owner rule 2026-11-10); the bottom stop
+///   (wire 0 = phone's stop "1") counts as an extreme, so a device resting
+///   at wire stop 0 or 1 leaves no valid neighbour-below and the run
+///   REFUSES instead of writing up or down an extreme.
+/// - `voiceMode` (§5 offset 9) is a separate heart field the single-byte
+///   payload cannot carry — never written; the settle poll asserts it.
+/// - The SET leg's own fresh-GET return (the stop in force just before the
+///   write) is the restore target; drift vs the pre-run GET retargets the
+///   guard, and the restore leg's return must report the written stop.
+/// - usbmon (owner-executed) captures the run; the .pcap + exported .jsonl
+///   land in captures/ as the evidence files.
+///
+/// Run only at the owner's explicit go, usbmon running:
+///   cargo test -p holly-usb --test hardware -- set_gain_roundtrip_guarded --ignored --nocapture
+#[test]
+#[ignore = "mutates device state; owner-gated run with usbmon capture active"]
+fn set_gain_roundtrip_guarded() {
+    let _dev = device_lock();
+    let mut ctl = HollyControl::open().expect("open + claim IF0");
+    let original = ctl.get_heart_info().expect("state poll failed");
+    assert_eq!(original.raw.len(), 17, "certified 17-byte payload shape");
+    eprintln!(
+        "original voiceLevel = {} (wire stop space 0..=5; phone shows stop {}), voiceMode = {}",
+        original.voice_level,
+        original.voice_level + 1,
+        original.voice_mode
+    );
+
+    // Neighbouring stop BELOW the current one — quieter, never an extreme,
+    // never above the current level (owner rule). Wire 0/1 have no such
+    // neighbour (0 IS the bottom stop, 1's only neighbour-below is 0), so
+    // those device states refuse the run.
+    let target = match original.voice_level {
+        2..=5 => original.voice_level - 1,
+        0 | 1 => panic!(
+            "voiceLevel {} leaves no stop below that is not the extreme (wire 0) — refusing the run; raise the volume via the phone/app first",
+            original.voice_level
+        ),
+        other => panic!(
+            "voiceLevel {other} is outside the wire-mapped stop space 0..=5 — refusing the run"
+        ),
+    };
+    eprintln!(
+        "writing neighbouring stop {target} (phone stop {})",
+        target + 1
+    );
+
+    let mut guard = GainRestoreGuard {
+        ctl: Some(ctl),
+        original: original.voice_level,
+    };
+
+    // SET leg — the op's own fresh GET happens inside set_gain, and the u8
+    // it returns is the stop in force JUST before the write: the freshest
+    // restore memory the device has. It wins over the pre-run poll; if
+    // another client moved gain between the two GETs, the difference is
+    // reported and the exit guard retargets.
+    let start = match guard.ctl().set_gain(target) {
+        Ok(previous) => {
+            if previous != original.voice_level {
+                eprintln!(
+                    "DRIFT: pre-run GET said voice {}, op's fresh GET reported voice {} — restore retargeted to {}",
+                    original.voice_level, previous, previous
+                );
+                guard.original = previous;
+            }
+            previous
+        }
+        Err(e) => {
+            // Route (b) ACK ≠ 0 path: NO SET retry. One fresh GET decides.
+            eprintln!("SET failed: {e:?} — probing once before the single restore");
+            let now = guard
+                .ctl()
+                .get_heart_info()
+                .expect("post-reject GET failed");
+            eprintln!("voiceLevel after reject: {}", now.voice_level);
+            if now.voice_level != original.voice_level {
+                eprintln!(
+                    "stop moved ({} -> {}): ONE verified restore attempt",
+                    original.voice_level, now.voice_level
+                );
+                if let Err(e) = guard.ctl().set_gain(original.voice_level) {
+                    eprintln!("reject-path restore SET failed: {e:?}");
+                }
+                match settle_voice_level(guard.ctl(), original.voice_level, original.voice_mode) {
+                    Ok(()) => eprintln!(
+                        "reject-path restore verified: voiceLevel={}",
+                        original.voice_level
+                    ),
+                    Err(last) => eprintln!("reject-path restore NOT settled (last seen {last:?})"),
+                }
+            }
+            panic!("SET rejected (ack gate) — aborting with no retry per route (b)");
+        }
+    };
+
+    // Heart-delta verify through the bounded settle poll (route (b) rule).
+    // The poll's match condition includes voiceMode == the pre-run mode
+    // (§5 offset 9 is a separate field; see settle_voice_level).
+    match settle_voice_level(guard.ctl(), target, original.voice_mode) {
+        Ok(()) => eprintln!("gain write confirmed: voiceLevel={target}"),
+        Err(last) => panic!(
+            "heart never reported voiceLevel {target} within the fixed settle budget (last seen: {last:?}) — guard restores the original on the way out"
+        ),
+    }
+
+    // Explicit restore leg (the guard double-covers mid-run panics).
+    // The restore TARGET is `start` — set_gain's own returned previous —
+    // and the leg's return must report the stop the SET leg wrote, which
+    // cross-checks that the fresh GET inside a SET sees that SET's own
+    // effect on the device.
+    let restore_previous = guard.ctl().set_gain(start).expect("restore SET failed");
+    assert_eq!(
+        restore_previous, target,
+        "restore leg's fresh GET must report the stop the SET leg wrote"
+    );
+    match settle_voice_level(guard.ctl(), start, original.voice_mode) {
+        Ok(()) => eprintln!("restore confirmed: voiceLevel={start}"),
         Err(last) => panic!(
             "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
         ),
