@@ -13,7 +13,7 @@ cargo run                          # real hardware (dongle 3547:0407 on IF0)
 cargo run -- --demo                # connected demo (same as --demo connected)
 cargo run -- --demo pending        # every SET stalls 20 s: photograph in-flight UI
 cargo run -- --demo busy           # OS busy error: the busy banner, no claim
-cargo test                         # 11 unit tests, no GPUI runtime/hardware needed
+cargo test                         # 13 unit tests, no GPUI runtime/hardware needed
 ```
 
 `--demo [connected|pending|busy]` parses via `DemoScenario::from_word`
@@ -53,7 +53,7 @@ shows the Busy banner instead of the dashboard.
 ```text
 holly-app actor thread ──Snapshot──▶ hub subscriber (pump thread)
         ▲                                   │ forwards into
-        │ commands (set_noise /set_noise_level /refresh)        ▼
+        │ commands (set_noise /set_noise_level /set_eq /refresh) ▼
    DeviceHandle                      gpui executor (cx.spawn → Entity::update)
 ```
 
@@ -77,13 +77,16 @@ holly-app actor thread ──Snapshot──▶ hub subscriber (pump thread)
 |---|---|---|---|
 | NC rocker (On/Off pads + Space/Enter) | verified `nc.state` only | click on a pad, or Space/Enter while the well is focused (`key_context "nc_rocker"`) | `nc_write_accepted`: nothing in flight, state verified; a pad requests THAT pad's state and dedups on the verified state |
 | NC level (Weak/Medium/Strong = `nc_level_label`) | verified `nc.state == some(true) && nc.level` — no pending target ever shown as selected | click a row (`named_usize("nc-level", L)`), or keys 1/2/3 | `level_pick`: blocked while ANY SET is in flight, blocked while the switch is not verified on, noop on the device's own level |
-| Mic mute chips, volume/channel/EQ/schedule selectors, reverb size + toggle, mic-recognition + indicator toggles | read-only snaps of the VM's known fields; unknown = no selection, full opacity | none | nothing is sent — every one of these is `WRITABLE.*: false` until a §1-gated capture exists (`docs/gui-roadmap.md`) |
+| EQ selector (Equalization/Low/Bright = display order) | verified `eq.selection` only (wire bytes 3/1/2 via `vm::eq_selection`; no pending target ever shown as selected) | click a pad (`named_usize("eq-pad", N)`), or Left/Right while the well is focused (`key_context "eq_selector"`) | `eq_pick` + `vm::eq_pad_wire`: blocked while an EQ write is in flight or `WRITABLE.eq` is false, noop on the device's own pad; the wire byte comes from the VM translation — never a literal here |
+| Mic mute chips, volume/channel/schedule selectors, reverb size + toggle, mic-recognition + indicator toggles | read-only snaps of the VM's known fields; unknown = no selection, full opacity | none | nothing is sent — every one of these is `WRITABLE.*: false` until a §1-gated capture exists (`docs/gui-roadmap.md`) |
 | Refresh ("Try again") | — | banner button | `DeviceHandle::refresh()` (actor re-open attempt) |
 
-Pending semantics (single rule, applied by `nc_write_accepted`/`level_pick`):
-ANY SET in flight (switch OR level) ⇒ both controls ignore picks, the VM's
+Pending semantics (single rule, applied by `nc_write_accepted`/`level_pick`/
+`eq_write_accepted`): ANY SET in flight blocks its OWN control family only
+(`PendingWrite::Noise` dims the NC controls, `PendingWrite::Eq` dims the EQ
+selector — never both): the affected controls ignore picks, the family's
 status word reads "Applying", the lit pad renders the tungsten gradient at 40%
-element opacity with no glow, and the selector dims to 0.5. Nothing
+element opacity with no glow, and the family's selector dims to 0.5. Nothing
 greys-out for "unknown": a state the wire never reported displays as-is.
 
 ## Theme: graphite and tungsten
@@ -186,12 +189,18 @@ data is never passable as hardware status.
   (`ResourceBusy, errno 16`), classified exactly like a held dongle: the busy
   banner, "Try again" does not succeed either.
 
+Demo writes change ONLY the scripted in-memory heart — `holly-cli status` (or
+any real-mode instance) reads the dongle and will never agree with a demo
+window; compare demo windows with nothing, compare `status` only with real
+sessions, sequentially (the claim is single-holder by design).
+
 ## Keybinds
 
 | Key | Action | Where it lives |
 |---|---|---|
 | Space / Enter | flip the NC switch (target computed from the verified state — equivalent to clicking the OPPOSITE pad) | only while the rocker well is focused (`nc_rocker` context) |
 | `1` / `2` / `3` | NC level Weak / Medium / Strong | global |
+| Left / Right | step the EQ selection one pad (from the device's verified pad; no verified pad = noop) | only while the EQ well is focused (`eq_selector` context) |
 | ctrl-r | refresh (same as "Try again") | global |
 | ctrl-q | quit | global, app-level action |
 | Mouse drag (titlebar strip) | move window | CSD: `start_window_move` |
@@ -202,13 +211,54 @@ Global keys reach the root's `on_action` listeners when nothing holds focus
 flip/level decisions ignore the request — the keys carry the same gates as
 the mouse.
 
+## Known issue: in niri the window only works once it is made WIDE
+
+**Observed 2026-11-10** (niri scrollable tiling, gpui 0.2.2 wayland CSD
+window, both `--demo` and real-device runs):
+
+- Launched as a normal-sized tile, the window shows its FIRST frame (usually
+  the `No dongle (3547:0407) on the bus` banner) and then **stops reacting
+  visually**: clicks and keys do nothing on screen. The clicks still reach
+  the actor — the terminal log keeps printing the SETs/pendings and the
+  DEVICE state actually changes (e.g. NC really went off) — only the
+  pixels freeze, so it both *looks* broken and *looks* like the dongle is
+  not being detected (the stale first banner is the "no dongle" text, while
+  the actor behind it is Connected).
+- Making the window WIDE — maximize the column, or drag-resize it — makes
+  everything work immediately: the connected dashboard paints, and from
+  then on clicks/keys/EQ writes repaint normally. The observed session
+  contract: **wide screen in niri = working app; tile-sized = not
+  responding.**
+- NOT a device issue: dongle detection/connection is actor-side and
+  independent of window size. No dongle should ever be "detected more"
+  because the window is wider — the frozen banner only misleads.
+- Working theory (not yet verified): the stall is in the gpui 0.2.2
+  Linux/Wayland redraw path for CSD client-decorations windows — the app
+  fires `cx.notify()` every second regardless (the VM's `updated` timestamp
+  changes on every poll), yet niri keeps showing the old frame until IT
+  forces one via resize. That means the paint decisions in our code are
+  fine and the missing piece sits below our layer: frame callbacks /
+  `request_frame`-on-wayland, possibly niri-specific (scrollable tiling +
+  `WindowDecorations::Client`). An X11/Wayland A/B test and a gpui-upstream
+  minimal case would settle it; our `patches/` vendored copy is where any
+  fix would land.
+- Workaround for the owner: maximize the holly column (or drag it wide)
+  once after each launch. If a window ever looks frozen again, any
+  resize/focus toggle restores painting without losing state — actions
+  taken while frozen DID take effect on the device; quitting (ctrl-q) and
+  relaunching repaints the true state.
+
 ## Current limitations
 
-- Only NC (switch + level, cmd 19) is writable — wire-exercised in
-  `captures/2026-11-05-noise-level-medium.txt` + `docs/protocol.md`. Volume,
-  channel, EQ, schedule, reverb, mute, mic-recognition, and the indicator
-  light are rendered but read-only until their per-control capture procedures
-  ([`../../docs/gui-roadmap.md`](../../docs/gui-roadmap.md)) pass the §1 gate.
+- NC (switch + level, cmd 19) and EQ (cmd 7) are writable — wire-exercised
+  (captures/2026-11-05-noise-level-medium.txt; captures/
+  set_eq_roundtrip.jsonl + docs/protocol.md). Volume, channel, schedule,
+  reverb, mute, mic-recognition, and the indicator light are rendered but
+  read-only until their per-control capture procedures
+  ([`../../docs/gui-roadmap.md`](../../docs/gui-roadmap.md)) pass the §1
+  gate.
+- **niri repaint stall** (see the known issue above): until traced, keep
+  the window widened after launch.
 - Linux only (wayland/x11 via gpui 0.2.2). No settings persistence, no tray.
 - The meter is always-unlit and inset shadows are absent — see "Unfinished
   reproductions".
