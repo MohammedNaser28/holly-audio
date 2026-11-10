@@ -11,6 +11,10 @@
 //!     PC-side round trip 2026-11-09 (captures/set_eq_roundtrip.jsonl).
 //!   - `set_gain(u8)` — cmd 3, same set_* shape as set_eq (fresh GET inside,
 //!     returns the pre-write stop); [code] until the guarded round trip runs.
+//!   - `set_reverb(bool, u8)` — cmd 5, payload `[isOpen, gear]` (switch
+//!     FIRST, per the APK builder); same set_* shape (fresh GET inside,
+//!     returns the pre-write pair); [code] until the guarded round trip
+//!     runs.
 
 use nusb::MaybeFuture;
 
@@ -225,6 +229,69 @@ impl<T: Transport> HollyControl<T> {
         let (reply, raw) = self.exchange(request)?;
         match reply.payload.as_slice() {
             [0x00] => Ok(state.voice_level),
+            [status] => Err(Error::Rejected {
+                status: *status,
+                raw,
+            }),
+            other => Err(Error::BadAck {
+                len: other.len(),
+                raw,
+            }),
+        }
+    }
+
+    /// Write the controller reverb state — cmd 5 SET_REVERB, two-byte
+    /// payload `[isOpen, gear]` with the SWITCH FIRST [code:
+    /// `UsbMessengerV2.setReverb(int value, boolean isOpen)` builds
+    /// `{isOpen ? 1 : 0, value}` — `UsbMessengerV2.java:192-195`; the
+    /// order is the one byte the APK does NOT move around in this frame,
+    /// unlike cmd 19's fresh-get preserve pattern]. Gear space = the
+    /// enum `DeviceConnectVariable.Reverb` GEAR_ONE/GEAR_TWO/GEAR_THREE =
+    /// 0/1/2 [code `HLDevice6302Activity.java:629-632`], identity-mapped to
+    /// the heart's reverb byte (§5 offset 14 — session-4 read-map check:
+    /// the gear flip 00→02 landed in the heart while the switch byte
+    /// stayed on, docs/protocol.md §5.2). Callers mirror the APK's own
+    /// two writes [code `HLDevice6302Activity.java:759/:769/:779/:792-793`]:
+    /// the gear buttons send the switch ON with their gear, the toggle-off
+    /// path sends the switch OFF with its remembered current gear
+    /// (`this.reverbType` — heart values keep feeding it, :1280/:1883-1891),
+    /// i.e. a toggle never invents a gear. The byte layout stays [code]
+    /// until the guarded PC-side round trip captures it on the wire
+    /// (route (b) — that run settles the §3 Reverb row).
+    ///
+    /// Unlike the SET_NOISE family there is NO preserved byte in this
+    /// payload: both bytes are caller-supplied exactly as the APK supplies
+    /// them, and the pair a prepare/restore path needs comes from the
+    /// return instead — this op returns the PAIR its fresh
+    /// `get_heart_info()` reported: the state in force on the device
+    /// immediately **before** the write. The fresh GET is the crate's
+    /// uniform SET discipline (one fresh GET inside every SET call; no
+    /// observable device state is ever cached), it gates the SET on a
+    /// live, answering device, and its `(reverbSwitch, reverbLevel)`[
+    /// wire captures/2026-11-05-hearinfo-first-wire.txt: heart payload[13]
+    /// = 00 (off), payload[14] = 02 — and hearts kept reporting gear 02
+    /// while the switch was off across sessions 1-4, §5.2] go back to the
+    /// caller instead of being dropped: a guarded round trip's restore leg
+    /// targets THAT pair — if another client moved reverb between the
+    /// caller's own GET and this SET, the returned pair is the freshest
+    /// memory the device has.
+    ///
+    /// Ack gating is identical to [`HollyControl::set_gain`] (checklist §3:
+    /// the `data[0] == 0` status rule is uniform across all `ProSet*`
+    /// classes [code]): `[00]` = success; anything else surfaces as
+    /// [`Error::Rejected`]/[`Error::BadAck`] — no retry. Reply-tail bytes
+    /// stay uninterpreted (decode discards everything past `7+len`,
+    /// docs/protocol.md §2). Values outside the certified 0..=2 gear space
+    /// are the caller's responsibility, not assumed here — family
+    /// convention (mirror of [`HollyControl::set_gain`]).
+    pub fn set_reverb(&mut self, switch: bool, gear: u8) -> Result<(bool, u8), Error> {
+        // Fresh GET inside every SET (crate rule); its pair is the restore
+        // datum returned to the caller.
+        let state = self.get_heart_info()?;
+        let request = Frame::new(cmd::SET_REVERB, vec![u8::from(switch), gear]);
+        let (reply, raw) = self.exchange(request)?;
+        match reply.payload.as_slice() {
+            [0x00] => Ok((state.reverb_switch, state.reverb_level)),
             [status] => Err(Error::Rejected {
                 status: *status,
                 raw,

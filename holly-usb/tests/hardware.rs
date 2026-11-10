@@ -13,6 +13,12 @@
 //! `set_gain_roundtrip_guarded` (2026-11-10) applies the SAME rules to the
 //! gain control — cmd 3 SET_VOICE_LEVEL, "Volume adjustment" — with the
 //! target bound to the neighbouring stop BELOW the current one (quieter).
+//! `set_reverb_roundtrip_guarded` applies them to reverb (cmd 5
+//! SET_REVERB, two-byte payload [isOpen, gear]): when the switch rests
+//! OFF it first toggles ON with the starting gear and then moves to the
+//! neighbouring gear while on; when it rests ON it only moves the
+//! neighbouring gear and NEVER switches off. Reverb is AUDIBLE on the
+//! mics — the owner keeps recording/monitoring off for the run.
 
 use holly_usb::{HollyControl, NusbTransport};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -747,6 +753,316 @@ fn set_gain_roundtrip_guarded() {
     );
     match settle_voice_level(guard.ctl(), start, original.voice_mode) {
         Ok(()) => eprintln!("restore confirmed: voiceLevel={start}"),
+        Err(last) => panic!(
+            "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
+        ),
+    }
+}
+
+// ── Reverb (cmd 5, SET_REVERB) ───────────────────────────────────────────────
+
+/// Bounded read-only settle poll for the reverb PAIR — same shape as
+/// [`settle_eq_level`] (route (b) owner rule): a FIXED number of fresh GETs
+/// spanning about 2 s run before any heart mismatch is declared — a slow
+/// heart is not a dropped write. GET-only; the SET behind this poll is never
+/// retried. The poll CONFIRMS only when BOTH bytes match (`reverbSwitch`
+/// §5 offset 13 == `want_switch` AND the gear byte §5 offset 14 ==
+/// `want_gear`): the docs' certified behaviour is that the heart reports
+/// the gear unchanged while the switch is off [wire
+/// captures/2026-11-05-hearinfo-first-wire.txt payload[13]=00/payload[14]=02;
+/// §5.2 sessions 1-4], so a one-leg-only settle would hide a half write.
+/// `Ok(())` = a fresh GET reported the whole pair;
+/// `Err(Some(last))` = the fixed budget ran out (`last` = the final pair
+/// seen); `Err(None)` = no parseable heart within the budget.
+fn settle_reverb(
+    ctl: &mut HollyControl<NusbTransport>,
+    want_switch: bool,
+    want_gear: u8,
+) -> Result<(), Option<(bool, u8)>> {
+    /// Fixed settle budget: 4 fresh GETs ≈ 2 s — deterministic, not
+    /// adaptive; nothing beyond this count.
+    const POLLS: u32 = 4;
+    let mut last = None;
+    for poll in 0..POLLS {
+        if poll > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        match ctl.get_heart_info() {
+            Ok(info) => {
+                if info.reverb_switch == want_switch && info.reverb_level == want_gear {
+                    return Ok(());
+                }
+                last = Some((info.reverb_switch, info.reverb_level));
+            }
+            Err(e) => eprintln!("settle poll {poll:>2}/{POLLS}: GET failed: {e:?}"),
+        }
+    }
+    Err(last)
+}
+
+/// Drop guard for the reverb test: mirrors [`GainRestoreGuard`] — on any
+/// exit path (normal return, failed assert, panic unwind) poll the device
+/// afresh and, IF the current `(reverbSwitch, reverbLevel)` pair differs
+/// from the run's starting pair, make ONE verified restore attempt via
+/// `set_reverb(original pair)` (route (b) rule: the "no retry" clause
+/// applies to the SET; this guard is the restore-of-last-resort, not a
+/// second write scheme). Restoring the PAIR — off, the starting gear —
+/// mirrors the APK's own toggle-off path, which sends its remembered gear
+/// [code HLDevice6302Activity.java:792-793]. Errors are logged, never
+/// raised from `drop`.
+struct ReverbRestoreGuard {
+    ctl: Option<HollyControl<NusbTransport>>,
+    original_switch: bool,
+    original_gear: u8,
+}
+
+impl ReverbRestoreGuard {
+    fn ctl(&mut self) -> &mut HollyControl<NusbTransport> {
+        self.ctl
+            .as_mut()
+            .expect("guard.ctl() may be called only while Some")
+    }
+}
+
+impl Drop for ReverbRestoreGuard {
+    fn drop(&mut self) {
+        let Some(ctl) = self.ctl.as_mut() else {
+            return;
+        };
+        // Restore decisions come only from a fresh GET, never cached state.
+        match ctl.get_heart_info() {
+            Err(e) => eprintln!("guard: state poll failed, cannot verify restore: {e:?}"),
+            Ok(info) => {
+                if info.reverb_switch == self.original_switch
+                    && info.reverb_level == self.original_gear
+                {
+                    eprintln!(
+                        "guard: reverb already at original pair ({}, gear {}), nothing to do",
+                        self.original_switch, self.original_gear
+                    );
+                } else {
+                    eprintln!(
+                        "guard: reverb at ({}, gear {}), original ({}, gear {}) — sending one restore SET",
+                        info.reverb_switch,
+                        info.reverb_level,
+                        self.original_switch,
+                        self.original_gear
+                    );
+                    if let Err(e) = ctl.set_reverb(self.original_switch, self.original_gear) {
+                        eprintln!(
+                            "guard: RESTORE FAILED ({e:?}) — device left at ({}, gear {}) while original was ({}, gear {})",
+                            info.reverb_switch,
+                            info.reverb_level,
+                            self.original_switch,
+                            self.original_gear
+                        );
+                    }
+                    // Verify what the single restore attempt actually did.
+                    match ctl.get_heart_info() {
+                        Ok(post) => eprintln!(
+                            "guard: post-restore reverb = (on={} gear={})",
+                            post.reverb_switch, post.reverb_level
+                        ),
+                        Err(e) => eprintln!("guard: post-restore GET failed: {e:?}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Phase 1B route (b): guarded SET_REVERB round trip on real hardware —
+/// substitute evidence for the §1 step-2 gate; on success the checklist §3
+/// Reverb row + protocol.md §4 SET_REVERB row tag `[wire] PC-originated
+/// round trip` (§5.2's gear-keeps-value-while-off note).
+///
+/// ⚠ AUDIBLE: reverb is applied to the mic signal — keep REC/MONITORING
+/// off while this runs.
+///
+/// Rules — the set_gain_roundtrip_guarded rule set applied to reverb:
+///   fresh GET → SET → ACK gate (`data[0]==0`) → bounded settle-verified
+///   heart delta on the PAIR (`reverbSwitch` §5 offset 13 + gear §5
+///   offset 14) → restore → settled verify. Restore attempted on every
+///   exit path.
+/// - ACK ≠ 0: NO SET retry — one fresh GET; if the pair moved from the
+///   start, ONE verified restore attempt; abort either way.
+/// - Any heart mismatch is declared only AFTER the fixed ~2 s settle poll.
+/// - Gear target = NEIGHBOURING certified gear (space 0/1/2 =
+///   GEAR_ONE/TWO/THREE [code HLDevice6302Activity.java:629-632];
+///   0→1, 1→2, 2→1), never out of space: anything outside 0..=2 refuses
+///   the run (guard convention — the op itself never range-checks).
+/// - Start-shape branch (toggle is the cheapest first delta):
+///   switch OFF → first leg toggles ON with the STARTING gear (the
+///   APK-toggle shape), second leg moves the NEIGHBOURING gear while ON;
+///   switch ON → the legs only move gear and the run NEVER writes the
+///   switch as off.
+/// - The SET leg's own fresh-GET return (the pair in force just before
+///   the write) is the restore target; drift vs the pre-run GET retargets
+///   the guard, and the restore leg's return must report the pair the SET
+///   leg wrote.
+/// - usbmon (owner-executed) captures the run; the .pcap + exported
+///   .jsonl land in captures/ as the evidence files.
+///
+/// Run only at the owner's explicit go, usbmon running:
+///   cargo test -p holly-usb --test hardware -- set_reverb_roundtrip_guarded --ignored --nocapture
+#[test]
+#[ignore = "mutates device state; owner-gated run with usbmon capture active — reverb is AUDIBLE on the mics"]
+fn set_reverb_roundtrip_guarded() {
+    let _dev = device_lock();
+    let mut ctl = HollyControl::open().expect("open + claim IF0");
+    let original = ctl.get_heart_info().expect("state poll failed");
+    assert_eq!(original.raw.len(), 17, "certified 17-byte payload shape");
+    eprintln!(
+        "original reverb: switch={} gear={} — ⚠ reverb is AUDIBLE on the mics, keep REC/MONITORING off",
+        original.reverb_switch, original.reverb_level
+    );
+
+    // Neighbouring certified gear — never out of space, never an extreme
+    // hop (route (b) rule). 0's neighbour is 1; 1 goes up to 2; 2 comes
+    // back to 1. Any device resting outside 0..=2 refuses the run.
+    let gear_target = match original.reverb_level {
+        0 => 1,
+        1 => 2,
+        2 => 1,
+        other => panic!(
+            "reverb gear {other} is outside the certified space 0..=2 (GEAR_ONE/TWO/THREE) — refusing the run"
+        ),
+    };
+
+    let mut guard = ReverbRestoreGuard {
+        ctl: Some(ctl),
+        original_switch: original.reverb_switch,
+        original_gear: original.reverb_level,
+    };
+
+    // FIRST leg. Switch OFF → toggle ON with the starting gear (the
+    // APK-toggle shape: the switch is the delta, gear passes through).
+    // Switch ON → only the neighbouring gear moves (the switch byte stays
+    // true; the run never turns reverb off). The op's own fresh GET
+    // happens inside set_reverb, and the PAIR it returns is the state in
+    // force JUST before the write: the freshest restore memory the device
+    // has. It wins over the pre-run poll; if another client moved reverb
+    // between the two GETs, the difference is reported and the exit guard
+    // retargets.
+    let first = if original.reverb_switch {
+        guard.ctl().set_reverb(true, gear_target)
+    } else {
+        guard.ctl().set_reverb(true, original.reverb_level)
+    };
+    let start = match first {
+        Ok(previous) => {
+            if previous != (original.reverb_switch, original.reverb_level) {
+                eprintln!(
+                    "DRIFT: pre-run GET said ({}, gear {}), op's fresh GET reported ({}, gear {}) — restore retargeted",
+                    original.reverb_switch, original.reverb_level, previous.0, previous.1
+                );
+                (guard.original_switch, guard.original_gear) = previous;
+            }
+            previous
+        }
+        Err(e) => {
+            // Route (b) ACK ≠ 0 path: NO SET retry. One fresh GET decides.
+            eprintln!("SET failed: {e:?} — probing once before the single restore");
+            let now = guard
+                .ctl()
+                .get_heart_info()
+                .expect("post-reject GET failed");
+            eprintln!(
+                "reverb after reject: (on={} gear={})",
+                now.reverb_switch, now.reverb_level
+            );
+            let now_pair = (now.reverb_switch, now.reverb_level);
+            let original_pair = (original.reverb_switch, original.reverb_level);
+            if now_pair != original_pair {
+                eprintln!(
+                    "pair moved ({:?} -> {:?}): ONE verified restore attempt",
+                    original_pair, now_pair
+                );
+                if let Err(e) = guard
+                    .ctl()
+                    .set_reverb(original.reverb_switch, original.reverb_level)
+                {
+                    eprintln!("reject-path restore SET failed: {e:?}");
+                }
+                match settle_reverb(guard.ctl(), original.reverb_switch, original.reverb_level) {
+                    Ok(()) => eprintln!(
+                        "reject-path restore verified: reverb = ({:?})",
+                        original_pair
+                    ),
+                    Err(last) => eprintln!("reject-path restore NOT settled (last seen {last:?})"),
+                }
+            }
+            panic!("SET rejected (ack gate) — aborting with no retry per route (b)");
+        }
+    };
+
+    // Heart-delta verify through the bounded settle poll (route (b) rule).
+    // First leg confirms the switch state written (on) with the gear in
+    // force after it: the toggle leg keeps the starting gear, the gear leg
+    // lands on the neighbour.
+    let first_want_gear = if original.reverb_switch {
+        gear_target
+    } else {
+        original.reverb_level
+    };
+    match settle_reverb(guard.ctl(), true, first_want_gear) {
+        Ok(()) => eprintln!("first leg confirmed: on gear={first_want_gear}"),
+        Err(last) => panic!(
+            "heart never reported (on, gear {first_want_gear}) within the fixed settle budget (last seen: {last:?}) — guard restores the original on the way out"
+        ),
+    }
+
+    // SECOND leg (switch was OFF at start only): move the NEIGHBOURING
+    // gear while reverb is on — a real gear delta, on the on state this
+    // run already created. When the switch started ON there is no second
+    // leg: the first leg WAS the neighbour-gear move and the restore is
+    // the original pair. Restore NEVER goes through a switch-off hop
+    // either way: it is exactly the starting pair (when that is off, the
+    // APK-toggle shape writes off WITH the starting gear as its value
+    // byte).
+    if !original.reverb_switch {
+        match guard.ctl().set_reverb(true, gear_target) {
+            Ok(previous) => {
+                assert_eq!(
+                    previous,
+                    (true, first_want_gear),
+                    "gear leg's fresh GET must report the pair the first leg wrote"
+                );
+            }
+            Err(e) => {
+                // No SET retry (route (b)); the exit guard still restores.
+                eprintln!(
+                    "neighbour-gear SET failed: {e:?} — aborting; guard restores the original on the way out"
+                );
+                panic!(
+                    "neighbour-gear SET failed (ack gate) — aborting with no retry per route (b)"
+                );
+            }
+        }
+        match settle_reverb(guard.ctl(), true, gear_target) {
+            Ok(()) => eprintln!("gear change confirmed: on gear={gear_target}"),
+            Err(last) => panic!(
+                "heart never reported (on, gear {gear_target}) within the fixed settle budget (last seen: {last:?}) — guard restores the original on the way out"
+            ),
+        }
+    }
+
+    // Restore leg = exactly the starting pair, via set_reverb so the
+    // guard's cross-check style mirrors EQ/gain: the restore's fresh GET
+    // must report the last pair this run left on the device. Both branches
+    // ended with reverb ON at the neighbouring gear: the S=on branch's
+    // only write leg was that move, the S=off branch's second leg was.
+    let last_pair = (true, gear_target);
+    let restore_previous = guard
+        .ctl()
+        .set_reverb(start.0, start.1)
+        .expect("restore SET failed");
+    assert_eq!(
+        restore_previous, last_pair,
+        "restore leg's fresh GET must report the pair the write leg left"
+    );
+    match settle_reverb(guard.ctl(), start.0, start.1) {
+        Ok(()) => eprintln!("restore confirmed: reverb pair = ({:?})", start),
         Err(last) => panic!(
             "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
         ),
