@@ -966,3 +966,254 @@ fn set_gain_roundtrip_replays_the_real_session() {
     );
     assert_eq!(SET_GAIN_ACK, SET_GAIN_ACK_WIRE, "ack lineage pin");
 }
+
+// ── Reverb (cmd 5, SET_REVERB) — Phase 1B route (b) ─────────────────────────
+// Owner rule (2026-11-11): Mock vectors are RECOMPUTED FROM THE DOCS until
+// the hardware run; real usbmon frames join as replay vectors after it —
+// the same flow as EQ/gain (roadmap §1 route (b)). Every frame below is
+// computed from docs only:
+//   frame template  docs/protocol.md §2 (ProtocolV2.getData [code]); cmd 5 =
+//                   ProSetReverb [code ProtocolFactoryV2 dispatch]
+//   payload         [isOpen, gear] — switch FIRST [code
+//                   UsbMessengerV2.setReverb(int value, boolean isOpen)
+//                   builds {isOpen?1:0, value}, UsbMessengerV2.java:192-195]
+//   gear space      0/1/2 = GEAR_ONE/GEAR_TWO/GEAR_THREE [code
+//                   HLDevice6302Activity.java:629-632]; identity read side
+//                   = heart payload[14] (§5 offset 14, §5.2)
+// The heart reply is the wire-certified E1 heart (captures/
+// 2026-11-05-hearinfo-first-wire.txt, line 19: payload[13] = 00 (reverb
+// off), payload[14] = 02 — hearts keep reporting the gear while the switch
+// is off, §5.2 sessions 1-4 [wire]) with only the reverb bytes moved:
+// heart payload offset k = frame byte 7+k, so switch = frame byte 20 and
+// gear = frame byte 21. The toggles pass the STARTING gear (E1's 02)
+// through exactly like the APK does — gear buttons send isOpen=true with
+// their gear (HLDevice6302Activity.java:759/:769/:779) and the toggle-off
+// path sends its remembered current gear
+// (setReverb(this.reverbType, false), :792-793) [code].
+
+/// SET_REVERB toggle-ON with E1's resting gear 2 recomputed from the docs:
+/// `05 03 AA DD 05 00 02 01 02 EF` + zero padding to 64 (big-endian len
+/// 00 02; switch byte at 7, gear byte at 8, tail EF at 9).
+const SET_REVERB_ON_2_TX: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x05, 0x00, 0x02, 0x01, 0x02, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// SET_REVERB toggle-OFF with the same gear — the APK toggle-off shape
+/// [`SET_REVERB_ON_2_TX`] with byte 7 (isOpen) 0x01 → 0x00.
+const SET_REVERB_OFF_2_TX: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x05, 0x00, 0x02, 0x00, 0x02, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// SET_REVERB ack recomputed from the docs: reply header `05 03 BB DD` +
+/// cmd echo 05 + len 00 01 + status `00` (checklist §3 ACK rule: one
+/// status byte, `data[0] == 0` = success — uniform across `ProSet*` [code]).
+/// The byte behind the payload follows the reply-checksum rule EQ/gain
+/// certified on the wire: XOR(frame[0..7+len)) ⊕ 0x07 — the cmd-05 prefix
+/// `05 03 BB DD 05 00 01 00` folds to 0x64, so the vector carries
+/// `0x63` (EQ: cmd 07 → 0x61; gain: cmd 03 → 0x65; NC: cmd 13 → 0x75; all
+/// wire-matched). protocol.md open question 2 stays the doc line until
+/// the run; either way the crate discards everything past `7+len`, so the
+/// vector doubles as an ignore-the-residue regression.
+const SET_REVERB_ACK: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x05, 0x00, 0x01, 0x00, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The certified E1 heart with ONLY the reverb switch byte (payload[13] =
+/// frame byte 20) moved 00 → 01: gear stays 02 — the docs' certified
+/// gear-keeps-value-through-a-toggle [wire §5.2]. Layout stays [wire]
+/// (E1); the residue drops 0x37 → 0x36 per the heart reply checksum rule
+/// (XOR(payload[0..17]) ⊕ 0x68 — the 00→01 flip moves fold 0x5F → 0x5E,
+/// 0x5E⊕0x68 = 0x36).
+const HEART_RX_REVERB_ON: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The certified E1 heart with reverb ON gear 1: frame byte 20 = 01 (switch)
+/// AND byte 21 = payload[14] moved 02 → 01 (a real gear delta — the
+/// toggle-off-style no-move already covered by [`HEART_RX_REVERB_ON`]).
+/// Fold: 0x5F ⊕ 0x01 ⊕ 0x03 = 0x5D → tail 0x5D⊕0x68 = 0x35.
+const HEART_RX_REVERB_GEAR1: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x00, 0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// set_reverb(ON, gear 2): the op must issue its own fresh GET first
+/// (uniform SET discipline), then the byte-exact doc-recomputed SET frame,
+/// and hand back the fresh GET's PAIR as the pre-write state. E1 IS a
+/// "(false, gear 2)" heart [wire], so the return doubles as the
+/// toggle-safe restore datum.
+#[test]
+fn set_reverb_tx_frame_is_the_apk_layout() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner fresh GET (device rests off, gear 2)
+    mock.push_reply(SET_REVERB_ACK);
+    let mut c = control(mock);
+
+    let previous = c.set_reverb(true, 2).expect("ack 00 must be accepted");
+    assert_eq!(
+        previous,
+        (false, 2),
+        "fresh GET inside set_reverb = the pair before write"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(&written[0], &HEART_TX, "op must issue its own GET first");
+    assert_eq!(
+        &written[1], &SET_REVERB_ON_2_TX,
+        "SET reverb must be the doc-recomputed on+gear-2 frame"
+    );
+    assert_eq!(written[1][4], cmd::SET_REVERB, "cmd echo = 5 [code]");
+}
+
+/// Both bytes are caller-supplied independently (no preserve byte in this
+/// payload — unlike the SET_NOISE family): the 6 (switch, gear) shapes of
+/// the certified space all differ from the template ONLY in bytes 7
+/// (isOpen, switch FIRST) and 8 (gear), cmd/tail unchanged.
+#[test]
+fn set_reverb_switch_and_gear_change_independently() {
+    for (switch, gear) in [
+        (false, 0u8),
+        (false, 1),
+        (false, 2),
+        (true, 0),
+        (true, 1),
+        (true, 2),
+    ] {
+        let mut mock = MockTransport::new();
+        mock.push_reply(HEART_RX_E1);
+        mock.push_reply(SET_REVERB_ACK);
+        let mut c = control(mock);
+
+        let previous = c.set_reverb(switch, gear).expect("ack 00 must be accepted");
+        assert_eq!(
+            previous,
+            (false, 2),
+            "fresh GET reported ({}, gear {}) INCOMING",
+            switch,
+            gear
+        );
+        let mut want = SET_REVERB_ON_2_TX;
+        want[7] = u8::from(switch); // isOpen at frame offset 7 (switch FIRST)
+        want[8] = gear; // gear at frame offset 8 (tail EF at 9)
+        assert_eq!(
+            &c.transport().written()[1],
+            &want,
+            "(switch {}, gear {})",
+            switch,
+            gear
+        );
+    }
+}
+
+/// Full doc-vector round trip (route (b), Mock half) in the shape the
+/// guarded hardware test rehearses on an OFF device: toggle ON with the
+/// starting gear (E1 rests off gear 2 [wire]), heart settles ON with that
+/// gear untouched; neighbour gear (2→1) written while ON; heart settles on
+/// gear 1; restore = the STARTING pair (off, gear 2) — the APK toggle-off
+/// shape; heart settles back. Frames asserted both ways round trip; every
+/// restore TARGET comes from the ops' own fresh-GET returns, not a
+/// caller-side poll.
+#[test]
+fn set_reverb_roundtrip_doc_vectors() {
+    let mut set_on_gear1 = SET_REVERB_ON_2_TX;
+    set_on_gear1[8] = 0x01; // neighbour gear while ON (gear byte only)
+
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner GET of the toggle: (off, gear 2)
+    mock.push_reply(SET_REVERB_ACK); // ack for SET_REVERB [01, 02]
+    mock.push_reply(HEART_RX_REVERB_ON); // settle GET: gear kept its value
+    mock.push_reply(HEART_RX_REVERB_ON); // inner GET of the gear write
+    mock.push_reply(SET_REVERB_ACK); // ack for SET_REVERB [01, 01]
+    mock.push_reply(HEART_RX_REVERB_GEAR1); // settle GET: gear 1
+    mock.push_reply(HEART_RX_REVERB_GEAR1); // inner GET of the restore
+    mock.push_reply(SET_REVERB_ACK); // ack for SET_REVERB [00, 02]
+    mock.push_reply(HEART_RX_E1); // final GET: back to (off, gear 2)
+
+    let mut c = control(mock);
+    let previous = c
+        .set_reverb(true, 2)
+        .expect("toggle write must be accepted");
+    assert_eq!(previous, (false, 2), "pre-write pair from the op's own GET");
+    let after_toggle = c.get_heart_info().expect("post-toggle GET");
+    assert!(
+        after_toggle.reverb_switch && after_toggle.reverb_level == 2,
+        "heart delta = switch on, GEAR UNTOUCHED (§5.2 [wire])"
+    );
+    let gear_previous = c
+        .set_reverb(true, 1)
+        .expect("neighbour-gear write must be accepted");
+    assert_eq!(
+        gear_previous,
+        (true, 2),
+        "the gear write's fresh GET saw the toggle's effect"
+    );
+    let after_gear = c.get_heart_info().expect("post-gear GET");
+    assert!(
+        after_gear.reverb_switch && after_gear.reverb_level == 1,
+        "heart delta = gear moved on the on state"
+    );
+    let restore_previous = c.set_reverb(false, 2).expect("restore must be accepted");
+    assert_eq!(
+        restore_previous,
+        (true, 1),
+        "the restore's fresh GET saw the gear write's effect"
+    );
+    let restored = c.get_heart_info().expect("post-restore GET");
+    assert!(
+        !restored.reverb_switch && restored.reverb_level == 2,
+        "heart must be back at the STARTING pair (off, gear 2)"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(&written[1], &SET_REVERB_ON_2_TX, "toggle leg = [01, 02]");
+    assert_eq!(&written[4], &set_on_gear1, "gear leg = [01, 01]");
+    assert_eq!(
+        &written[7], &SET_REVERB_OFF_2_TX,
+        "restore leg = the starting pair [00, 02]"
+    );
+}
+
+/// Ack gates shared with the SET_NOISE/SET_EQ/SET_GAIN families (checklist
+/// §3: uniform `data[0] == 0` success across all `ProSet*` classes [code]):
+/// nonzero status = [`Error::Rejected`], wrong ack length =
+/// [`Error::BadAck`]. Reason same as the EQ/gain tests: the ack shape has
+/// only ever been seen as `[00]` [wire E2/E4].
+#[test]
+fn set_reverb_rejects_abnormal_acks() {
+    // nonzero status
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_REVERB_ACK;
+    ack[7] = 0x03; // status byte != 0
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_reverb(true, 2).expect_err("nonzero ack must fail");
+    assert!(
+        matches!(err, Error::Rejected { status: 0x03, .. }),
+        "{err:?}"
+    );
+
+    // two-byte ack (echo shape) must not be accepted
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_REVERB_ACK;
+    ack[6] = 0x02; // payload len 2
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_reverb(true, 2).expect_err("2-byte ack must fail");
+    assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
+}
