@@ -34,6 +34,15 @@ hardcode device rules or strings.
   explicit "go", one hardware session at a time, and no `holly`/GUI process
   may hold IF0 while the VM rig or a hardware test has the dongle.
 
+## GUI changes
+
+- GUI changes for a feature may add behaviour only: click and keyboard
+  wiring, the pending state, and the ViewModel fields they read. They must
+  NOT change style, layout, colour, spacing, sizes, typography, icons, or
+  panel structure.
+- Reuse the existing 0.5 dim for in-flight writes; never add a new look.
+- If a requirement seems to need a visual change, stop and ask the owner.
+
 ## Git
 
 - Do not commit anything under `docs/` without owner approval (this file is
