@@ -148,6 +148,23 @@ impl StatusSource for DemoDevice {
         heart.voice_level = stop;
         Ok(previous)
     }
+
+    fn set_reverb(&mut self, switch: bool, gear: u8) -> Result<(bool, u8), Error> {
+        // Same shape as holly-usb's set_reverb: the RETURN is the (switch,
+        // gear) pair the heart held BEFORE the write (guarded flows restore
+        // from it); the write mutates BOTH reverb bytes — the real SET
+        // carries `[isOpen, gear]` and the 2026-11-11 wire round trip
+        // settled the pair on every leg (§5 offsets 13/14) — everything
+        // else stays scripted. Pending scenario: stall BEFORE mutation, so
+        // the pending snapshot is always observable first (same shape as
+        // set_gain).
+        let mut heart = self.heart.lock().unwrap();
+        let previous = (heart.reverb_switch, heart.reverb_level);
+        std::thread::sleep(self.stall);
+        heart.reverb_switch = switch;
+        heart.reverb_level = gear;
+        Ok(previous)
+    }
 }
 
 /// The OS busy condition, byte-for-byte the real claim failure shape

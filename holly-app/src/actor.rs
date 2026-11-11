@@ -69,6 +69,12 @@ pub enum PendingWrite {
     /// stop being written (0..=5 = the display stops "1".."6"; the identity
     /// lives in `vm::volume_selection`/`vm::volume_pad_wire`, never here).
     Gain(u8),
+    /// A reverb write is in flight: the bytes are the WIRE pair being
+    /// written, `(switch, gear)` — the frame builds the pair as
+    /// `[isOpen, gear]`, switch FIRST (checklist §3). The identity mapping
+    /// lives in `vm::reverb_toggle_wire`/`vm::reverb_gear_wire`, never
+    /// here.
+    Reverb(bool, u8),
 }
 
 /// Commands the UI/frontend may send.
@@ -95,6 +101,13 @@ pub enum Command {
     /// VM (`volume_pad_wire`), never in a frontend. Coalesces to the
     /// latest like every other SET (one SET per batch, newest intent).
     SetGain(u8),
+    /// Request a reverb write, `(switch, gear)` in the WIRE value spaces
+    /// (switch free, gear 0..=2 — checklist §3 Reverb row: write space ==
+    /// read space, identity). The DISPLAY-order translations live in the
+    /// VM (`reverb_toggle_wire`/`reverb_gear_wire`), never in a frontend.
+    /// Coalesces to the latest like every other SET (one SET per batch,
+    /// newest intent).
+    SetReverb(bool, u8),
     /// Force one fresh poll/reconnect attempt now.
     Refresh,
 }
@@ -180,6 +193,14 @@ impl DeviceHandle {
     /// device verdict.
     pub fn set_gain(&self, stop: u8) {
         let _ = self.tx.send(Command::SetGain(stop));
+    }
+
+    /// Request a reverb write (WIRE pair `(switch, gear)`; display-order
+    /// translation is the VM's `reverb_toggle_wire`/`reverb_gear_wire`).
+    /// Fire-and-forget like every other send: the snapshot stream reports
+    /// "pending" then the device verdict.
+    pub fn set_reverb(&self, switch: bool, gear: u8) {
+        let _ = self.tx.send(Command::SetReverb(switch, gear));
     }
 
     pub fn refresh(&self) {
@@ -278,9 +299,9 @@ impl Core {
     }
 
     /// Process ONE batch of queued commands with coalescing (latest-wins:
-    /// within the batch, any SET command — NC switch, NC level, EQ pad, or
-    /// Volume stop — replaces its predecessor; only the newest SET goes
-    /// out).
+    /// within the batch, any SET command — NC switch, NC level, EQ pad,
+    /// Volume stop, or reverb write — replaces its predecessor; only the
+    /// newest SET goes out).
     pub fn pump<I: IntoIterator<Item = Command>>(&mut self, cmds: I) {
         let mut refresh = false;
         let mut write: Option<PendingWrite> = None;
@@ -293,6 +314,9 @@ impl Core {
                 }
                 Command::SetEq(pad) => write = Some(PendingWrite::Eq(pad)),
                 Command::SetGain(stop) => write = Some(PendingWrite::Gain(stop)),
+                Command::SetReverb(switch, gear) => {
+                    write = Some(PendingWrite::Reverb(switch, gear))
+                }
             }
         }
         if self.device.is_none() {
@@ -393,11 +417,12 @@ impl Core {
     }
 
     /// One SET round trip — the single in-flight SET — then a fresh poll
-    /// so subscribers always see the DEVICE's verdict. For EQ/gain,
-    /// holly-usb's `set_eq`/`set_gain` additionally return the fresh GET's
-    /// pre-write value; nothing here consumes it for STATE (the post-SET
-    /// poll is the verdict the snapshot carries — never optimistic); the
-    /// value exists for the guarded restore flows (holly-usb tests).
+    /// so subscribers always see the DEVICE's verdict. For EQ/gain/reverb,
+    /// holly-usb's `set_eq`/`set_gain`/`set_reverb` additionally return the
+    /// fresh GET's pre-write value; nothing here consumes it for STATE (the
+    /// post-SET poll is the verdict the snapshot carries — never
+    /// optimistic); the value exists for the guarded restore flows
+    /// (holly-usb tests).
     fn execute_set(&mut self, write: PendingWrite) {
         let Some(source) = self.device.as_mut() else {
             return;
@@ -407,6 +432,9 @@ impl Core {
             PendingWrite::Noise(NoiseWrite::Level(level)) => source.set_noise_level(level),
             PendingWrite::Eq(pad) => source.set_eq(pad).map(|_previous| ()),
             PendingWrite::Gain(stop) => source.set_gain(stop).map(|_previous| ()),
+            PendingWrite::Reverb(switch, gear) => {
+                source.set_reverb(switch, gear).map(|_previous| ())
+            }
         };
         match result {
             Ok(()) => {

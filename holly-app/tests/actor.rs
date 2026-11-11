@@ -62,6 +62,17 @@ const SET_GAIN_ACK: [u8; REPORT] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+/// Real SET_REVERB ack (holly-usb tests/mock.rs `SET_REVERB_ACK_WIRE` —
+/// export frames 25/37/49 of the 2026-11-11 reverb capture): cmd echo 05 +
+/// status 00 + the cmd-05 residue 0x63 — predicted pre-run from the reply
+/// checksum rule `XOR(7+len prefix) ⊕ 0x07` and byte-matched on the wire
+/// (4th command shape of `cmd ⊕ 0x66`). The crate ignores the residue.
+const SET_REVERB_ACK: [u8; REPORT] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x05, 0x00, 0x01, 0x00, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
 
 /// Never-captured shape: nonzero ack status byte. Per
 /// `ProSetNoise.receiveData` [code], only `data[0] == 0` is success — the
@@ -618,8 +629,9 @@ fn view_model_connected_shape() {
     assert_eq!(
         vm.reverb,
         Some(vm::ReverbVm {
-            enabled: false,
-            level: 2
+            enabled: Some(false),
+            gear: Some(2),
+            applying: false
         })
     );
 }
@@ -788,12 +800,64 @@ fn set_gain_roundtrip_through_the_actor() {
     );
 }
 
+/// The reverb write path through the actor: ONE SetReverb round trip on
+/// holly-usb's `set_reverb` (fresh GET inside, cmd-05 ack — the
+/// 2026-11-11 wire shape `… 05 00 01 00 63`), then the actor's post-SET
+/// poll carries the DEVICE's verdict — the wire pair, byte for byte
+/// (payload[13]/[14] = reverb switch/gear, buffer indices 20/21 [wire E1]).
+/// The pending appears exactly once as `Reverb(switch, gear)`.
+#[test]
+fn set_reverb_roundtrip_through_the_actor() {
+    let session = MockShared::default();
+    session.push_reply(HEART_E1); // connect poll (reverb off, gear 2)
+    session.push_reply(HEART_E1); // fresh GET inside set_reverb
+    session.push_reply(SET_REVERB_ACK); // cmd-05 ack (status 00, residue 63)
+    let mut verdict = HEART_E1;
+    verdict[20] = 0x01; // payload[13] = reverbSwitch 00 -> 01; gear byte [21]
+    session.push_reply(verdict); // actor's verification poll (stays 02)
+
+    let (mut core, mut rx) = core_of(VecDeque::from([Ok(session.clone())]));
+    core.tick();
+    assert_eq!(core.snapshot().status, ConnStatus::Connected);
+
+    core.pump([Command::SetReverb(true, 2)]);
+
+    let final_snap = core.snapshot();
+    assert_eq!(final_snap.status, ConnStatus::Connected);
+    let heart = final_snap.heart.expect("connected");
+    assert!(heart.reverb_switch, "device verdict: the written switch");
+    assert_eq!(heart.reverb_level, 2, "the request's gear byte");
+    assert_eq!(final_snap.pending_set, None, "verdict clears pending");
+
+    let written = session.written();
+    assert_eq!(written.len(), 4);
+    assert_eq!(written[2][4], 0x05, "SET_REVERB");
+    assert_eq!(written[2][6], 0x02, "payload len 2 — [isOpen, gear]");
+    assert_eq!(written[2][7], 0x01, "switch byte FIRST");
+    assert_eq!(written[2][8], 0x02, "gear byte = request");
+    assert_eq!(written[3][4], 0x1F, "verification GET");
+
+    let stream = drain(&mut rx);
+    let pendings: Vec<Option<PendingWrite>> = stream.iter().map(|s| s.pending_set).collect();
+    assert_eq!(
+        pendings.iter().filter(|p| p.is_some()).count(),
+        1,
+        "reverb pending appears exactly once"
+    );
+    assert_eq!(
+        pendings.iter().find(|p| p.is_some()).copied().flatten(),
+        Some(PendingWrite::Reverb(true, 2)),
+        "the single pending is the reverb write on the wire"
+    );
+}
+
 /// Coalescing is ONE bucket across control families: a batch's LAST SET
 /// command wins and the earlier ones vanish — cross-family (an NC switch
-/// replaced by an EQ pad; an EQ pad replaced by a gain stop) and within EQ
-/// itself (pad 2 replaced by pad 3 — the winning pad is the newest
-/// request). The final SET is byte-checked on the wire, and each batch's
-/// pending shows ONLY its winner.
+/// replaced by an EQ pad; an EQ pad replaced by a gain stop; a gain stop
+/// replaced by a reverb write; a reverb write replaced by an EQ pad) and
+/// within EQ itself (pad 2 replaced by pad 3 — the winning pad is the
+/// newest request). The final SET is byte-checked on the wire, and each
+/// batch's pending shows ONLY its winner.
 #[test]
 fn set_commands_coalesce_across_families_to_one_set() {
     let session = MockShared::default();
@@ -830,29 +894,80 @@ fn set_commands_coalesce_across_families_to_one_set() {
 
     core.pump([Command::SetGain(1)]);
 
+    // Batch 3's verdict (the scripted device answers per batch, it does not
+    // accumulate): the winning stop.
+    let mid3 = core.snapshot();
+    let heart3 = mid3.heart.expect("connected");
+    assert_eq!(heart3.voice_level, 1, "batch 3 verdict: the gain stop");
+    assert_eq!(heart3.eq_level, 3, "EQ stayed at its own verified pad");
+
+    // Batch 4 script: [SetGain(4), SetReverb(true, 1)] — a FOURTH family
+    // joins the one bucket: the newer reverb write replaces the gain intent
+    // the same way the gain replaced the EQ in batch 3.
+    session.push_reply(HEART_E1); // fresh GET for the reverb SET
+    session.push_reply(SET_REVERB_ACK); // its ack
+    let mut verdict4 = HEART_E1;
+    verdict4[20] = 0x01; // device settles on reverb switch 01
+    verdict4[21] = 0x01; // ...with the winning gear 1
+    session.push_reply(verdict4); // verification poll
+
+    core.pump([Command::SetGain(4), Command::SetReverb(true, 1)]);
+
+    let mid4 = core.snapshot();
+    let heart4 = mid4.heart.expect("connected");
+    assert!(heart4.reverb_switch, "batch 4 verdict: reverb on");
+    assert_eq!(heart4.reverb_level, 1, "batch 4 verdict: the gear");
+    assert_eq!(
+        heart4.voice_level, 3,
+        "the replaced gain never wrote (verdict = E1's own stop)"
+    );
+
+    // Batch 5 script: [SetReverb(false, 2), SetEq(3)] — the reverse
+    // direction: a newer EQ pad replaces a reverb intent.
+    session.push_reply(HEART_E1); // fresh GET for the EQ SET
+    session.push_reply(SET_EQ_ACK); // its ack
+    session.push_reply(HEART_E1); // verification poll (reverb never wrote)
+
+    core.pump([Command::SetReverb(false, 2), Command::SetEq(3)]);
+
     let final_snap = core.snapshot();
     assert_eq!(final_snap.status, ConnStatus::Connected);
     let heart = final_snap.heart.expect("connected");
-    assert_eq!(heart.voice_level, 1, "batch 3 verdict: the gain stop");
-    assert_eq!(heart.eq_level, 3, "EQ stayed at its own verified pad");
+    assert_eq!(heart.eq_level, 3, "batch 5 verdict: the winning EQ pad");
+    assert_eq!(
+        (heart.reverb_switch, heart.reverb_level),
+        (false, 2),
+        "the replaced reverb SET never went out (E1's own bytes)"
+    );
     assert_eq!(final_snap.pending_set, None);
 
     // Transcript: connect GET + batch-1 SET round trip + batch-2 SET round
-    // trip + batch-3 SET round trip, NOTHING else — no SET_NOISE frame from
-    // the replaced command, no second SET for a replaced pad.
+    // trip + batch-3 SET round trip + batch-4 SET round trip + batch-5 SET
+    // round trip, NOTHING else — no SET_NOISE frame from the replaced
+    // command, no second SET for a replaced pad, no SET_REVERB from a
+    // replaced reverb intent.
     let written = session.written();
-    assert_eq!(written.len(), 10);
+    assert_eq!(written.len(), 16);
     assert_eq!(written[2][4], 0x07, "batch 1: the ONLY SET is SET_EQ");
     assert_eq!(written[2][7], 0x03, "batch 1: request");
     assert_eq!(written[5][4], 0x07, "batch 2: the ONLY SET is SET_EQ");
     assert_eq!(written[5][7], 0x03, "batch 2: the NEWEST pad wins");
     assert_eq!(written[8][4], 0x03, "batch 3: the ONLY SET is SET_GAIN");
     assert_eq!(written[8][7], 0x01, "batch 3: the gain stop");
+    assert_eq!(written[11][4], 0x05, "batch 4: the ONLY SET is SET_REVERB");
+    assert_eq!(
+        &written[11][7..9],
+        &[0x01, 0x01],
+        "batch 4: the winning pair [isOpen, gear]"
+    );
+    assert_eq!(written[14][4], 0x07, "batch 5: the ONLY SET is SET_EQ");
+    assert_eq!(written[14][7], 0x03, "batch 5: the EQ pad");
     for (i, frame) in written.iter().enumerate() {
-        if i != 2 && i != 5 && i != 8 {
+        if i != 2 && i != 5 && i != 8 && i != 11 && i != 14 {
             assert_ne!(frame[4], 0x07, "no extra SET_EQ frame at {i}");
             assert_ne!(frame[4], 0x13, "no SET_NOISE frame at {i}");
             assert_ne!(frame[4], 0x03, "no extra SET_GAIN frame at {i}");
+            assert_ne!(frame[4], 0x05, "no extra SET_REVERB frame at {i}");
         }
     }
 
@@ -863,10 +978,12 @@ fn set_commands_coalesce_across_families_to_one_set() {
     assert_eq!(
         some,
         vec![
-            PendingWrite::Eq(3),   // batch 1 winner
-            PendingWrite::Eq(3),   // batch 2 winner
-            PendingWrite::Gain(1), // batch 3 winner
+            PendingWrite::Eq(3),           // batch 1 winner
+            PendingWrite::Eq(3),           // batch 2 winner
+            PendingWrite::Gain(1),         // batch 3 winner
+            PendingWrite::Reverb(true, 1), // batch 4 winner
+            PendingWrite::Eq(3),           // batch 5 winner
         ],
-        "exactly the three winning writes ever pended"
+        "exactly the five winning writes ever pended"
     );
 }

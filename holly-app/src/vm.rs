@@ -66,9 +66,15 @@ pub const VID_PID: &str = "3547:0407";
 ///   ack `00` → hearts settled on the written stop
 ///   (captures/raw/set_gain_roundtrip.pcap + captures/
 ///   set_gain_roundtrip.jsonl; roadmap §1 route (b), checklist §3 Gain row)
+/// - `reverb` — SET_REVERB (cmd 5) [wire] PC-originated guarded round trip
+///   2026-11-11: frames `05 03 AA DD 05 00 02 {01 00, 01 01, 00 00} EF` →
+///   acks `00` → hearts settled on the written pair (§5 offsets 13/14)
+///   (captures/raw/set_reverb_roundtrip.pcap + captures/
+///   set_reverb_roundtrip.jsonl; roadmap §1 route (b), checklist §3
+///   Reverb row)
 /// - everything else is [code] at best (mic mute cmd 22, light cmd 33,
-///   reverb 5, shutdown 39/40 …) and has never been captured, so it stays
-///   read-only today.
+///   shutdown 39/40 …) and has never been captured, so it stays read-only
+///   today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Writable {
     pub nc_toggle: bool,
@@ -91,7 +97,7 @@ pub const WRITABLE: Writable = Writable {
     volume: true,
     channel_mode: false,
     eq: true,
-    reverb: false,
+    reverb: true,
     mic_recognition: false,
     schedule_power_off: false,
     indicator_light: false,
@@ -226,6 +232,33 @@ pub fn reverb_selection(reverb_level: u8) -> Option<usize> {
     (reverb_level <= 2).then_some(reverb_level as usize)
 }
 
+/// The inverse translation a UI gear pick needs: a DISPLAY-order pad index
+/// ([`reverb_selection`]'s space) -> the WIRE byte `set_reverb` writes.
+/// Identity on 0..=2: the checklist §3 Reverb row's write space IS the §5.2
+/// read space — identity write-verified [wire, 2026-11-11 reverb run: the
+/// 0→1 gear flip landed while the switch was on, protocol.md §4 row 5/6].
+/// Pure function like [`volume_pad_wire`] so frontends never hardcode
+/// device values; unmapped (out of 0..=2) returns None.
+pub fn reverb_gear_wire(index: usize) -> Option<u8> {
+    (index <= 2).then_some(index as u8)
+}
+
+/// The reverb toggle's WIRE pair `(switch, gear)`: the requested switch
+/// byte plus the device's CURRENT gear as the value byte — the APK's
+/// switch handler sends the remembered `reverbType` on BOTH directions
+/// (`setReverb(this.reverbType, z)`, HLDevice6302Activity.java:792-793),
+/// and the 2026-11-11 round trip proved the gear byte rides UNTOUCHED
+/// through a toggle on the write path (frame 22 `05 03 AA DD 05 00 02
+/// 01 00 EF` written to a resting (off, gear 0) device — protocol.md §4
+/// row 5/6). An unknown gear (`None` — a byte outside the certified
+/// 0..=2 space, or no heart yet) falls back to the APK's own default: the
+/// field initializes to GEAR_ONE = 0 [code
+/// HLDevice6302Activity.java:341, `DeviceConnectVariable.Reverb`]. Pure
+/// function so frontends never hardcode device values.
+pub fn reverb_toggle_wire(switch: bool, gear: Option<u8>) -> (bool, u8) {
+    (switch, gear.unwrap_or(0))
+}
+
 /// The NC panel's status word: one place, driven ONLY by NcVm — a pending
 /// (actor-reported, latest-wins) write says "Applying" while the panel keeps
 /// showing the previous device state; an unknown state is "Unavailable".
@@ -321,10 +354,25 @@ pub struct GainVm {
     pub applying: bool,
 }
 
+/// Reverb state: the DEVICE's current switch and gear bytes, plus whether
+/// a reverb write is in flight. `enabled` is the verified switch byte
+/// (§5 offset 13) — None only where no heart exists, so a toggle never
+/// invents a flip target; `gear` is Some only for a byte in the certified
+/// space 0..=2 (§5 offset 14, see [`reverb_selection`]) — an unknown byte
+/// is no selection and never rides a toggle ([`reverb_toggle_wire`]'s
+/// GEAR_ONE fallback covers it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ReverbVm {
-    pub enabled: bool,
-    pub level: u8,
+    /// The device's current reverb switch (the ONLY value the toggle may
+    /// display as actual state; changes only via snapshots).
+    pub enabled: Option<bool>,
+    /// The device's current gear byte (§5 offset 14), Some only inside the
+    /// certified 0..=2 space; None = no certified selection.
+    pub gear: Option<u8>,
+    /// A reverb SET (only ever [`PendingWrite::Reverb`]) is in flight —
+    /// the panel's controls dim and ignore picks until the device's
+    /// verdict.
+    pub applying: bool,
 }
 
 /// Read-only panels for exactly what HeartInfo verifiably provides
@@ -471,7 +519,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                     // never greys the NC controls (and vice versa).
                     pending: match s.pending_set {
                         Some(PendingWrite::Noise(w)) => Some(w),
-                        Some(PendingWrite::Eq(_)) | Some(PendingWrite::Gain(_)) | None => None,
+                        Some(PendingWrite::Eq(_))
+                        | Some(PendingWrite::Gain(_))
+                        | Some(PendingWrite::Reverb(_, _))
+                        | None => None,
                     },
                     last_error: None,
                 },
@@ -489,8 +540,13 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 shutdown: shutdown_selection(heart.shutdown_time),
                 signal_mode: Some(heart.signal_mode),
                 reverb: Some(ReverbVm {
-                    enabled: heart.reverb_switch,
-                    level: heart.reverb_level,
+                    enabled: Some(heart.reverb_switch),
+                    // The certified gear byte only: `reverb_selection`'s
+                    // 0..=2 space, mapped back to the wire byte. Anything
+                    // else (a byte outside the APK's GEAR_ONE..THREE) is
+                    // no selection and never rides a toggle.
+                    gear: reverb_selection(heart.reverb_level).map(|pad| pad as u8),
+                    applying: matches!(s.pending_set, Some(PendingWrite::Reverb(_, _))),
                 }),
                 updated: s.received_at,
             }
@@ -755,8 +811,9 @@ mod tests {
         assert_eq!(
             vm.reverb,
             Some(ReverbVm {
-                enabled: false,
-                level: 2
+                enabled: Some(false),
+                gear: Some(2),
+                applying: false
             })
         );
         // The formerly-dropped fields: E1's own bytes (cite §5 offsets).
@@ -945,6 +1002,107 @@ mod tests {
         assert!(!gain.eq.applying, "EQ panel never sees a gain write");
     }
 
+    /// The click path's inverse for Reverb gears: display pads 0..=2 map to
+    /// the wire bytes 0..=2 — IDENTITY, because the checklist §3 Reverb
+    /// row's write space is the §5.2 read space (identity write-verified
+    /// [wire, 2026-11-11 reverb run: the 0→1 gear flip landed while the
+    /// switch was on]). Unmapped indices stay unmapped, and the VM's
+    /// connected shape carries the CERTIFIED byte only.
+    #[test]
+    fn reverb_gear_wire_roundtrips_reverb_selection() {
+        for wire in 0..=2u8 {
+            assert_eq!(
+                reverb_gear_wire(wire as usize),
+                Some(wire),
+                "pad {wire} is its own wire byte"
+            );
+            assert_eq!(reverb_selection(wire), Some(wire as usize), "wire {wire}");
+            let mut heart = e1();
+            heart.reverb_level = wire;
+            let vm = view_model(&snap(ConnStatus::Connected, Some(heart), None, None));
+            assert_eq!(vm.reverb.as_ref().expect("connected").gear, Some(wire));
+            assert_eq!(
+                reverb_gear_wire(
+                    vm.reverb
+                        .as_ref()
+                        .and_then(|r| r.gear)
+                        .and_then(reverb_selection)
+                        .expect("certified byte maps")
+                ),
+                Some(wire)
+            );
+        }
+        assert_eq!(reverb_gear_wire(3), None, "out of the three-pad space");
+        assert_eq!(reverb_gear_wire(usize::MAX), None);
+        // An UNMAPPED heart byte is no selection at all (never a guess):
+        let mut heart = e1();
+        heart.reverb_level = 3;
+        let vm = view_model(&snap(ConnStatus::Connected, Some(heart), None, None));
+        assert_eq!(
+            vm.reverb.as_ref().expect("connected").gear,
+            None,
+            "byte 3 has no certified gear"
+        );
+    }
+
+    /// The toggle's wire pair: the APK's switch handler sends the
+    /// remembered `reverbType` on BOTH directions
+    /// (HLDevice6302Activity.java:792-793 [code]) — and the 2026-11-11 run
+    /// proved the gear byte rides untouched through a toggle [wire]. An
+    /// unknown gear falls back to the APK's own default GEAR_ONE = 0
+    /// (`:341` [code]).
+    #[test]
+    fn reverb_toggle_wire_sends_the_remembered_gear() {
+        assert_eq!(
+            reverb_toggle_wire(true, Some(0)),
+            (true, 0),
+            "the run's toggle leg: switch on, starting gear rides [wire]"
+        );
+        assert_eq!(
+            reverb_toggle_wire(false, Some(1)),
+            (false, 1),
+            "restore = the full pair, gear remembered [wire frame 46]"
+        );
+        assert_eq!(
+            reverb_toggle_wire(true, Some(2)),
+            (true, 2),
+            "a certified gear always passes through"
+        );
+        assert_eq!(
+            reverb_toggle_wire(true, None),
+            (true, 0),
+            "unknown gear falls back to GEAR_ONE(0) [code :341]"
+        );
+        assert_eq!(reverb_toggle_wire(false, None), (false, 0));
+    }
+
+    /// Panels gate on their OWN pending only: an in-flight reverb write
+    /// (`PendingWrite::Reverb`) shows `applying` on the reverb panel while
+    /// every other panel stays untouched. (`WRITABLE.reverb` is pinned
+    /// separately by `writable_table_matches_the_certified_chain`.)
+    #[test]
+    fn reverb_applying_is_family_scoped_and_writable() {
+        let vm = view_model(&snap(
+            ConnStatus::Connected,
+            Some(e1()),
+            Some(PendingWrite::Reverb(true, 2)),
+            None,
+        ));
+        let reverb = vm.reverb.expect("connected");
+        assert!(reverb.applying, "a reverb write dims the reverb panel");
+        assert_eq!(
+            (reverb.enabled, reverb.gear),
+            (Some(false), Some(2)),
+            "selection stays the device's (no pending target shown)"
+        );
+        assert_eq!(vm.nc.pending, None, "NC panel never sees a reverb write");
+        assert!(!vm.eq.applying, "EQ panel never sees a reverb write");
+        assert!(
+            !vm.volume.applying,
+            "Volume panel never sees a reverb write"
+        );
+    }
+
     /// Panels gate on their OWN pending only: an in-flight EQ write
     /// (`PendingWrite::Eq`) shows `applying` on the EQ panel while the NC
     /// panel stays untouched (pending None), and the reverse.
@@ -1014,7 +1172,8 @@ mod tests {
     /// its capture lands (docs/gui-roadmap.md §1 gate). EQ joined via its
     /// PC-originated guarded round trip ([wire] 2026-11-09;
     /// captures/set_eq_roundtrip.jsonl); Volume joined the same route
-    /// (b) on 2026-11-10 (captures/set_gain_roundtrip.jsonl).
+    /// (b) on 2026-11-10 (captures/set_gain_roundtrip.jsonl); Reverb on
+    /// 2026-11-11 (captures/set_reverb_roundtrip.jsonl).
     #[test]
     fn writable_table_matches_the_certified_chain() {
         let all_read_only = Writable {
@@ -1036,6 +1195,7 @@ mod tests {
                 nc_level: true,
                 eq: true,
                 volume: true,
+                reverb: true,
                 ..all_read_only
             }
         );

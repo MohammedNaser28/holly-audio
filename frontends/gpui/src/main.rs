@@ -98,9 +98,9 @@ use gpui::{
 use holly_app::DeviceHandle;
 use holly_app::demo::DemoScenario;
 use holly_app::vm::{
-    Banner, DEVICE_NAME, EqVm, GainVm, NcVm, TxVm, VID_PID, ViewModel, WRITABLE,
+    Banner, DEVICE_NAME, EqVm, GainVm, NcVm, ReverbVm, TxVm, VID_PID, ViewModel, WRITABLE,
     battery_segment_count, conn_status_word, eq_pad_wire, mic_status, mute_label, nc_level_label,
-    nc_status, reverb_selection, view_model, volume_pad_wire,
+    nc_status, reverb_gear_wire, reverb_selection, reverb_toggle_wire, view_model, volume_pad_wire,
 };
 
 actions!(
@@ -114,6 +114,9 @@ actions!(
         EqNext,
         VolumePrev,
         VolumeNext,
+        ToggleReverb,
+        ReverbPrev,
+        ReverbNext,
         Refresh,
         Quit
     ]
@@ -432,8 +435,9 @@ fn radio_group(labels: &[&'static str], selected: Option<usize>) -> gpui::Div {
 }
 
 /// The small on/off switch (48×26 track, 20px thumb; reference `tog()`).
-/// Rendered READ-ONLY: the app's toggles other than NC are unmapped, so a
-/// switch shows the wire-read state at full opacity and no interaction.
+/// The pill itself adds NO interaction — it renders the wire-read state at
+/// full opacity; an interactive caller wraps it (the reverb switch is the
+/// only one today) and owns the click/keyboard wiring outside.
 fn toggle_switch(on: bool) -> gpui::Div {
     let track = div()
         .relative()
@@ -594,6 +598,49 @@ fn volume_pick(index: usize, volume: &GainVm) -> VolumePick {
     VolumePick::Write
 }
 
+/// Write gate for the Reverb panel: the certified family AND nothing in
+/// flight — the same conjunction as [`eq_write_accepted`] (the
+/// `WRITABLE.reverb` half is vm.rs's pinned table; the `applying` half
+/// comes from the actor-reported `ReverbVm`).
+fn reverb_write_accepted(reverb: &ReverbVm) -> bool {
+    WRITABLE.reverb && !reverb.applying
+}
+
+/// May THIS reverb toggle go out right now? Guard for the switch flip: the
+/// family gate plus a VERIFIED switch state — the flip target is
+/// `!enabled`, and an unknown state never invents one (same rule as
+/// [`nc_write_accepted`]). The device's current gear rides along in the
+/// handler.
+fn reverb_toggle_accepted(reverb: &ReverbVm) -> bool {
+    reverb_write_accepted(reverb) && reverb.enabled.is_some()
+}
+
+/// Decision for ONE reverb gear pick — parallel to [`EqPick`]: blocked (the
+/// family is read-only, a reverb write is in flight, or the switch state is
+/// unverified), noop (that gear is already the device's verified selection
+/// while ON), else write. A pick with the switch verified OFF still WRITES:
+/// the APK's gear buttons send `isOpen=true` unconditionally
+/// (HLDevice6302Activity.java:759/:769/:779 [code]), so the pick turns
+/// reverb on with that gear — [wire] the 2026-11-11 round trip's SET legs
+/// all carried explicit `[isOpen, gear]` pairs. NO pending target is ever
+/// displayed — the selection moves on the device's verdict only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReverbPick {
+    Blocked,
+    Noop,
+    Write,
+}
+
+fn reverb_pick(index: usize, reverb: &ReverbVm) -> ReverbPick {
+    if !reverb_write_accepted(reverb) || reverb.enabled.is_none() {
+        return ReverbPick::Blocked;
+    }
+    if reverb.enabled == Some(true) && reverb.gear == Some(index as u8) {
+        return ReverbPick::Noop;
+    }
+    ReverbPick::Write
+}
+
 /// Banner decoration per kind, decided ONLY from `Banner` (the design
 /// colour rule: amber = needs attention, red = error, grey = everything
 /// else; container stays on the designed BANNER_BG/BANNER_LINE). The
@@ -669,6 +716,13 @@ struct AppModel {
     /// its own "volume_selector" key context (Left/Right there step the six
     /// stops, disjoint from the EQ well's bindings).
     volume_focus: FocusHandle,
+    /// The Reverb size selector's keyboard handle — same rule as the other
+    /// selector wells, its own "reverb_selector" key context (Left/Right
+    /// step the three gears while it holds focus).
+    reverb_focus: FocusHandle,
+    /// The Reverb switch's keyboard handle — its own "reverb_toggle" key
+    /// context (Space/Enter flip while the switch wrapper holds focus).
+    reverb_toggle_focus: FocusHandle,
     vm: ViewModel,
     device: DeviceHandle,
     demo: Option<DemoScenario>,
@@ -790,6 +844,65 @@ impl AppModel {
 
     fn on_volume_next(&mut self, _: &VolumeNext, _: &mut Window, cx: &mut Context<Self>) {
         self.volume_step(1, cx);
+    }
+
+    /// The reverb toggle's single flip path (Space/Enter via the action,
+    /// click via the switch wrapper); [`reverb_toggle_accepted`] is the
+    /// whole gate. The flip target is computed from the VERIFIED state; the
+    /// device's current gear rides along — the APK's switch handler sends
+    /// the remembered `reverbType` (HLDevice6302Activity.java:792-793
+    /// [code]), and an unknown gear falls back to the APK's own default
+    /// GEAR_ONE(0) (`:341`) — [`reverb_toggle_wire`] is the whole
+    /// translation.
+    fn flip_reverb(&mut self) {
+        if let Some(reverb) = self.vm.reverb.as_ref()
+            && reverb_toggle_accepted(reverb)
+            && let Some(enabled) = reverb.enabled
+        {
+            let (switch, gear) = reverb_toggle_wire(!enabled, reverb.gear);
+            self.device.set_reverb(switch, gear);
+        }
+    }
+
+    fn on_toggle_reverb(&mut self, _: &ToggleReverb, _: &mut Window, _: &mut Context<Self>) {
+        self.flip_reverb();
+    }
+
+    /// One reverb gear pick for mouse AND keyboard — [`reverb_pick`] is the
+    /// whole decision (read-only family / in-flight write / unverified
+    /// switch: blocked; the ON device's own gear: noop; else write). The
+    /// WIRE pair is (switch on, the picked gear) — the APK's gear buttons
+    /// (`HLDevice6302Activity.java:759/:769/:779` [code]); the byte comes
+    /// from the VM's tested translation ([`reverb_gear_wire`]) — this file
+    /// never names a device gear value.
+    fn set_reverb_gear(&mut self, index: usize) {
+        if let Some(reverb) = self.vm.reverb.as_ref()
+            && reverb_pick(index, reverb) == ReverbPick::Write
+            && let Some(wire) = reverb_gear_wire(index)
+        {
+            self.device.set_reverb(true, wire);
+        }
+    }
+
+    /// Left/Right stepping over the three gears (same context-scoped rule
+    /// as the EQ/Volume wells; NC's global 1/2/3 stay untouched). With no
+    /// verified selection the step is a noop: the VM's gear is the only
+    /// cursor, matching the "no pending target" rule.
+    fn reverb_step(&mut self, step: isize) {
+        if let Some(gear) = self.vm.reverb.as_ref().and_then(|r| r.gear) {
+            let next = gear as isize + step;
+            if (0..=2).contains(&next) {
+                self.set_reverb_gear(next as usize);
+            }
+        }
+    }
+
+    fn on_reverb_prev(&mut self, _: &ReverbPrev, _: &mut Window, _: &mut Context<Self>) {
+        self.reverb_step(-1);
+    }
+
+    fn on_reverb_next(&mut self, _: &ReverbNext, _: &mut Window, _: &mut Context<Self>) {
+        self.reverb_step(1);
     }
 
     fn refresh_now(&mut self, _: &mut Context<Self>) {
@@ -1036,7 +1149,7 @@ impl AppModel {
                             .flex()
                             .gap(px(theme::metrics::SPACE_4))
                             .child(self.eq_panel(cx).flex_1())
-                            .child(self.reverb_panel().flex_1()),
+                            .child(self.reverb_panel(cx).flex_1()),
                     )
                     .child(
                         div()
@@ -1663,12 +1776,22 @@ impl AppModel {
             .child(radio_group(labels, selected))
     }
 
-    /// Reverb panel: title + read-only state toggle (`ReverbVm.enabled`,
-    /// wire-read) + the size selector row, shown only while reverb is ON
-    /// (reference `sc-if reverbOn`, index.html:139); the gear pads
-    /// select the wire byte identically (0..=2 — `reverb_selection`).
-    fn reverb_panel(&self) -> gpui::Div {
-        let enabled = self.vm.reverb.is_some_and(|reverb| reverb.enabled);
+    /// Reverb panel — INTERACTIVE since the reverb round trip (2026-11-11):
+    /// the switch flips through `set_reverb` (opposite of the VERIFIED
+    /// state, the device's current gear riding along — `reverb_toggle_wire`)
+    /// and the size pads send (switch on, that gear) through the same actor
+    /// path as the other controls, gated by `reverb_toggle_accepted`
+    /// /`reverb_pick`. While a reverb write is in flight
+    /// (`ReverbVm.applying`) BOTH controls dim to 0.5 (the established dim)
+    /// and all picks are ignored — the snapshot's POST-SET poll moves
+    /// everything (no pending target is ever shown). The selector keeps the
+    /// read-only radio_group recipe byte-for-byte (row well, 36px pads,
+    /// matte selected pad + tungsten bar) — only behaviour is added; the
+    /// focus outline reuses the rocker's 2px tungsten rule.
+    fn reverb_panel(&self, cx: &Context<Self>) -> gpui::Div {
+        let reverb = self.vm.reverb.as_ref();
+        let enabled = reverb.and_then(|r| r.enabled);
+        let applying = reverb.is_some_and(|r| r.applying);
         panel()
             .flex_1()
             .justify_center()
@@ -1684,20 +1807,129 @@ impl AppModel {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Reverb adjustment"),
                     )
-                    .child(toggle_switch(enabled)),
+                    .child(self.reverb_toggle(enabled, applying, cx)),
             )
-            .children(enabled.then(|| {
-                radio_group(
-                    &["Small", "Medium", "Large"], // [code index.html:140]
-                    // GEAR_ONE..THREE = wire 0..2, and the APK's gear
-                    // strings ARE these words [code
-                    // DeviceConnectVariable.Reverb + hldevice_6108.xml:792-794].
-                    self.vm
-                        .reverb
-                        .as_ref()
-                        .and_then(|reverb| reverb_selection(reverb.level)),
-                )
-            }))
+            .children((enabled == Some(true)).then(|| self.reverb_selector(applying, cx)))
+    }
+
+    /// The panel's switch: the read-only `toggle_switch` pill wrapped in
+    /// the keyboard shell (track_focus + "reverb_toggle" context + the
+    /// rocker's 2px tungsten focus outline) and — ONLY while the flip may
+    /// go out — a click listener. The wrapper adds NO padding: it is the
+    /// pill's own footprint, so the row's space-between keeps the toggle
+    /// exactly where the read-only render had it.
+    fn reverb_toggle(
+        &self,
+        enabled: Option<bool>,
+        applying: bool,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let reverb = self.vm.reverb.as_ref();
+        let mut shell = div()
+            .id("reverb-toggle")
+            .rounded(px(theme::metrics::TOGGLE_RADIUS))
+            .track_focus(&self.reverb_toggle_focus)
+            .key_context("reverb_toggle")
+            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
+            .when(applying, |t| t.opacity(0.5))
+            .child(toggle_switch(enabled == Some(true)));
+        if let Some(reverb) = reverb
+            && reverb_toggle_accepted(reverb)
+        {
+            shell = shell.on_click(cx.listener(|this, _: &ClickEvent, _, _| this.flip_reverb()));
+        }
+        shell
+    }
+
+    /// The panel's size selector: the read-only radio_group recipe
+    /// (radio_group + the APK's gear strings, selected from the certified
+    /// byte) with the interactive shell added on top — track_focus +
+    /// "reverb_selector" context + the rocker's 2px tungsten focus outline,
+    /// per-pad click listeners (gated by `reverb_pick`), and the 0.5 dim
+    /// while a reverb write is in flight. Shown only while the switch is
+    /// verified ON (reference `sc-if reverbOn`, index.html:139).
+    fn reverb_selector(&self, applying: bool, cx: &Context<Self>) -> gpui::Div {
+        let reverb = self.vm.reverb.as_ref();
+        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
+            .flex_row()
+            .p(px(theme::metrics::SELECTOR_PADDING))
+            .gap(px(theme::metrics::SELECTOR_GAP))
+            .track_focus(&self.reverb_focus)
+            .key_context("reverb_selector")
+            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
+            .when(applying, |g| g.opacity(0.5));
+        const REVERB_GEARS: [&str; 3] = ["Small", "Medium", "Large"]; // [code index.html:140]
+        for (index, label) in REVERB_GEARS.iter().enumerate() {
+            // The device's verified gear drives the selection — no pending
+            // target is ever shown.
+            let selected = reverb.and_then(|r| r.gear).and_then(reverb_selection) == Some(index);
+            let pick = reverb.map(|r| reverb_pick(index, r));
+            let mut option = div()
+                .flex_1()
+                .min_w_0()
+                .h(px(theme::metrics::SELECTOR_HEIGHT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
+                .text_size(px(theme::text::BODY_SIZE))
+                .when(selected, |o| {
+                    o.bg(linear_gradient(
+                        180.,
+                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
+                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
+                    ))
+                    .text_color(solid(theme::color::TEXT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .shadow(matte_under_edge(1.))
+                })
+                .when(!selected, |o| {
+                    o.text_color(solid(theme::color::TEXT_2))
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .child(*label)
+                .relative();
+            if selected {
+                // the 14×2 tungsten indicator bar under the selected pad
+                // (index.html:111; glow `0 0 6px rgba(255,181,71,.6)`)
+                option = option.child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(4.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
+                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
+                                .rounded(px(1.))
+                                .bg(solid(theme::color::TUNGSTEN))
+                                .shadow(vec![BoxShadow {
+                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
+                                        .opacity(0.6),
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(6.),
+                                    spread_radius: px(0.),
+                                }]),
+                        ),
+                );
+            }
+            let option = if pick.is_some_and(|p| p != ReverbPick::Blocked) {
+                option
+                    .id(ElementId::named_usize("reverb-gear", index))
+                    .hover(|s| s.cursor_pointer())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+                        this.set_reverb_gear(index);
+                    }))
+                    .into_any_element()
+            } else {
+                option.into_any_element()
+            };
+            group = group.child(option);
+        }
+        group
     }
 
     /// Mic recognition / Indicator light panels (the 120px row halves): the
@@ -1895,6 +2127,9 @@ impl Render for AppModel {
             .on_action(cx.listener(Self::on_eq_next))
             .on_action(cx.listener(Self::on_volume_prev))
             .on_action(cx.listener(Self::on_volume_next))
+            .on_action(cx.listener(Self::on_toggle_reverb))
+            .on_action(cx.listener(Self::on_reverb_prev))
+            .on_action(cx.listener(Self::on_reverb_next))
             .on_action(cx.listener(Self::on_refresh))
             .child(self.render_titlebar())
             .children(self.render_banner(cx))
@@ -1951,10 +2186,12 @@ fn main() {
             // window ROOT (window.rs:3982-3988), which carries the
             // corresponding on_action listeners. Left/Right step the EQ
             // pads ONLY while the EQ well is focused (key context
-            // "eq_selector"), and the Volume stops ONLY while the volume
-            // well is focused ("volume_selector") — the design defines no
-            // inter-selector arrow keys (no invented global bindings
-            // stealing NC's 1/2/3).
+            // "eq_selector"), the Volume stops ONLY while the volume
+            // well is focused ("volume_selector"), and the reverb gears
+            // ONLY while the reverb well is focused ("reverb_selector");
+            // Space/Enter flip the reverb switch only inside
+            // "reverb_toggle" — the design defines no inter-selector arrow
+            // keys (no invented global bindings stealing NC's 1/2/3).
             cx.bind_keys([
                 KeyBinding::new("space", ToggleNoise, Some("nc_rocker")),
                 KeyBinding::new("enter", ToggleNoise, Some("nc_rocker")),
@@ -1966,6 +2203,15 @@ fn main() {
                 // bindings.
                 KeyBinding::new("left", VolumePrev, Some("volume_selector")),
                 KeyBinding::new("right", VolumeNext, Some("volume_selector")),
+                // Space/Enter flip the reverb switch ONLY while the switch
+                // wrapper is focused ("reverb_toggle"); Left/Right step the
+                // gears ONLY while the selector well is focused
+                // ("reverb_selector") — three disjoint selector contexts,
+                // no invented global bindings.
+                KeyBinding::new("space", ToggleReverb, Some("reverb_toggle")),
+                KeyBinding::new("enter", ToggleReverb, Some("reverb_toggle")),
+                KeyBinding::new("left", ReverbPrev, Some("reverb_selector")),
+                KeyBinding::new("right", ReverbNext, Some("reverb_selector")),
                 KeyBinding::new("1", NcLow, None),
                 KeyBinding::new("2", NcMedium, None),
                 KeyBinding::new("3", NcStrong, None),
@@ -2037,10 +2283,14 @@ fn main() {
                             focus.focus(window);
                             let eq_focus = cx.focus_handle();
                             let volume_focus = cx.focus_handle();
+                            let reverb_focus = cx.focus_handle();
+                            let reverb_toggle_focus = cx.focus_handle();
                             AppModel {
                                 focus,
                                 eq_focus,
                                 volume_focus,
+                                reverb_focus,
+                                reverb_toggle_focus,
                                 vm: ViewModel::default(),
                                 device,
                                 demo,

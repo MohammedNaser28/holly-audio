@@ -144,6 +144,13 @@ pub trait StatusSource {
     /// returns the fresh GET's PRE-write stop (restore-flow datum) exactly
     /// like set_eq; the actor's verdict comes from its own post-SET poll.
     fn set_gain(&mut self, stop: u8) -> Result<u8, Error>;
+    /// One SET_REVERB round trip — the pair `(switch, gear)` in the WIRE
+    /// value spaces (switch free, gear 0..=2, §5.2 Reverb row; write space ==
+    /// read space, identity); the frame carries the pair in the APK's
+    /// `[isOpen, gear]` order, switch FIRST (checklist §3). set_reverb
+    /// returns the fresh GET's PRE-write pair (restore-flow datum) exactly
+    /// like set_gain; the actor's verdict comes from its own post-SET poll.
+    fn set_reverb(&mut self, switch: bool, gear: u8) -> Result<(bool, u8), Error>;
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {
@@ -165,6 +172,10 @@ impl<T: Transport> StatusSource for HollyControl<T> {
 
     fn set_gain(&mut self, stop: u8) -> Result<u8, Error> {
         HollyControl::set_gain(self, stop)
+    }
+
+    fn set_reverb(&mut self, switch: bool, gear: u8) -> Result<(bool, u8), Error> {
+        HollyControl::set_reverb(self, switch, gear)
     }
 }
 
