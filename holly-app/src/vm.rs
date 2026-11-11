@@ -209,6 +209,24 @@ pub fn channel_mode_pad_wire(index: usize) -> Option<u8> {
     (index <= 1).then_some(index as u8)
 }
 
+/// The Stereo pad's gate: BOTH transmitters must be VERIFIED connected
+/// before Stereo may be enabled. [owner 2026-11-12 — a product rule
+/// STRICTER than both certified layers: the APK gates both mode pads only
+/// on `isAllMicOffline` = `isAllowSet()` = ANY transmitter online
+/// (`tx1Status || tx2Status || tx3Status || tx4Status`,
+/// `HLDevice6302Activity.java:1947-1949`, applied at the mode branches
+/// :1647-:1666), and the DEVICE accepted and held voiceMode 01 while TX1
+/// was offline [wire, 2026-11-11 round trip: writes acked, hearts settled
+/// at 01 with payload[0] = 00]. The APK's own both-mics rule
+/// (`tx1Status && tx2Status`) belongs to mic recognition (:805) and the
+/// custom-function entry (:829), NOT to stereo.] Mono stays selectable on
+/// any verified heart — the owner scoped the rule to Stereo; the APK's
+/// all-offline mono gate is noted, not adopted. Pure function so the VM
+/// carries the rule and frontends never restate it.
+pub fn stereo_allowed(tx1_connected: bool, tx2_connected: bool) -> bool {
+    tx1_connected && tx2_connected
+}
+
 /// The Schedule-panel's selected pad: `quarterTime` ("15min") = 0,
 /// `neverTime` ("Never") = 1 [code
 /// `HLDevice6302Activity.java:1864-1866`, driven by
@@ -410,6 +428,10 @@ pub struct ChannelModeVm {
     /// Pad index of the active mode (0 = Mono, 1 = Stereo — [code
     /// `HLDevice6302Activity.java:1803-1805`]).
     pub selected: Option<usize>,
+    /// Whether the Stereo pad may be enabled right now: BOTH transmitters
+    /// verified connected ([`stereo_allowed`]'s rule). Mono is never
+    /// gated by it.
+    pub stereo_ok: bool,
     /// A channel-mode SET (only ever [`PendingWrite::ChannelMode`]) is in
     /// flight — the selector dims and ignores picks until the device's
     /// verdict.
@@ -518,6 +540,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
             mic_recognition: None,
             channel_mode: ChannelModeVm {
                 selected: None,
+                stereo_ok: false,
                 applying: false,
             },
             shutdown: None,
@@ -626,6 +649,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 mic_recognition: Some(heart.tx_identify),
                 channel_mode: ChannelModeVm {
                     selected: channel_mode_selection(heart.voice_mode),
+                    stereo_ok: stereo_allowed(heart.tx1_status, heart.tx2_status),
                     applying: matches!(s.pending_set, Some(PendingWrite::ChannelMode(_))),
                 },
                 shutdown: shutdown_selection(heart.shutdown_time),
@@ -671,6 +695,7 @@ fn disconnected_core() -> ViewModel {
         mic_recognition: None,
         channel_mode: ChannelModeVm {
             selected: None,
+            stereo_ok: false,
             applying: false,
         },
         shutdown: None,
@@ -934,6 +959,7 @@ mod tests {
             vm.channel_mode,
             ChannelModeVm {
                 selected: Some(0), // voiceMode 0 = Mono [9]
+                stereo_ok: false,  // E1: TX1 offline — stereo stays gated
                 applying: false
             }
         );
@@ -1194,6 +1220,38 @@ mod tests {
             !channel.reverb.as_ref().expect("connected").applying,
             "Reverb panel never sees a channel write"
         );
+    }
+
+    /// The Stereo gate is the VERIFIED LINKS, not the mode byte: both TXs
+    /// verified connected opens Stereo [owner 2026-11-12]; one or both
+    /// offline keeps it gated. (APK contrast: `isAllowSet` = any TX online
+    /// is enough there [code :1947-1949] — the rule here is deliberately
+    /// stricter; see [`stereo_allowed`]'s full evidence note.)
+    #[test]
+    fn stereo_allowed_needs_both_verified_links() {
+        assert!(stereo_allowed(true, true), "both verified: stereo opens");
+        assert!(!stereo_allowed(false, true), "TX1 off: gated");
+        assert!(!stereo_allowed(true, false), "TX2 off: gated");
+        assert!(!stereo_allowed(false, false), "both off: gated");
+
+        // The connected VM carries it from the heart's own status bytes:
+        // E1 (TX1 off / TX2 on) is gated; the same heart with TX1 verified
+        // on is not.
+        let vm = view_model(&snap(ConnStatus::Connected, Some(e1()), None, None));
+        assert!(!vm.channel_mode.stereo_ok, "E1 links: TX1 off gates stereo");
+        let mut both = e1();
+        both.tx1_status = true;
+        let vm = view_model(&snap(ConnStatus::Connected, Some(both), None, None));
+        assert!(vm.channel_mode.stereo_ok, "both links verified: opens");
+
+        // The gate is INDEPENDENT of the current mode byte: the device may
+        // rest at Stereo (held from an earlier session) with a mic down —
+        // the display keeps the byte, the next write stays gated.
+        let mut held = e1();
+        held.voice_mode = 1;
+        let vm = view_model(&snap(ConnStatus::Connected, Some(held), None, None));
+        assert_eq!(vm.channel_mode.selected, Some(1), "held stereo shows");
+        assert!(!vm.channel_mode.stereo_ok, "but a new write stays gated");
     }
 
     /// The click path's inverse for Reverb gears: display pads 0..=2 map to

@@ -649,6 +649,7 @@ fn view_model_connected_shape() {
         vm.channel_mode,
         vm::ChannelModeVm {
             selected: Some(0), // wire byte 0 = Mono
+            stereo_ok: false,  // E1: TX1 offline — stereo stays gated
             applying: false    // an NC pending must not dim the channel panel
         }
     );

@@ -668,6 +668,14 @@ fn channel_pick(index: usize, channel: &ChannelModeVm) -> ChannelPick {
     if !channel_write_accepted(channel) {
         return ChannelPick::Blocked;
     }
+    // Stereo needs BOTH mics verified connected (the VM's `stereo_ok` —
+    // owner rule 2026-11-12, stricter than the APK's any-mic gate; the
+    // full evidence note lives on vm.rs `stereo_allowed`). Mono is never
+    // gated by it. The gate fires BEFORE the noop check: with a mic
+    // down, a click on the held Stereo pad is blocked, not a noop.
+    if index == 1 && !channel.stereo_ok {
+        return ChannelPick::Blocked;
+    }
     if channel.selected == Some(index) {
         return ChannelPick::Noop;
     }
@@ -1879,10 +1887,14 @@ impl AppModel {
     /// shown; same rule as the EQ/Volume selectors). Pad order IS byte
     /// order (Mono, Stereo — mono = wire 0, stereo = wire 1 [code
     /// HLDevice6302Activity.java:1803-1805]; the 2026-11-11 round trip
-    /// exercised BOTH values on the wire). Left/Right step the pads while
-    /// the well is focused ("channel_selector" key context — bindings in
-    /// main); the DEVISION dim (busy → 0.6) intentionally NOT applied
-    /// (README).
+    /// exercised BOTH values on the wire). STEREO is additionally gated on
+    /// BOTH transmitters being verified connected (`stereo_ok`, the VM's
+    /// [`holly_app::vm::stereo_allowed`] rule — owner 2026-11-12): a gated
+    /// pad renders without its click affordance and Left/Right steps over
+    /// it as a noop; the held mode byte still shows. Left/Right step the
+    /// pads while the well is focused ("channel_selector" key
+    /// context — bindings in main); the DEVISION dim (busy → 0.6)
+    /// intentionally NOT applied (README).
     fn channel_panel(&self, cx: &Context<Self>) -> gpui::Div {
         let channel = &self.vm.channel_mode;
         let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
@@ -2636,6 +2648,7 @@ mod tests {
             mic_recognition: None,
             channel_mode: ChannelModeVm {
                 selected: None,
+                stereo_ok: false,
                 applying: false,
             },
             shutdown: None,
