@@ -2416,3 +2416,165 @@ fn set_shutdown_time_rejects_abnormal_acks() {
     let err = c.set_shutdown_time(1).expect_err("2-byte ack must fail");
     assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
 }
+
+// ── Shutdown timer — real usbmon session (owner run 2026-11-12) ─────────────
+//
+// Route (b) closure, same as EQ/gain/reverb/channel-mode/mute: the doc
+// vectors above stay RECOMPUTED (kept verbatim for lineage pinning) and the
+// REAL frames of the guarded run join as replay vectors below. Source:
+//   captures/raw/set_shutdown_time_roundtrip.pcap
+//   captures/set_shutdown_time_roundtrip.jsonl   (16 rows, 8 round trips)
+// Session: start = 15min (0) → write Never (1) FIRST (disarms), settle-
+// confirmed, restore 15min, settle-confirmed, guard found the timer already
+// at its original value. Both ACK tails are 0x41 — the checksum rule's
+// prediction byte-matched, protocol.md §2 (n=7 for cmd ⊕ 0x66).
+
+/// Real SET_SHUTDOWN_TIME write frame of the run (export row 5) — value 01
+/// (Never): the other documented value, written from 15min 0.
+const SET_SHUTDOWN_1_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x27, 0x00, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_SHUTDOWN_TIME RESTORE frame (export row 11) — value 00 (15min):
+/// the starting state written back exactly (the restore RE-ARMS the
+/// countdown — expected and printed by the test).
+const SET_SHUTDOWN_0_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x27, 0x00, 0x01, 0x00, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at shutdownTime 0 (export rows 2/4/14/16): TX1 OFF,
+/// TX2 ON battery 0x49, both unmuted, NC on level 0, voice 4, Stereo 1 (the
+/// device HELD stereo from the earlier run — the stereo-gate fact, TX1
+/// offline), shutdown 0, light on (0x00 inverted), eq 1, reverb off gear 1,
+/// txIdentify 0, signalMode 0, tail 0x24.
+const HEART_WIRE_SHUTDOWN0: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x49, 0x00, 0x00, 0x01, 0x00, 0x04,
+    0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at shutdownTime 1 (export rows 8/10): ONLY the
+/// timer byte moved 00 → 01 (§5 offset 10 = frame byte 17) across all six
+/// hearts — state-change congruence on the write path; tail 0x25 (the timer
+/// flip folds 0x24 → 0x25, ⊕0x68 consistent on every heart of the session).
+const HEART_WIRE_SHUTDOWN1: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x49, 0x00, 0x00, 0x01, 0x00, 0x04,
+    0x01, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_SHUTDOWN_TIME ack (export rows 6/12): 1-byte status 00 + tail
+/// 0x41 — equal to the doc-recomputed [`SET_SHUTDOWN_ACK`], which closes the
+/// residue question for this command shape (see the section comment; the
+/// owner-corrected prediction — hex cmd 0x27 ⊕ 0x66 = 0x41, NOT decimal
+/// digits).
+const SET_SHUTDOWN_ACK_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x27, 0x00, 0x01, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Full real-session replay (shutdown timer's route (b) closure): the
+/// export's control frames replayed through the op end-to-end in the
+/// guarded test's leg shape (write 1 FIRST, settle, restore 0, settle, exit
+/// guard). TX side asserts byte-exact equality with the captured SET
+/// frames; the lineage pins assert the doc-recomputed layout EQUALS the
+/// observed wire frames; the restore leg targets the timer
+/// set_shutdown_time itself returned from its fresh GET.
+#[test]
+fn set_shutdown_time_roundtrip_replays_the_real_session() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_WIRE_SHUTDOWN0); // op's inner GET (= rows 2/4)
+    mock.push_reply(SET_SHUTDOWN_ACK_WIRE); // ack of row 5's SET [01]
+    mock.push_reply(HEART_WIRE_SHUTDOWN1); // test's settle GET (rows 8/10)
+    mock.push_reply(HEART_WIRE_SHUTDOWN1); // op's inner GET of the restore (row 10)
+    mock.push_reply(SET_SHUTDOWN_ACK_WIRE); // ack of row 11's SET [00]
+    mock.push_reply(HEART_WIRE_SHUTDOWN0); // test's final GET (rows 14/16)
+
+    let mut c = control(mock);
+    let previous = c
+        .set_shutdown_time(1)
+        .expect("real ack [00]+41 must be accepted (residue ignored)");
+    assert_eq!(
+        previous, 0,
+        "rows 2/4 rest at 15min 0 (the last-known state)"
+    );
+    let after = c.get_heart_info().expect("real heart (residue 25) parses");
+    assert_eq!(after.shutdown_time, 1, "heart delta = Never (rows 8/10)");
+    assert!(
+        !after.tx1_status,
+        "TX1 disconnected in the run (owner status output)"
+    );
+    assert!(after.tx2_status, "TX2 connected in the run");
+    assert_eq!(after.tx2_battery, 0x49, "run's TX2 battery byte (73 %)");
+    assert_eq!(
+        after.voice_level, 4,
+        "run's gain byte (owner status output)"
+    );
+    assert_eq!(
+        after.voice_mode, 1,
+        "the device HELD Stereo 01 through the run while TX1 was offline — the stereo-gate fact (owner status output 'mode 1')"
+    );
+    assert_eq!(after.eq_level, 1, "run's EQ byte (owner status output)");
+    assert_eq!(
+        (after.reverb_switch, after.reverb_level),
+        (false, 1),
+        "run's reverb pair (owner status output 'off (level 1)')"
+    );
+    assert!(
+        after.light_on,
+        "run's light byte 00 = ON (inverted, owner status output)"
+    );
+    assert_eq!(
+        after.signal_mode, 0,
+        "signalMode 0 in this run (owner status output)"
+    );
+    let restore_previous = c
+        .set_shutdown_time(0)
+        .expect("real restore must be accepted");
+    assert_eq!(
+        restore_previous, 1,
+        "the restore's fresh GET saw the write leg's effect (row 10)"
+    );
+    let restored = c.get_heart_info().expect("heart back at the start timer");
+    assert_eq!(
+        restored.shutdown_time, 0,
+        "restore delta verified — 15min restored (row 14)"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(&written[1], &SET_SHUTDOWN_1_WIRE, "SET TX byte-exact row 5");
+    assert_eq!(
+        &written[4], &SET_SHUTDOWN_0_WIRE,
+        "restore TX byte-exact row 11"
+    );
+    // Lineage pins (roadmap §1(b)): the doc-recomputed layout and the
+    // hardware-observed frames are the SAME bytes — the run started at the
+    // same timer value the doc vectors assumed (0), so the write-leg pin is
+    // byte-equal as-is and the restore pin recomputes only the value byte;
+    // the ack tail 0x41 the checksum rule predicted pre-run (owner-corrected
+    // to hex cmd 0x27) is byte-equal as-is (n=7 for cmd ⊕ 0x66).
+    assert_eq!(
+        SET_SHUTDOWN_1_WIRE, SET_SHUTDOWN_1_TX,
+        "doc layout == observed wire (write leg)"
+    );
+    let mut doc_0 = SET_SHUTDOWN_1_TX;
+    doc_0[7] = 0x00;
+    assert_eq!(
+        SET_SHUTDOWN_0_WIRE, doc_0,
+        "doc layout == observed wire (restore leg)"
+    );
+    assert_eq!(
+        SET_SHUTDOWN_ACK, SET_SHUTDOWN_ACK_WIRE,
+        "ack lineage pin (tail 0x41)"
+    );
+}
