@@ -151,6 +151,13 @@ pub trait StatusSource {
     /// returns the fresh GET's PRE-write pair (restore-flow datum) exactly
     /// like set_gain; the actor's verdict comes from its own post-SET poll.
     fn set_reverb(&mut self, switch: bool, gear: u8) -> Result<(bool, u8), Error>;
+    /// One SET_VOICE_MODE round trip — `value` in the WIRE value space
+    /// 0..=1 (§5.2 Channel-mode row; write space == read space, identity,
+    /// both values wire-exercised in the 2026-11-11 round trip);
+    /// set_channel_mode returns the fresh GET's PRE-write mode
+    /// (restore-flow datum) exactly like set_gain; the actor's verdict
+    /// comes from its own post-SET poll.
+    fn set_channel_mode(&mut self, value: u8) -> Result<u8, Error>;
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {
@@ -176,6 +183,10 @@ impl<T: Transport> StatusSource for HollyControl<T> {
 
     fn set_reverb(&mut self, switch: bool, gear: u8) -> Result<(bool, u8), Error> {
         HollyControl::set_reverb(self, switch, gear)
+    }
+
+    fn set_channel_mode(&mut self, value: u8) -> Result<u8, Error> {
+        HollyControl::set_channel_mode(self, value)
     }
 }
 

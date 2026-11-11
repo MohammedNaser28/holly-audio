@@ -75,6 +75,11 @@ pub enum PendingWrite {
     /// lives in `vm::reverb_toggle_wire`/`vm::reverb_gear_wire`, never
     /// here.
     Reverb(bool, u8),
+    /// A channel-mode write is in flight: the byte is the WIRE value being
+    /// written (0 = mono, 1 = stereo — checklist §3). The identity mapping
+    /// lives in `vm::channel_mode_selection`/`vm::channel_mode_pad_wire`,
+    /// never here.
+    ChannelMode(u8),
 }
 
 /// Commands the UI/frontend may send.
@@ -108,6 +113,13 @@ pub enum Command {
     /// Coalesces to the latest like every other SET (one SET per batch,
     /// newest intent).
     SetReverb(bool, u8),
+    /// Request a Channel-mode write, `value` in the WIRE value space
+    /// 0..=1 (0=mono, 1=stereo — checklist §3 Channel-mode row: write
+    /// space == read space, identity). The DISPLAY-order translation
+    /// lives in the VM (`channel_mode_pad_wire`), never in a frontend.
+    /// Coalesces to the latest like every other SET (one SET per batch,
+    /// newest intent).
+    SetChannelMode(u8),
     /// Force one fresh poll/reconnect attempt now.
     Refresh,
 }
@@ -201,6 +213,14 @@ impl DeviceHandle {
     /// "pending" then the device verdict.
     pub fn set_reverb(&self, switch: bool, gear: u8) {
         let _ = self.tx.send(Command::SetReverb(switch, gear));
+    }
+
+    /// Request a Channel-mode write (WIRE value 0..=1; display-order
+    /// translation is the VM's `channel_mode_pad_wire`). Fire-and-forget
+    /// like every other send: the snapshot stream reports "pending" then
+    /// the device verdict.
+    pub fn set_channel_mode(&self, value: u8) {
+        let _ = self.tx.send(Command::SetChannelMode(value));
     }
 
     pub fn refresh(&self) {
@@ -317,6 +337,7 @@ impl Core {
                 Command::SetReverb(switch, gear) => {
                     write = Some(PendingWrite::Reverb(switch, gear))
                 }
+                Command::SetChannelMode(value) => write = Some(PendingWrite::ChannelMode(value)),
             }
         }
         if self.device.is_none() {
@@ -435,6 +456,7 @@ impl Core {
             PendingWrite::Reverb(switch, gear) => {
                 source.set_reverb(switch, gear).map(|_previous| ())
             }
+            PendingWrite::ChannelMode(value) => source.set_channel_mode(value).map(|_previous| ()),
         };
         match result {
             Ok(()) => {

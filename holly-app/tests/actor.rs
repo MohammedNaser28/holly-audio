@@ -73,6 +73,17 @@ const SET_REVERB_ACK: [u8; REPORT] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+/// Real SET_VOICE_MODE ack (holly-usb tests/mock.rs `SET_CHANNEL_MODE_ACK_WIRE`
+/// — export frames 6/12 of the 2026-11-11 channel-mode capture): cmd echo
+/// 01 + status 00 + the cmd-01 residue 0x67 — predicted pre-run from the
+/// reply checksum rule `XOR(7+len prefix) ⊕ 0x07` and byte-matched on the
+/// wire (5th command shape of `cmd ⊕ 0x66`). The crate ignores the residue.
+const SET_CHANNEL_MODE_ACK: [u8; REPORT] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x01, 0x00, 0x01, 0x00, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
 
 /// Never-captured shape: nonzero ack status byte. Per
 /// `ProSetNoise.receiveData` [code], only `data[0] == 0` is success — the
@@ -634,6 +645,13 @@ fn view_model_connected_shape() {
             applying: false
         })
     );
+    assert_eq!(
+        vm.channel_mode,
+        vm::ChannelModeVm {
+            selected: Some(0), // wire byte 0 = Mono
+            applying: false    // an NC pending must not dim the channel panel
+        }
+    );
 }
 
 fn no_tail_txs(vm: &vm::ViewModel) -> bool {
@@ -851,13 +869,66 @@ fn set_reverb_roundtrip_through_the_actor() {
     );
 }
 
+/// The channel-mode write path through the actor: ONE SetChannelMode round
+/// trip on holly-usb's `set_channel_mode` (fresh GET inside, cmd-01 ack —
+/// the 2026-11-11 wire shape `… 01 00 01 00 67`), then the actor's
+/// post-SET poll carries the DEVICE's verdict — the wire value, byte for
+/// byte (payload[9] = voiceMode, buffer index 16 [wire E1 layout; the
+/// 2026-11-11 run's hearts moved ONLY this byte]). The pending appears
+/// exactly once as `ChannelMode(value)`.
+#[test]
+fn set_channel_mode_roundtrip_through_the_actor() {
+    let session = MockShared::default();
+    session.push_reply(HEART_E1); // connect poll (voiceMode 0 = Mono)
+    session.push_reply(HEART_E1); // fresh GET inside set_channel_mode
+    session.push_reply(SET_CHANNEL_MODE_ACK); // cmd-01 ack (status 00, residue 67)
+    let mut verdict = HEART_E1;
+    verdict[16] = 0x01; // payload[9] = voiceMode 00 -> 01 (Stereo)
+    session.push_reply(verdict); // actor's verification poll
+
+    let (mut core, mut rx) = core_of(VecDeque::from([Ok(session.clone())]));
+    core.tick();
+    assert_eq!(core.snapshot().status, ConnStatus::Connected);
+
+    core.pump([Command::SetChannelMode(1)]);
+
+    let final_snap = core.snapshot();
+    assert_eq!(final_snap.status, ConnStatus::Connected);
+    let heart = final_snap.heart.expect("connected");
+    assert_eq!(heart.voice_mode, 1, "device verdict: the written mode");
+    assert_eq!(heart.voice_level, 3, "the neighbouring gain byte untouched");
+    assert_eq!(final_snap.pending_set, None, "verdict clears pending");
+
+    let written = session.written();
+    assert_eq!(written.len(), 4);
+    assert_eq!(written[2][4], 0x01, "SET_VOICE_MODE");
+    assert_eq!(written[2][6], 0x01, "payload len 1 — [{{value}}]");
+    assert_eq!(written[2][7], 0x01, "value byte = request (Stereo)");
+    assert_eq!(written[3][4], 0x1F, "verification GET");
+
+    let stream = drain(&mut rx);
+    let pendings: Vec<Option<PendingWrite>> = stream.iter().map(|s| s.pending_set).collect();
+    assert_eq!(
+        pendings.iter().filter(|p| p.is_some()).count(),
+        1,
+        "channel-mode pending appears exactly once"
+    );
+    assert_eq!(
+        pendings.iter().find(|p| p.is_some()).copied().flatten(),
+        Some(PendingWrite::ChannelMode(1)),
+        "the single pending is the channel-mode write on the wire"
+    );
+}
+
 /// Coalescing is ONE bucket across control families: a batch's LAST SET
 /// command wins and the earlier ones vanish — cross-family (an NC switch
 /// replaced by an EQ pad; an EQ pad replaced by a gain stop; a gain stop
-/// replaced by a reverb write; a reverb write replaced by an EQ pad) and
-/// within EQ itself (pad 2 replaced by pad 3 — the winning pad is the
-/// newest request). The final SET is byte-checked on the wire, and each
-/// batch's pending shows ONLY its winner.
+/// replaced by a reverb write; a reverb write replaced by an EQ pad; a
+/// gain stop replaced by a channel-mode write; a channel-mode write
+/// replaced by an EQ pad) and within EQ itself (pad 2 replaced by pad 3
+/// — the winning pad is the newest request). The final SET is
+/// byte-checked on the wire, and each batch's pending shows ONLY its
+/// winner.
 #[test]
 fn set_commands_coalesce_across_families_to_one_set() {
     let session = MockShared::default();
@@ -930,24 +1001,51 @@ fn set_commands_coalesce_across_families_to_one_set() {
 
     core.pump([Command::SetReverb(false, 2), Command::SetEq(3)]);
 
+    // Batch 6 script: [SetGain(2), SetChannelMode(1)] — a FIFTH family
+    // joins the one bucket: the newer channel-mode write replaces the
+    // gain intent the same way the reverb replaced the gain in batch 4.
+    session.push_reply(HEART_E1); // fresh GET for the channel-mode SET
+    session.push_reply(SET_CHANNEL_MODE_ACK); // its ack
+    let mut verdict6 = HEART_E1;
+    verdict6[16] = 0x01; // device settles on voiceMode 01 (Stereo)
+    session.push_reply(verdict6); // verification poll
+
+    core.pump([Command::SetGain(2), Command::SetChannelMode(1)]);
+
+    let mid6 = core.snapshot();
+    let heart6 = mid6.heart.expect("connected");
+    assert_eq!(heart6.voice_mode, 1, "batch 6 verdict: the written mode");
+    assert_eq!(
+        heart6.voice_level, 3,
+        "the replaced gain never wrote (verdict = E1's own stop)"
+    );
+
+    // Batch 7 script: [SetChannelMode(0), SetEq(3)] — the reverse
+    // direction: a newer EQ pad replaces a channel-mode intent.
+    session.push_reply(HEART_E1); // fresh GET for the EQ SET
+    session.push_reply(SET_EQ_ACK); // its ack
+    session.push_reply(HEART_E1); // verification poll (voiceMode never wrote)
+
+    core.pump([Command::SetChannelMode(0), Command::SetEq(3)]);
+
     let final_snap = core.snapshot();
     assert_eq!(final_snap.status, ConnStatus::Connected);
     let heart = final_snap.heart.expect("connected");
-    assert_eq!(heart.eq_level, 3, "batch 5 verdict: the winning EQ pad");
+    assert_eq!(heart.eq_level, 3, "batch 7 verdict: the winning EQ pad");
     assert_eq!(
-        (heart.reverb_switch, heart.reverb_level),
-        (false, 2),
-        "the replaced reverb SET never went out (E1's own bytes)"
+        heart.voice_mode, 0,
+        "the replaced channel SET never went out (E1's own bytes)"
     );
     assert_eq!(final_snap.pending_set, None);
 
     // Transcript: connect GET + batch-1 SET round trip + batch-2 SET round
     // trip + batch-3 SET round trip + batch-4 SET round trip + batch-5 SET
-    // round trip, NOTHING else — no SET_NOISE frame from the replaced
-    // command, no second SET for a replaced pad, no SET_REVERB from a
-    // replaced reverb intent.
+    // round trip + batch-6 SET round trip + batch-7 SET round trip,
+    // NOTHING else — no SET_NOISE frame from the replaced command, no
+    // second SET for a replaced pad, no SET_REVERB from a replaced reverb
+    // intent, no SET_VOICE_MODE from a replaced channel intent.
     let written = session.written();
-    assert_eq!(written.len(), 16);
+    assert_eq!(written.len(), 22);
     assert_eq!(written[2][4], 0x07, "batch 1: the ONLY SET is SET_EQ");
     assert_eq!(written[2][7], 0x03, "batch 1: request");
     assert_eq!(written[5][4], 0x07, "batch 2: the ONLY SET is SET_EQ");
@@ -962,12 +1060,21 @@ fn set_commands_coalesce_across_families_to_one_set() {
     );
     assert_eq!(written[14][4], 0x07, "batch 5: the ONLY SET is SET_EQ");
     assert_eq!(written[14][7], 0x03, "batch 5: the EQ pad");
+    assert_eq!(
+        written[17][4], 0x01,
+        "batch 6: the ONLY SET is SET_VOICE_MODE"
+    );
+    assert_eq!(written[17][6], 0x01, "batch 6: payload len 1");
+    assert_eq!(written[17][7], 0x01, "batch 6: the winning mode (Stereo)");
+    assert_eq!(written[20][4], 0x07, "batch 7: the ONLY SET is SET_EQ");
+    assert_eq!(written[20][7], 0x03, "batch 7: the EQ pad");
     for (i, frame) in written.iter().enumerate() {
-        if i != 2 && i != 5 && i != 8 && i != 11 && i != 14 {
+        if i != 2 && i != 5 && i != 8 && i != 11 && i != 14 && i != 17 && i != 20 {
             assert_ne!(frame[4], 0x07, "no extra SET_EQ frame at {i}");
             assert_ne!(frame[4], 0x13, "no SET_NOISE frame at {i}");
             assert_ne!(frame[4], 0x03, "no extra SET_GAIN frame at {i}");
             assert_ne!(frame[4], 0x05, "no extra SET_REVERB frame at {i}");
+            assert_ne!(frame[4], 0x01, "no extra SET_VOICE_MODE frame at {i}");
         }
     }
 
@@ -983,7 +1090,9 @@ fn set_commands_coalesce_across_families_to_one_set() {
             PendingWrite::Gain(1),         // batch 3 winner
             PendingWrite::Reverb(true, 1), // batch 4 winner
             PendingWrite::Eq(3),           // batch 5 winner
+            PendingWrite::ChannelMode(1),  // batch 6 winner
+            PendingWrite::Eq(3),           // batch 7 winner
         ],
-        "exactly the five winning writes ever pended"
+        "exactly the seven winning writes ever pended"
     );
 }

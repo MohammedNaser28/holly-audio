@@ -72,6 +72,13 @@ pub const VID_PID: &str = "3547:0407";
 ///   (captures/raw/set_reverb_roundtrip.pcap + captures/
 ///   set_reverb_roundtrip.jsonl; roadmap §1 route (b), checklist §3
 ///   Reverb row)
+/// - `channel_mode` — SET_VOICE_MODE (cmd 1) [wire] PC-originated guarded
+///   round trip 2026-11-11: frames `05 03 AA DD 01 00 01 {01,00} EF` →
+///   acks `00` tail `0x67` → hearts settled on the written mode (§5
+///   offset 9; the only heart byte that moved)
+///   (captures/raw/set_channel_mode_roundtrip.pcap + captures/
+///   set_channel_mode_roundtrip.jsonl; roadmap §1 route (b), checklist §3
+///   Channel mode row)
 /// - everything else is [code] at best (mic mute cmd 22, light cmd 33,
 ///   shutdown 39/40 …) and has never been captured, so it stays read-only
 ///   today.
@@ -95,7 +102,7 @@ pub const WRITABLE: Writable = Writable {
     nc_level: true,
     mic_mute: false,
     volume: true,
-    channel_mode: false,
+    channel_mode: true,
     eq: true,
     reverb: true,
     mic_recognition: false,
@@ -179,6 +186,18 @@ pub fn volume_pad_wire(index: usize) -> Option<u8> {
 /// `heartInfo.getVoiceMode()` (:1277)]. Anything > 1 has no certified pad.
 pub fn channel_mode_selection(voice_mode: u8) -> Option<usize> {
     (voice_mode <= 1).then_some(voice_mode as usize)
+}
+
+/// The inverse translation a UI click needs: a Channel-mode pad index
+/// ([`ChannelModeVm::selected`]'s space) -> the WIRE byte
+/// `set_channel_mode` writes. Identity on 0..=1: the §3 Channel-mode
+/// row's write space IS the §5.2 read space — identity write-verified
+/// [wire, 2026-11-11 channel-mode run: the 0→1→0 round trip landed on
+/// the written byte every leg (§5 offset 9), never out of space].
+/// Pure function like [`volume_pad_wire`] so frontends never hardcode
+/// device values; unmapped (out of 0..=1) returns None.
+pub fn channel_mode_pad_wire(index: usize) -> Option<u8> {
+    (index <= 1).then_some(index as u8)
 }
 
 /// The Schedule-panel's selected pad: `quarterTime` ("15min") = 0,
@@ -354,6 +373,20 @@ pub struct GainVm {
     pub applying: bool,
 }
 
+/// Channel-mode state: the DEVICE's current mode pad, plus whether a
+/// channel-mode write is in flight. `selected` is None for any
+/// non-certified byte (§5 offset 9; see [`channel_mode_selection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ChannelModeVm {
+    /// Pad index of the active mode (0 = Mono, 1 = Stereo — [code
+    /// `HLDevice6302Activity.java:1803-1805`]).
+    pub selected: Option<usize>,
+    /// A channel-mode SET (only ever [`PendingWrite::ChannelMode`]) is in
+    /// flight — the selector dims and ignores picks until the device's
+    /// verdict.
+    pub applying: bool,
+}
+
 /// Reverb state: the DEVICE's current switch and gear bytes, plus whether
 /// a reverb write is in flight. `enabled` is the verified switch byte
 /// (§5 offset 13) — None only where no heart exists, so a toggle never
@@ -408,10 +441,11 @@ pub struct ViewModel {
     /// THIS — it used to be hardcoded `false` in the view, which could
     /// contradict the device when the phone-side identify was on.
     pub mic_recognition: Option<bool>,
-    /// Channel-mode pad (`voiceMode`, §5 offset 9) via
-    /// [`channel_mode_selection`]: 0 = Mono, 1 = Stereo [code
-    /// HLDevice6302Activity.java:1803-1805]. Unmapped for any other byte.
-    pub channel_mode: Option<usize>,
+    /// Channel-mode pads ([`ChannelModeVm`]): display-order selection
+    /// from the device's `voiceMode` byte (§5 offset 9; 0 = Mono, 1 =
+    /// Stereo [code HLDevice6302Activity.java:1803-1805]), plus the
+    /// in-flight flag for its own panel only.
+    pub channel_mode: ChannelModeVm,
     /// Schedule pad (`shutdownTime`, §5 offset 10) via
     /// [`shutdown_selection`]: 0 = 15min, 1 = Never [code
     /// HLDevice6302Activity.java:1864-1866]. Unmapped for any other byte.
@@ -453,7 +487,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 applying: false,
             },
             mic_recognition: None,
-            channel_mode: None,
+            channel_mode: ChannelModeVm {
+                selected: None,
+                applying: false,
+            },
             shutdown: None,
             signal_mode: None,
             reverb: None,
@@ -522,6 +559,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                         Some(PendingWrite::Eq(_))
                         | Some(PendingWrite::Gain(_))
                         | Some(PendingWrite::Reverb(_, _))
+                        | Some(PendingWrite::ChannelMode(_))
                         | None => None,
                     },
                     last_error: None,
@@ -536,7 +574,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                     applying: matches!(s.pending_set, Some(PendingWrite::Eq(_))),
                 },
                 mic_recognition: Some(heart.tx_identify),
-                channel_mode: channel_mode_selection(heart.voice_mode),
+                channel_mode: ChannelModeVm {
+                    selected: channel_mode_selection(heart.voice_mode),
+                    applying: matches!(s.pending_set, Some(PendingWrite::ChannelMode(_))),
+                },
                 shutdown: shutdown_selection(heart.shutdown_time),
                 signal_mode: Some(heart.signal_mode),
                 reverb: Some(ReverbVm {
@@ -578,7 +619,10 @@ fn disconnected_core() -> ViewModel {
             applying: false,
         },
         mic_recognition: None,
-        channel_mode: None,
+        channel_mode: ChannelModeVm {
+            selected: None,
+            applying: false,
+        },
         shutdown: None,
         signal_mode: None,
         reverb: None,
@@ -818,7 +862,13 @@ mod tests {
         );
         // The formerly-dropped fields: E1's own bytes (cite §5 offsets).
         assert_eq!(vm.mic_recognition, Some(false), "txIdentify off [15]");
-        assert_eq!(vm.channel_mode, Some(0), "voiceMode 0 = Mono [9]");
+        assert_eq!(
+            vm.channel_mode,
+            ChannelModeVm {
+                selected: Some(0), // voiceMode 0 = Mono [9]
+                applying: false
+            }
+        );
         assert_eq!(vm.shutdown, Some(0), "shutdownTime 0 = 15min [10]");
         assert_eq!(vm.signal_mode, Some(0), "carried raw [16]");
     }
@@ -1002,6 +1052,82 @@ mod tests {
         assert!(!gain.eq.applying, "EQ panel never sees a gain write");
     }
 
+    /// The click path's inverse for Channel mode: display pads 0..=1 map
+    /// to the wire bytes 0..=1 — IDENTITY, because the §3 Channel-mode
+    /// row's write space is the §5.2 read space (identity write-verified
+    /// [wire, 2026-11-11 channel-mode run: the 0→1→0 round trip landed on
+    /// the written byte every leg]). Unmapped indices stay unmapped, and
+    /// a channel-mode write in flight dims ONLY the channel panel.
+    #[test]
+    fn channel_mode_pad_wire_roundtrips_channel_selection() {
+        for wire in 0..=1u8 {
+            assert_eq!(
+                channel_mode_pad_wire(wire as usize),
+                Some(wire),
+                "pad {wire} is its own wire byte"
+            );
+            assert_eq!(
+                channel_mode_selection(wire),
+                Some(wire as usize),
+                "wire {wire}"
+            );
+            // The VM's connected shape carries the mode as `selected`; a
+            // UI sending `channel_mode_pad_wire(selected)` lands on the
+            // same byte.
+            let mut heart = e1();
+            heart.voice_mode = wire;
+            let vm = view_model(&snap(ConnStatus::Connected, Some(heart), None, None));
+            assert_eq!(
+                vm.channel_mode.selected,
+                Some(wire as usize),
+                "heart wire {wire}"
+            );
+            assert_eq!(
+                channel_mode_pad_wire(vm.channel_mode.selected.expect("mapped above")),
+                Some(wire)
+            );
+        }
+        assert_eq!(channel_mode_pad_wire(2), None, "out of the two-pad space");
+        assert_eq!(channel_mode_pad_wire(usize::MAX), None);
+        // An UNMAPPED heart byte is no selection at all (never a guess):
+        let mut heart = e1();
+        heart.voice_mode = 2;
+        let vm = view_model(&snap(ConnStatus::Connected, Some(heart), None, None));
+        assert_eq!(
+            vm.channel_mode.selected, None,
+            "byte 2 has no certified mode"
+        );
+
+        let channel = view_model(&snap(
+            ConnStatus::Connected,
+            Some(e1()),
+            Some(PendingWrite::ChannelMode(1)),
+            None,
+        ));
+        assert!(
+            channel.channel_mode.applying,
+            "a channel-mode write dims the channel panel"
+        );
+        assert_eq!(
+            channel.channel_mode.selected,
+            Some(0),
+            "selection stays the device's (E1 rests at Mono 0)"
+        );
+        assert_eq!(
+            channel.nc.pending, None,
+            "NC panel never sees a channel-mode write"
+        );
+        assert!(!channel.eq.applying, "EQ panel never sees a channel write");
+        assert!(
+            !channel.volume.applying,
+            "Volume panel never sees a channel write"
+        );
+        assert!(
+            !channel.reverb.as_ref().expect("connected").applying,
+            "Reverb panel never sees a channel write"
+        );
+    }
+
     /// The click path's inverse for Reverb gears: display pads 0..=2 map to
     /// the wire bytes 0..=2 — IDENTITY, because the checklist §3 Reverb
     /// row's write space is the §5.2 read space (identity write-verified
@@ -1173,7 +1299,8 @@ mod tests {
     /// PC-originated guarded round trip ([wire] 2026-11-09;
     /// captures/set_eq_roundtrip.jsonl); Volume joined the same route
     /// (b) on 2026-11-10 (captures/set_gain_roundtrip.jsonl); Reverb on
-    /// 2026-11-11 (captures/set_reverb_roundtrip.jsonl).
+    /// 2026-11-11 (captures/set_reverb_roundtrip.jsonl); Channel mode on
+    /// 2026-11-11 (captures/set_channel_mode_roundtrip.jsonl).
     #[test]
     fn writable_table_matches_the_certified_chain() {
         let all_read_only = Writable {
@@ -1196,6 +1323,7 @@ mod tests {
                 eq: true,
                 volume: true,
                 reverb: true,
+                channel_mode: true,
                 ..all_read_only
             }
         );

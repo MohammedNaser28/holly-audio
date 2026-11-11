@@ -98,9 +98,10 @@ use gpui::{
 use holly_app::DeviceHandle;
 use holly_app::demo::DemoScenario;
 use holly_app::vm::{
-    Banner, DEVICE_NAME, EqVm, GainVm, NcVm, ReverbVm, TxVm, VID_PID, ViewModel, WRITABLE,
-    battery_segment_count, conn_status_word, eq_pad_wire, mic_status, mute_label, nc_level_label,
-    nc_status, reverb_gear_wire, reverb_selection, reverb_toggle_wire, view_model, volume_pad_wire,
+    Banner, ChannelModeVm, DEVICE_NAME, EqVm, GainVm, NcVm, ReverbVm, TxVm, VID_PID, ViewModel,
+    WRITABLE, battery_segment_count, channel_mode_pad_wire, conn_status_word, eq_pad_wire,
+    mic_status, mute_label, nc_level_label, nc_status, reverb_gear_wire, reverb_selection,
+    reverb_toggle_wire, view_model, volume_pad_wire,
 };
 
 actions!(
@@ -117,6 +118,8 @@ actions!(
         ToggleReverb,
         ReverbPrev,
         ReverbNext,
+        ChannelPrev,
+        ChannelNext,
         Refresh,
         Quit
     ]
@@ -641,6 +644,36 @@ fn reverb_pick(index: usize, reverb: &ReverbVm) -> ReverbPick {
     ReverbPick::Write
 }
 
+/// Write gate for the Channel-mode panel: the certified family AND nothing
+/// in flight — the same conjunction as [`eq_write_accepted`] (the
+/// `WRITABLE.channel_mode` half is vm.rs's pinned table; the `applying`
+/// half comes from the actor-reported `ChannelModeVm`).
+fn channel_write_accepted(channel: &ChannelModeVm) -> bool {
+    WRITABLE.channel_mode && !channel.applying
+}
+
+/// Decision for ONE Channel-mode pick — parallel to [`EqPick`]: blocked
+/// (the family is read-only or a channel-mode write is in flight), noop
+/// (that mode is already the device's verified selection), else write. NO
+/// pending target is ever displayed — the selection moves on the device's
+/// verdict only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelPick {
+    Blocked,
+    Noop,
+    Write,
+}
+
+fn channel_pick(index: usize, channel: &ChannelModeVm) -> ChannelPick {
+    if !channel_write_accepted(channel) {
+        return ChannelPick::Blocked;
+    }
+    if channel.selected == Some(index) {
+        return ChannelPick::Noop;
+    }
+    ChannelPick::Write
+}
+
 /// Banner decoration per kind, decided ONLY from `Banner` (the design
 /// colour rule: amber = needs attention, red = error, grey = everything
 /// else; container stays on the designed BANNER_BG/BANNER_LINE). The
@@ -723,6 +756,10 @@ struct AppModel {
     /// The Reverb switch's keyboard handle — its own "reverb_toggle" key
     /// context (Space/Enter flip while the switch wrapper holds focus).
     reverb_toggle_focus: FocusHandle,
+    /// The Channel-mode selector's keyboard handle — same rule as the
+    /// other selector wells, its own "channel_selector" key context
+    /// (Left/Right step the two mode pads while it holds focus).
+    channel_focus: FocusHandle,
     vm: ViewModel,
     device: DeviceHandle,
     demo: Option<DemoScenario>,
@@ -903,6 +940,41 @@ impl AppModel {
 
     fn on_reverb_next(&mut self, _: &ReverbNext, _: &mut Window, _: &mut Context<Self>) {
         self.reverb_step(1);
+    }
+
+    /// One Channel-mode pick for mouse AND keyboard — [`channel_pick`] is
+    /// the whole decision (read-only family or an in-flight channel-mode
+    /// write: blocked; already-selected: noop; else write). The WIRE byte
+    /// comes from the VM's tested translation (`channel_mode_pad_wire`) —
+    /// this file never names a device value.
+    fn set_channel_mode(&mut self, index: usize, _: &mut Context<Self>) {
+        if channel_pick(index, &self.vm.channel_mode) == ChannelPick::Write
+            && let Some(wire) = channel_mode_pad_wire(index)
+        {
+            self.device.set_channel_mode(wire);
+        }
+    }
+
+    /// Left/Right stepping over the two mode pads (same context-scoped
+    /// rule as the EQ/Volume/reverb wells; NC's global 1/2/3 stay
+    /// untouched). With no verified selection the step is a noop: the
+    /// VM's `selected` is the only cursor, matching the "no pending
+    /// target" rule.
+    fn channel_step(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some(selected) = self.vm.channel_mode.selected {
+            let next = selected as isize + step;
+            if (0..=1).contains(&next) {
+                self.set_channel_mode(next as usize, cx);
+            }
+        }
+    }
+
+    fn on_channel_prev(&mut self, _: &ChannelPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.channel_step(-1, cx);
+    }
+
+    fn on_channel_next(&mut self, _: &ChannelNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.channel_step(1, cx);
     }
 
     fn refresh_now(&mut self, _: &mut Context<Self>) {
@@ -1131,14 +1203,10 @@ impl AppModel {
                                         self.volume_panel(cx).flex_1(),
                                     )
                                     .child(
-                                        self.audio_panel(
-                                            "Channel mode",
-                                            &["Mono", "Stereo"], // [code index.html:258]
-                                            // mono = wire 0, stereo = wire 1 [code
-                                            // HLDevice6302Activity.java:1803-1805].
-                                            self.vm.channel_mode,
-                                        )
-                                        .flex_1(),
+                                        // Interactive since the channel-mode
+                                        // round trip (2026-11-11): the two-mode
+                                        // selector route moved to channel_panel.
+                                        self.channel_panel(cx).flex_1(),
                                     ),
                             ),
                     )
@@ -1746,15 +1814,124 @@ impl AppModel {
             .child(group)
     }
 
-    /// The read-only audio panels (Channel mode / Schedule): a title and a
-    /// selector group. Selection comes ONLY from the heart's certified
-    /// byte→pad mapping — Channel mode maps mono=0/stereo=1 (each with its
+    /// Channel-mode panel — INTERACTIVE since the channel-mode round trip
+    /// (2026-11-11): the two mode pads send `set_channel_mode` (wire
+    /// values via `channel_mode_pad_wire`) through the same actor path as
+    /// the other controls, gated by `channel_pick`. While a channel-mode
+    /// write is in flight (`ChannelModeVm.applying`) the selector dims to
+    /// 0.5 and both mouse and keyboard picks are ignored — the snapshot's
+    /// POST-SET poll moves the selection (no pending target is ever
+    /// shown; same rule as the EQ/Volume selectors). Pad order IS byte
+    /// order (Mono, Stereo — mono = wire 0, stereo = wire 1 [code
+    /// HLDevice6302Activity.java:1803-1805]; the 2026-11-11 round trip
+    /// exercised BOTH values on the wire). Left/Right step the pads while
+    /// the well is focused ("channel_selector" key context — bindings in
+    /// main); the DEVISION dim (busy → 0.6) intentionally NOT applied
+    /// (README).
+    fn channel_panel(&self, cx: &Context<Self>) -> gpui::Div {
+        let channel = &self.vm.channel_mode;
+        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
+            .flex_1()
+            .min_w(px(0.))
+            .p(px(theme::metrics::SELECTOR_PADDING))
+            .gap(px(theme::metrics::SELECTOR_GAP))
+            .track_focus(&self.channel_focus)
+            .key_context("channel_selector")
+            // focus-visible outline = the rocker's rule (2px tungsten).
+            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
+            .when(channel.applying, |g| g.opacity(0.5));
+        const CHANNEL_MODES: [&str; 2] = ["Mono", "Stereo"]; // [code index.html:258]
+        for (index, label) in CHANNEL_MODES.iter().enumerate() {
+            let selected = channel.selected == Some(index);
+            let pick = channel_pick(index, channel);
+            let mut option = div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
+                .text_size(px(theme::text::BODY_SIZE))
+                .when(selected, |o| {
+                    o.bg(linear_gradient(
+                        180.,
+                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
+                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
+                    ))
+                    .text_color(solid(theme::color::TEXT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .shadow(matte_under_edge(1.))
+                })
+                .when(!selected, |o| {
+                    o.text_color(solid(theme::color::TEXT_2))
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .child(label.to_string())
+                .relative();
+            if selected {
+                // Same tungsten indicator bar as the EQ/Volume selectors.
+                option = option.child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(5.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
+                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
+                                .rounded(px(1.))
+                                .bg(solid(theme::color::TUNGSTEN))
+                                .shadow(vec![BoxShadow {
+                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
+                                        .opacity(0.6),
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(6.),
+                                    spread_radius: px(0.),
+                                }]),
+                        ),
+                );
+            }
+            let option = if pick != ChannelPick::Blocked {
+                option
+                    .id(ElementId::named_usize("channel-mode", index))
+                    .hover(|s| s.cursor_pointer())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_channel_mode(index, cx);
+                    }))
+                    .into_any_element()
+            } else {
+                option.into_any_element()
+            };
+            group = group.child(option);
+        }
+        // The read-only audio_panel rendered this same shell (panel +
+        // title + selector); the interactivity wraps in it unchanged.
+        panel()
+            .flex_1()
+            .justify_center()
+            .gap(px(theme::metrics::SPACE_3))
+            .child(
+                div()
+                    .text_size(px(theme::text::TITLE_SIZE))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Channel mode"),
+            )
+            .child(group)
+    }
+
+    /// The read-only audio panel (Schedule): a title and a selector
+    /// group. Selection comes ONLY from the heart's certified byte→pad
+    /// mapping — Schedule maps quarter=0/never=1 (with its
     /// `HLDevice6302Activity.java` [code] citation at the call site). A
-    /// byte outside a panel's certified set passes None and renders the
-    /// no-selection rule. EQ and Volume no longer route here — they
-    /// graduated to the INTERACTIVE [`AppModel::eq_panel`]
-    /// /[`AppModel::volume_panel`] once their SET paths were wire-certified
-    /// (2026-11-09 EQ, 2026-11-10 gain); Schedule stays read-only. The
+    /// byte outside the panel's certified set passes None and renders the
+    /// no-selection rule. EQ, Volume and Channel mode no longer route
+    /// here — they graduated to the INTERACTIVE [`AppModel::eq_panel`]
+    /// /[`AppModel::volume_panel`]/[`AppModel::channel_panel`] once their
+    /// SET paths were wire-certified (2026-11-09 EQ, 2026-11-10 gain,
+    /// 2026-11-11 channel mode); Schedule stays read-only. The
     /// DEVISION-chart dim (busy → 0.6) is intentionally NOT applied:
     /// unknown is not disabled-looking (documented deviation in README).
     fn audio_panel(
@@ -2130,6 +2307,8 @@ impl Render for AppModel {
             .on_action(cx.listener(Self::on_toggle_reverb))
             .on_action(cx.listener(Self::on_reverb_prev))
             .on_action(cx.listener(Self::on_reverb_next))
+            .on_action(cx.listener(Self::on_channel_prev))
+            .on_action(cx.listener(Self::on_channel_next))
             .on_action(cx.listener(Self::on_refresh))
             .child(self.render_titlebar())
             .children(self.render_banner(cx))
@@ -2187,11 +2366,13 @@ fn main() {
             // corresponding on_action listeners. Left/Right step the EQ
             // pads ONLY while the EQ well is focused (key context
             // "eq_selector"), the Volume stops ONLY while the volume
-            // well is focused ("volume_selector"), and the reverb gears
-            // ONLY while the reverb well is focused ("reverb_selector");
-            // Space/Enter flip the reverb switch only inside
-            // "reverb_toggle" — the design defines no inter-selector arrow
-            // keys (no invented global bindings stealing NC's 1/2/3).
+            // well is focused ("volume_selector"), the reverb gears
+            // ONLY while the reverb well is focused ("reverb_selector"),
+            // and the Channel-mode pads ONLY while the channel well is
+            // focused ("channel_selector"); Space/Enter flip the reverb
+            // switch only inside "reverb_toggle" — the design defines no
+            // inter-selector arrow keys (no invented global bindings
+            // stealing NC's 1/2/3).
             cx.bind_keys([
                 KeyBinding::new("space", ToggleNoise, Some("nc_rocker")),
                 KeyBinding::new("enter", ToggleNoise, Some("nc_rocker")),
@@ -2212,6 +2393,11 @@ fn main() {
                 KeyBinding::new("enter", ToggleReverb, Some("reverb_toggle")),
                 KeyBinding::new("left", ReverbPrev, Some("reverb_selector")),
                 KeyBinding::new("right", ReverbNext, Some("reverb_selector")),
+                // Left/Right step the Channel-mode pads ONLY while that
+                // well is focused ("channel_selector" context) — four
+                // disjoint selector contexts, no invented global bindings.
+                KeyBinding::new("left", ChannelPrev, Some("channel_selector")),
+                KeyBinding::new("right", ChannelNext, Some("channel_selector")),
                 KeyBinding::new("1", NcLow, None),
                 KeyBinding::new("2", NcMedium, None),
                 KeyBinding::new("3", NcStrong, None),
@@ -2285,12 +2471,14 @@ fn main() {
                             let volume_focus = cx.focus_handle();
                             let reverb_focus = cx.focus_handle();
                             let reverb_toggle_focus = cx.focus_handle();
+                            let channel_focus = cx.focus_handle();
                             AppModel {
                                 focus,
                                 eq_focus,
                                 volume_focus,
                                 reverb_focus,
                                 reverb_toggle_focus,
+                                channel_focus,
                                 vm: ViewModel::default(),
                                 device,
                                 demo,
@@ -2348,7 +2536,7 @@ mod tests {
         level_pick, nc_led, nc_write_accepted, vm_led,
     };
     use holly_app::NoiseWrite;
-    use holly_app::vm::{Banner, EqVm, GainVm, NcVm, TxVm, ViewModel, battery_class};
+    use holly_app::vm::{Banner, ChannelModeVm, EqVm, GainVm, NcVm, TxVm, ViewModel, battery_class};
 
     /// A rocker/VM shape straight from the VM fields.
     fn nc(level: Option<u8>, state: Option<bool>, pending: Option<NoiseWrite>) -> NcVm {
@@ -2390,7 +2578,10 @@ mod tests {
             },
             eq: eq(None, false),
             mic_recognition: None,
-            channel_mode: None,
+            channel_mode: ChannelModeVm {
+                selected: None,
+                applying: false,
+            },
             shutdown: None,
             signal_mode: None,
             reverb: None,

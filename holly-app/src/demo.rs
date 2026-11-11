@@ -165,6 +165,22 @@ impl StatusSource for DemoDevice {
         heart.reverb_level = gear;
         Ok(previous)
     }
+
+    fn set_channel_mode(&mut self, value: u8) -> Result<u8, Error> {
+        // Same shape as holly-usb's set_channel_mode: the RETURN is the
+        // mode the heart held BEFORE the write (guarded flows restore from
+        // it); the write mutates only the voiceMode byte (§5 offset 9 —
+        // voiceLevel offset 8 is a separate heart field; the 2026-11-11
+        // wire round trip settled the written byte on every leg) —
+        // everything else stays scripted. Pending scenario: stall BEFORE
+        // mutation, so the pending snapshot is always observable first
+        // (same shape as set_gain).
+        let mut heart = self.heart.lock().unwrap();
+        let previous = heart.voice_mode;
+        std::thread::sleep(self.stall);
+        heart.voice_mode = value;
+        Ok(previous)
+    }
 }
 
 /// The OS busy condition, byte-for-byte the real claim failure shape
