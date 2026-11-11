@@ -21,6 +21,12 @@
 //!     runs. THE re-enumeration-risk control: the mode change re-presents
 //!     the audio path, so callers must expect the handle to die briefly
 //!     after the write.
+//!   - `set_tx_mute(u8, bool)` — cmd 22, payload `[{txIndex}, {muted}]`
+//!     (0-based TX slot TX1=0 … TX4=3, then the mute byte); same set_*
+//!     shape (fresh GET inside, returns the pre-write mute of the
+//!     ADDRESSED slot — `None` where the fresh heart's length does not
+//!     carry that slot's field); [code] until the guarded round trip
+//!     runs.
 
 use nusb::MaybeFuture;
 
@@ -376,6 +382,78 @@ impl<T: Transport> HollyControl<T> {
         let (reply, raw) = self.exchange(request)?;
         match reply.payload.as_slice() {
             [0x00] => Ok(state.voice_mode),
+            [status] => Err(Error::Rejected {
+                status: *status,
+                raw,
+            }),
+            other => Err(Error::BadAck {
+                len: other.len(),
+                raw,
+            }),
+        }
+    }
+
+    /// Write ONE transmitter's mute state — the per-mic "Mute"/"Muted"
+    /// chip — cmd 22 SET_TX_MUTE, two-byte payload `[{txIndex}, {muted}]`
+    /// [code docs/set-gate-checklist.md §3 TX-mute row:
+    /// `UsbMessengerV2.setMicMute(boolean on, int deviceType)` builds
+    /// `saveReserved(new byte[]{(byte) (deviceType.ordinal() - 1), (byte)
+    /// (on ? 1 : 0)})` clamped into 0..=3 (`UsbMessengerV2.java:206-210`,
+    /// `Protocol.java:49-57`); cmd re-derived from `ProSetTxMute.getCmd()`
+    /// = `(byte) 22` = Ascii.SYN (`ProSetTxMute.java:16-18`)]. One TX per
+    /// frame — the APK's mute click writes exactly one ordinal, there is
+    /// no broadcast variant (`HLDevice6302Activity.java:677/:691/:705/:719`).
+    /// `tx_index` is the WIRE 0-based slot (TX1=0 … TX4=3); `muted` is the
+    /// write byte 0/1, and the write space EQUALS the read space (no
+    /// inversion): heart `tx1_mute`/`tx2_mute` (§5 offsets 4/5,
+    /// `ProGetHearInfo.java:57-58`) are the same values the app renders —
+    /// §5.2 TX-mute row. The frame stays [code] until the guarded PC-side
+    /// round trip captures it on the wire (route (b) — that run settles
+    /// the §3 TX-mute row).
+    ///
+    /// Returns the ADDRESSED slot's pre-write mute from THIS call's fresh
+    /// `get_heart_info()` — the value in force on the device immediately
+    /// before the write (the crate's uniform SET discipline — one fresh
+    /// GET inside every SET call, no observable device state cached — it
+    /// gates the SET on a live, answering device, and the value is the
+    /// guarded test's restore datum, like set_gain's returned stop). The
+    /// result is `Option` because the fresh heart may not CARRY the slot:
+    /// `tx3_mute`/`tx4_mute` exist only at heart lengths ≥ 22/23 [code
+    /// `ProGetHearInfo.java:100-123`], so a write targeting TX3/TX4 from a
+    /// certified 17-byte heart has no restore datum — the return stays
+    /// honest about what the GET actually reported instead of inventing a
+    /// false.
+    ///
+    /// Ack gating is identical to [`HollyControl::set_gain`] (checklist §3:
+    /// the `data[0] == 0` status rule is uniform across all `ProSet*`
+    /// classes — `ProSetTxMute.receiveData` reads `toInt(data[0]) == 0`
+    /// [code `ProSetTxMute.java:26-30`]): `[00]` = success; anything else
+    /// surfaces as [`Error::Rejected`]/[`Error::BadAck`] — no retry.
+    /// Reply-tail bytes stay uninterpreted: heart replies carry
+    /// XOR(payload[0..16)) ⊕ 0x68 [wire — LAST payload byte excluded],
+    /// ACK tails follow XOR(whole 7+len prefix) ⊕ 0x07 = cmd ⊕ 0x66 [wire,
+    /// 5 command shapes] (docs/protocol.md §2 — decode discards everything
+    /// past `7+len`, so no decode behaviour changes here either way).
+    /// Values outside the documented tx_index space 0..=3 are the caller's
+    /// responsibility, not assumed here — family convention (mirror of
+    /// [`HollyControl::set_gain`]).
+    pub fn set_tx_mute(&mut self, tx_index: u8, muted: bool) -> Result<Option<bool>, Error> {
+        // Fresh GET inside every SET (crate rule); the addressed slot's
+        // mute is the restore datum returned to the caller.
+        let state = self.get_heart_info()?;
+        let request = Frame::new(cmd::SET_TX_MUTE, vec![tx_index, u8::from(muted)]);
+        let (reply, raw) = self.exchange(request)?;
+        // The fresh GET's word for the slot we are about to write. Slots
+        // the heart's length gate does not carry return None (see doc).
+        let previous = match tx_index {
+            0 => Some(state.tx1_mute),
+            1 => Some(state.tx2_mute),
+            2 => state.tx3_mute,
+            3 => state.tx4_mute,
+            _ => None,
+        };
+        match reply.payload.as_slice() {
+            [0x00] => Ok(previous),
             [status] => Err(Error::Rejected {
                 status: *status,
                 raw,

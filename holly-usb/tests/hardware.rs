@@ -1348,3 +1348,259 @@ fn set_channel_mode_roundtrip_guarded() {
         ),
     }
 }
+
+// ── TX mute (cmd 22 SET_TX_MUTE) — the per-mic Mute buttons ─────────────────
+
+/// Bounded read-only settle poll for the mute PAIR — same shape as
+/// [`settle_reverb`] (route (b) owner rule): a FIXED number of fresh GETs
+/// spanning about 2 s run before any heart mismatch is declared — a slow
+/// heart is not a dropped write. GET-only; the SET behind this poll is
+/// never retried. The poll CONFIRMS only when BOTH mute bytes match
+/// (`tx1_mute` §5 offset 4 == `want_tx1` AND `tx2_mute` §5 offset 5 ==
+/// the run's `baseline_tx2`): the write addresses ONE slot per frame
+/// ([code] HLDevice6302Activity mute clicks, one ordinal each), so the
+/// OTHER slot's byte must stay at its baseline — a one-leg-only settle
+/// would hide a cross-slot side effect. `Ok(())` = a fresh GET reported
+/// the whole pair; `Err(Some(last))` = the fixed budget ran out (`last`
+/// = the final pair seen); `Err(None)` = no parseable heart within the
+/// budget.
+fn settle_tx_mute(
+    ctl: &mut HollyControl<NusbTransport>,
+    want_tx1: bool,
+    baseline_tx2: bool,
+) -> Result<(), Option<(bool, bool)>> {
+    /// Fixed settle budget: 4 fresh GETs ≈ 2 s — deterministic, not
+    /// adaptive; nothing beyond this count.
+    const POLLS: u32 = 4;
+    let mut last = None;
+    for poll in 0..POLLS {
+        if poll > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        match ctl.get_heart_info() {
+            Ok(info) => {
+                if info.tx1_mute == want_tx1 && info.tx2_mute == baseline_tx2 {
+                    return Ok(());
+                }
+                last = Some((info.tx1_mute, info.tx2_mute));
+            }
+            Err(e) => eprintln!("settle poll {poll:>2}/{POLLS}: GET failed: {e:?}"),
+        }
+    }
+    Err(last)
+}
+
+/// Drop guard for the mute test: mirrors [`ReverbRestoreGuard`] — on any
+/// exit path (normal return, failed assert, panic unwind) poll the device
+/// afresh and, IF `tx1_mute` differs from the run's starting byte, make
+/// ONE verified restore attempt via `set_tx_mute(0, original byte)`.
+/// TX2 is NEVER written by this run (AGENTS.md: TX2 stays gated until
+/// "22 lifted for TX2"): if `tx2_mute` moved from its baseline (it should
+/// not — one TX per frame), the guard only REPORTS the move for the owner
+/// to fix by hand. Errors are logged, never raised from `drop`.
+struct TxMuteRestoreGuard {
+    ctl: Option<HollyControl<NusbTransport>>,
+    original_mute: bool,
+    baseline_tx2_mute: bool,
+}
+
+impl TxMuteRestoreGuard {
+    fn ctl(&mut self) -> &mut HollyControl<NusbTransport> {
+        self.ctl
+            .as_mut()
+            .expect("guard.ctl() may be called only while Some")
+    }
+}
+
+impl Drop for TxMuteRestoreGuard {
+    fn drop(&mut self) {
+        let Some(ctl) = self.ctl.as_mut() else {
+            return;
+        };
+        // Restore decisions come only from a fresh GET, never cached state.
+        match ctl.get_heart_info() {
+            Err(e) => eprintln!("guard: state poll failed, cannot verify restore: {e:?}"),
+            Ok(info) => {
+                if info.tx2_mute != self.baseline_tx2_mute {
+                    eprintln!(
+                        "guard: ⚠ TX2 mute moved ({:?} -> {:?}) during the run — NEVER written by this test; check and fix by hand",
+                        self.baseline_tx2_mute, info.tx2_mute
+                    );
+                }
+                if info.tx1_mute == self.original_mute {
+                    eprintln!(
+                        "guard: TX1 mute already at original ({}), nothing to do",
+                        self.original_mute
+                    );
+                } else {
+                    eprintln!(
+                        "guard: TX1 mute at {:?}, original {:?} — sending one restore SET",
+                        info.tx1_mute, self.original_mute
+                    );
+                    if let Err(e) = ctl.set_tx_mute(0, self.original_mute) {
+                        eprintln!(
+                            "guard: RESTORE FAILED ({e:?}) — device left with tx1_mute={:?} while original was {:?}",
+                            info.tx1_mute, self.original_mute
+                        );
+                    }
+                    // Verify what the single restore attempt actually did.
+                    match ctl.get_heart_info() {
+                        Ok(post) => eprintln!(
+                            "guard: post-restore mutes = tx1={} tx2={}",
+                            post.tx1_mute, post.tx2_mute
+                        ),
+                        Err(e) => eprintln!("guard: post-restore GET failed: {e:?}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Phase 1B route (b): guarded SET_TX_MUTE round trip on real hardware —
+/// substitute evidence for the §1 step-2 gate; on success the checklist
+/// §3 TX-mute row + protocol.md §4 SET_TX_MUTE row tag `[wire]
+/// PC-originated round trip` (§5 offsets 4/5 write==read).
+///
+/// ⚠ AUDIBLE: muting TX1 cuts its mic signal — keep REC/CALLS closed
+/// while this runs (owner rule; TX2 stays OFF and is never powered).
+///
+/// Rules — the set_reverb_roundtrip_guarded rule set applied to the mute
+/// pair, with the per-slot specifics:
+///   fresh GET → SET → ACK gate (`data[0]==0`) → bounded settle-verified
+///   heart delta on the PAIR (`tx1_mute` §5 offset 4 == target AND
+///   `tx2_mute` §5 offset 5 == baseline) → restore → settled verify.
+///   Restore attempted on every exit path.
+/// - Refusal preconditions (never guess the shape): the heart must be the
+///   certified 17-byte field set AND TX1 must be CONNECTED — the APK only
+///   mutes a live transmitter (offline → toast, no write [code
+///   `HLDevice6302Activity.java:668/:682`]).
+/// - Direction: the FIRST leg flips the START byte to its opposite
+///   (`target = !tx1_mute`) — a device resting muted is first UNMUTED, so
+///   the muted phase stays bounded either way; the unmute happens right
+///   after the settle poll.
+/// - TX2 is NEVER written: `tx2_mute` is only a BASELINE the settle polls
+///   verify unchanged, and the exit guard REPORTS any TX2 move instead of
+///   writing it.
+/// - ACK ≠ 0: NO SET retry — one fresh GET; if the byte moved from the
+///   start, ONE verified restore attempt; abort either way.
+/// - The SET leg's own fresh-GET return (the addressed slot's pre-write
+///   mute) is the restore target; drift vs the pre-run GET retargets the
+///   guard, and the restore leg's return must report the byte the SET leg
+///   wrote.
+/// - usbmon (owner-executed) captures the run; the .pcap + exported
+///   .jsonl land in captures/ as the evidence files.
+///
+/// Run only at the owner's explicit go, usbmon running:
+///   cargo test -p holly-usb --test hardware -- set_tx_mute_roundtrip_guarded --ignored --nocapture
+#[test]
+#[ignore = "mutates device state; owner-gated run with usbmon capture active — muting TX1 is AUDIBLE (mic signal cut), keep REC/CALLS closed"]
+fn set_tx_mute_roundtrip_guarded() {
+    let _dev = device_lock();
+    let mut ctl = HollyControl::open().expect("open + claim IF0");
+    let original = ctl.get_heart_info().expect("state poll failed");
+    assert_eq!(original.raw.len(), 17, "certified 17-byte payload shape");
+    assert!(
+        original.tx1_status,
+        "TX1 must be CONNECTED for the mute write (the APK refuses offline TXs [code :668/:682]) — connect TX1 and rerun"
+    );
+    eprintln!(
+        "original mutes: tx1={} tx2={} — ⚠ muting is AUDIBLE, keep REC/CALLS closed; TX2 is never powered or written",
+        original.tx1_mute, original.tx2_mute
+    );
+    let baseline_tx2 = original.tx2_mute;
+    // Flip the START byte to its opposite: an unmuted device is first
+    // muted; a device resting muted is first UNMUTED (bounded muted phase).
+    let target = !original.tx1_mute;
+
+    let mut guard = TxMuteRestoreGuard {
+        ctl: Some(ctl),
+        original_mute: original.tx1_mute,
+        baseline_tx2_mute: baseline_tx2,
+    };
+
+    // FIRST leg: one addressed write, TX1 slot 0 only. The op's own fresh
+    // GET happens inside set_tx_mute, and the Option it returns is the
+    // byte in force JUST before the write: the freshest restore memory
+    // the device has. It wins over the pre-run poll; if another client
+    // moved the mute between the two GETs, the difference is reported and
+    // the exit guard retargets.
+    match guard.ctl().set_tx_mute(0, target) {
+        Ok(previous) => {
+            if previous != Some(original.tx1_mute) {
+                eprintln!(
+                    "DRIFT: pre-run GET said tx1_mute {}, op's fresh GET reported {:?} — restore retargeted",
+                    original.tx1_mute, previous
+                );
+                if let Some(now) = previous {
+                    guard.original_mute = now;
+                }
+            }
+        }
+        Err(e) => {
+            // Route (b) ACK ≠ 0 path: NO SET retry. One fresh GET decides.
+            eprintln!("SET failed: {e:?} — probing once before the single restore");
+            let now = guard
+                .ctl()
+                .get_heart_info()
+                .expect("post-reject GET failed");
+            eprintln!(
+                "mutes after reject: tx1={} tx2={}",
+                now.tx1_mute, now.tx2_mute
+            );
+            if now.tx2_mute != baseline_tx2 {
+                eprintln!(
+                    "⚠ TX2 mute moved during the reject ({:?} -> {:?}) — reported only, never restored by this run",
+                    baseline_tx2, now.tx2_mute
+                );
+            }
+            if now.tx1_mute != original.tx1_mute {
+                eprintln!(
+                    "tx1_mute moved ({:?} -> {:?}): ONE verified restore attempt",
+                    original.tx1_mute, now.tx1_mute
+                );
+                if let Err(e) = guard.ctl().set_tx_mute(0, original.tx1_mute) {
+                    eprintln!("reject-path restore SET failed: {e:?}");
+                }
+                match settle_tx_mute(guard.ctl(), original.tx1_mute, baseline_tx2) {
+                    Ok(()) => eprintln!(
+                        "reject-path restore verified: tx1_mute = {}",
+                        original.tx1_mute
+                    ),
+                    Err(last) => eprintln!("reject-path restore NOT settled (last seen {last:?})"),
+                }
+            }
+            panic!("SET rejected (ack gate) — aborting with no retry per route (b)");
+        }
+    }
+
+    // Heart-delta verify through the bounded settle poll (route (b) rule):
+    // BOTH bytes — the addressed one at its target AND the untouched
+    // TX2 byte at its baseline.
+    match settle_tx_mute(guard.ctl(), target, baseline_tx2) {
+        Ok(()) => eprintln!("write leg confirmed: tx1_mute={target} (tx2 at baseline)"),
+        Err(last) => panic!(
+            "heart never reported tx1_mute={target} with tx2 at baseline within the fixed settle budget (last seen: {last:?}) — guard restores the start byte on the way out"
+        ),
+    }
+
+    // Restore leg = exactly the starting byte, immediately after the
+    // settle poll (the muted phase is bounded). The restore's fresh GET
+    // must report the byte the write leg left.
+    let restore_byte = guard.original_mute;
+    let restore_previous = guard
+        .ctl()
+        .set_tx_mute(0, restore_byte)
+        .expect("restore SET failed");
+    assert_eq!(
+        restore_previous,
+        Some(target),
+        "restore leg's fresh GET must report the byte the write leg left"
+    );
+    match settle_tx_mute(guard.ctl(), restore_byte, baseline_tx2) {
+        Ok(()) => eprintln!("restore confirmed: tx1_mute={restore_byte}"),
+        Err(last) => panic!(
+            "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
+        ),
+    }
+}

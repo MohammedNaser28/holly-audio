@@ -1781,3 +1781,235 @@ fn set_channel_mode_roundtrip_replays_the_real_session() {
         "ack lineage pin"
     );
 }
+
+// ── SET_TX_MUTE (cmd 22): the per-mic Mute buttons, [code]-certified frames ──
+// Route (b) doc vectors — the mute SET path has never been on the wire (§3
+// TX-mute row stays EXTRA-BLOCKED until the guarded round trip runs). Frame
+// layout from the APK builder [code UsbMessengerV2.java:206-210]: prefix
+// `05 03 AA DD` + cmd 16 (= 22) + big-endian len 00 02 + payload
+// `[{txIndex}, {muted}]` (one TX per frame — each mute click names one
+// ordinal, HLDevice6302Activity.java:677/:691/:705/:719) + tail EF (the
+// doc-recomputed SET tail every SET_* family vector carries). ACK: reply
+// header + cmd echo + len 00 01 + status 00 (ProSetTxMute.receiveData reads
+// `toInt(data[0]) == 0` [code :26-30]); the byte behind the payload follows
+// the reply-checksum rule XOR(frame[0..7+len)) ⊕ 0x07 = cmd ⊕ 0x66 —
+// 0x16 ⊕ 0x66 = 0x70, the 6th command shape this rule predicts. UNENFORCED
+// until the run: the crate discards everything past `7+len`, so the vector
+// doubles as an ignore-the-residue regression either way.
+
+/// SET_TX_MUTE of TX1 muted (txIndex 0, muted 01) recomputed from the docs:
+/// `05 03 AA DD 16 00 02 00 01 EF` + zero padding to 64 (big-endian len
+/// 00 02; slot byte at 7, mute byte at 8, tail EF at 9).
+const SET_TX_MUTE_ON_TX1: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x16, 0x00, 0x02, 0x00, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The restore leg — TX1 unmuted: [`SET_TX_MUTE_ON_TX1`] with the mute byte
+/// (frame byte 8) 0x01 → 0x00. The slot byte stays 00.
+const SET_TX_MUTE_OFF_TX1: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x16, 0x00, 0x02, 0x00, 0x00, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// SET_TX_MUTE of TX2 muted (txIndex 1, muted 01): [`SET_TX_MUTE_ON_TX1`]
+/// with the SLOT byte (frame byte 7) 0x00 → 0x01 — length and tail
+/// unchanged, the two payload bytes are independent (one TX per frame).
+const SET_TX_MUTE_ON_TX2: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x16, 0x00, 0x02, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// SET_TX_MUTE ack recomputed from the docs: reply header `05 03 BB DD` +
+/// cmd echo 16 + len 00 01 + status `00` (checklist §3 ACK rule: one status
+/// byte, `data[0] == 0` = success — `ProSetTxMute.receiveData` reads
+/// `toInt(data[0]) == 0` [code :26-30]). The byte behind the payload follows
+/// the reply checksum rule XOR(frame[0..7+len)) ⊕ 0x07 — the cmd-16 prefix
+/// `05 03 BB DD 16 00 01 00` folds to 0x77, 0x77 ⊕ 0x07 = 0x70 (the same
+/// byte the cmd ⊕ 0x66 shortcut predicts: 0x16 ⊕ 0x66 = 0x70). The byte
+/// stays UNENFORCED until the run — the crate must ignore everything past
+/// `7+len`, so the vector still doubles as an ignore-the-residue regression.
+const SET_TX_MUTE_ACK: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x16, 0x00, 0x01, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Route (b) START heart recomputed from the certified 17-byte layout
+/// ([wire] E1, captures/2026-11-05-hearinfo-first-wire.txt) with TX1/TX2
+/// swapped: TX1 CONNECTED at battery 0x5D (payload[2]), TX2 disconnected
+/// (payload[1] = 00), BOTH mute bytes 00 (§5 offsets 4/5), every other
+/// field at E1's resting values. Residue 0x37: fold XOR(payload[0..16)) ⊕
+/// 0x68, the LAST payload byte (signalMode 0) excluded.
+const HEART_RX_TX1_ON: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x37, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The write-leg heart: [`HEART_RX_TX1_ON`] with ONLY tx1_mute (payload[4]
+/// = frame byte 11) moved 00 → 01 — TX2's mute byte (payload[5]) and every
+/// other field stay put. The flipped byte is the doc-recomputed delta side
+/// of route (b), and the residue drops 0x37 → 0x36 per the heart reply
+/// checksum rule (XOR(payload[0..16)) ⊕ 0x68 — LAST payload byte excluded;
+/// signalMode was 0 in E1 so both readings give the same byte; 00^01 flips
+/// that fold, 0x5F⊕0x68=0x37 → 0x5E⊕0x68=0x36).
+const HEART_RX_TX1_MUTED: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x00, 0x5D, 0x00, 0x01, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// set_tx_mute(0, true) — the per-mic mute write (TX1 muted): the op must
+/// issue its own fresh GET first (uniform SET discipline), then the
+/// byte-exact doc-recomputed SET frame, and hand back the fresh GET's mute
+/// word for the ADDRESSED slot as the pre-write state.
+#[test]
+fn set_tx_mute_tx_frame_is_the_apk_layout() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_TX1_ON); // inner fresh GET (mutes rest at 00)
+    mock.push_reply(SET_TX_MUTE_ACK);
+    let mut c = control(mock);
+
+    let previous = c.set_tx_mute(0, true).expect("ack 00 must be accepted");
+    assert_eq!(
+        previous,
+        Some(false),
+        "the fresh GET's tx1_mute 00 is the returned pre-write state"
+    );
+    assert_eq!(
+        &c.transport().written()[1],
+        &SET_TX_MUTE_ON_TX1,
+        "SET TX byte-exact doc layout [txIndex 0, muted 01]"
+    );
+}
+
+/// The payload's two bytes are INDEPENDENT — one TX per frame, no
+/// broadcast variant: addressing TX2 (txIndex 1) keeps frame length and
+/// tail unchanged, moving only the slot byte [code
+/// HLDevice6302Activity.java:677/:691/:705/:719 — each mute click names
+/// one ordinal]. The heart is the certified E1 (TX2 connected) so the
+/// fresh GET reports TX2's resting mute as the pre-write state.
+#[test]
+fn set_tx_mute_slot_byte_is_independent() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner fresh GET (TX2 connected, mutes 00)
+    mock.push_reply(SET_TX_MUTE_ACK);
+    let mut c = control(mock);
+
+    let previous = c.set_tx_mute(1, true).expect("ack 00 must be accepted");
+    assert_eq!(
+        previous,
+        Some(false),
+        "the addressed slot's resting mute is the pre-write state"
+    );
+    assert_eq!(
+        &c.transport().written()[1],
+        &SET_TX_MUTE_ON_TX2,
+        "TX2 write = the same frame with the slot byte at 01"
+    );
+}
+
+/// Route (b) doc round trip: mute TX1 → heart delta → restore. The SET
+/// legs carry the byte-exact doc frames, the settle/final GETs carry the
+/// doc hearts (start pair ↔ TX1-muted pair), and the addressed slot's
+/// pre-write word comes back from each leg's fresh GET. TX2's mute byte
+/// stays 00 across ALL hearts — the per-slot independence the docs
+/// certify (one TX per frame). No lineage pins yet: the wire frames land
+/// with the guarded run and join as replay vectors then.
+#[test]
+fn set_tx_mute_roundtrip_doc_vectors() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_TX1_ON); // op's inner GET (start: mutes off)
+    mock.push_reply(SET_TX_MUTE_ACK); // ack of the mute SET
+    mock.push_reply(HEART_RX_TX1_MUTED); // test's settle GET (heart delta)
+    mock.push_reply(HEART_RX_TX1_MUTED); // op's inner GET of the restore
+    mock.push_reply(SET_TX_MUTE_ACK); // ack of the restore SET
+    mock.push_reply(HEART_RX_TX1_ON); // test's final GET (restored)
+
+    let mut c = control(mock);
+    let previous = c
+        .set_tx_mute(0, true)
+        .expect("doc ack [00]+70 must be accepted (residue unenforced)");
+    assert_eq!(
+        previous,
+        Some(false),
+        "the op's fresh GET rests at tx1_mute 00 (the last-known state)"
+    );
+    let after = c.get_heart_info().expect("doc heart (muted pair) parses");
+    assert!(after.tx1_mute, "heart delta = TX1 muted (payload[4] = 01)");
+    assert!(
+        !after.tx2_mute,
+        "TX2's mute byte stayed 00 — one TX per frame, no broadcast"
+    );
+    assert_eq!(
+        after.tx1_battery, 0x5D,
+        "TX1's battery byte sits at payload[2] in the doc hearts"
+    );
+    assert!(
+        !after.tx2_status,
+        "TX2 stays disconnected in the doc hearts"
+    );
+
+    let restore_previous = c
+        .set_tx_mute(0, false)
+        .expect("doc restore must be accepted");
+    assert_eq!(
+        restore_previous,
+        Some(true),
+        "the restore's fresh GET saw the write leg's effect (muted heart)"
+    );
+    let restored = c.get_heart_info().expect("heart back at the start pair");
+    assert!(!restored.tx1_mute, "restore delta verified — TX1 unmuted");
+
+    let written = c.transport().written();
+    assert_eq!(
+        &written[1], &SET_TX_MUTE_ON_TX1,
+        "SET TX byte-exact doc layout (write leg)"
+    );
+    assert_eq!(
+        &written[4], &SET_TX_MUTE_OFF_TX1,
+        "restore TX byte-exact doc layout [txIndex 0, muted 00]"
+    );
+}
+
+/// Ack gates shared with the SET_NOISE/SET_EQ/SET_GAIN/SET_REVERB/
+/// SET_VOICE_MODE families (checklist §3: uniform `data[0] == 0` success
+/// across all `ProSet*` classes — `ProSetTxMute.receiveData` [code
+/// :26-30]): nonzero status = [`Error::Rejected`], wrong ack length =
+/// [`Error::BadAck`]. Reason same as the other families: the ack shape
+/// has only ever been seen as `[00]` [wire E2/E4].
+#[test]
+fn set_tx_mute_rejects_abnormal_acks() {
+    // nonzero status
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_TX1_ON);
+    let mut ack = SET_TX_MUTE_ACK;
+    ack[7] = 0x03; // status byte != 0
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_tx_mute(0, true).expect_err("nonzero ack must fail");
+    assert!(
+        matches!(err, Error::Rejected { status: 0x03, .. }),
+        "{err:?}"
+    );
+
+    // two-byte ack (echo shape) must not be accepted
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_TX1_ON);
+    let mut ack = SET_TX_MUTE_ACK;
+    ack[6] = 0x02; // payload len 2
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_tx_mute(0, true).expect_err("2-byte ack must fail");
+    assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
+}
