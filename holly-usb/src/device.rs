@@ -214,9 +214,13 @@ impl<T: Transport> HollyControl<T> {
     /// classes; `ProSetVoiceLevel.receiveData` [code]): `[00]` = success;
     /// anything else surfaces as [`Error::Rejected`]/[`Error::BadAck`] — no
     /// retry. Reply-tail bytes stay uninterpreted: heart replies carry
-    /// XOR(payload[0..17]) ⊕ 0x68 [wire ×10], ACK tails are per-session
-    /// constants (docs/protocol.md §2 — decode discards everything past
-    /// `7+len`, so no decode behaviour changes here either way). Values
+    /// XOR(payload[0..16)) ⊕ 0x68 [wire — the LAST payload byte (§5
+    /// offset 16, signalMode) is NOT in the fold; 2026-11-11 correction
+    /// from the reverb run's signalMode=1 hearts, tools/residue_check.py],
+    /// ACK tails follow XOR(whole 7+len prefix) ⊕ 0x07 = cmd ⊕ 0x66
+    /// [wire, 4 command shapes] (docs/protocol.md §2 — decode discards
+    /// everything past `7+len`, so no decode behaviour changes here
+    /// either way). Values
     /// outside the certified 0..=5 stop space are the caller's
     /// responsibility, not assumed here — mirror of
     /// [`HollyControl::set_eq`]'s stance on unobserved bytes.

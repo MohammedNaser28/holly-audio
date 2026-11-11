@@ -438,7 +438,9 @@ const SET_EQ_ACK: [u8; 64] = [
 /// The certified E1 heart with eqLevel (payload offset 12 = frame byte 19)
 /// moved 3 → 2: layout stays [wire] (E1); the flipped value byte is the
 /// doc-recomputed delta side of route (b), and the residue drops to 0x36
-/// per the reply checksum rule (XOR(payload[0..17]) ⊕ 0x68 — value 03^02
+/// per the reply checksum rule (XOR(payload[0..16)) ⊕ 0x68 — the LAST
+/// payload byte, signalMode, is NOT in the fold: 2026-11-11 correction,
+/// signalMode was 0 in E1 so both readings give the same byte; value 03^02
 /// flips that fold, 0x5F⊕0x68=0x37 → 0x5E⊕0x68=0x36;
 /// tools/residue_check.py verifies both).
 const HEART_RX_EQ2: [u8; 64] = [
@@ -568,9 +570,11 @@ fn set_eq_rejects_abnormal_acks() {
 //   #34            SET_EQ restore `05 03 AA DD 07 00 01 03 EF`
 //   #41/#45        heart, eqLevel 3, byte 3C
 // The byte AFTER the payload (frame 24) follows the reply checksum rule
-// XOR(payload[0..17]) ⊕ 0x68 — verified on EVERY reply captured so far
-// (12 packets: 9 distinct heart shapes over 4 sessions at salt 0x68,
-// plus both ACK shapes over the whole 7+len prefix at salt 0x07) by
+// XOR(payload[0..len-1)) ⊕ 0x68 — the LAST payload byte (signalMode, §5
+// offset 16) is NOT in the fold. Verified on EVERY reply captured so far
+// (14 hearts over 5 sessions at salt 0x68 incl. the 2026-11-11 reverb run
+// whose signalMode=1 hearts first split the two readings, plus 4 ACK
+// shapes over the whole 7+len prefix at salt 0x07) by
 // `python3 tools/residue_check.py` [wire]; the crate ignores the byte
 // (past 7+len), which the replay below also proves.
 
@@ -714,7 +718,9 @@ const SET_GAIN_ACK: [u8; 64] = [
 /// The certified E1 heart with voiceLevel (payload offset 8 = frame byte
 /// 15) moved 3 → 2: layout stays [wire] (E1); the flipped value byte is the
 /// doc-recomputed delta side of route (b), and the residue drops to 0x36
-/// per the heart reply checksum rule (XOR(payload[0..17]) ⊕ 0x68 — the
+/// per the heart reply checksum rule (XOR(payload[0..16)) ⊕ 0x68 — the
+/// LAST payload byte, signalMode (§5 offset 16), is NOT in the fold;
+/// signalMode was 0 in E1 so both readings give the same byte — the
 /// 03→02 flip lands the fold 0x5F → 0x5E, 0x5E⊕0x68 = 0x36; the identical
 /// arithmetic the EQ-2 heart vector verified, since EQ2 flipped 03→02 too).
 /// voiceMode (payload[9], §5 offset 9) is a SEPARATE field and stays 0.
@@ -863,7 +869,9 @@ fn set_gain_rejects_abnormal_acks() {
 // The run's live start state was wire stop 2 (NOT the certified rest
 // 3/"4" — the phone had drifted): the guard computed the neighbour below
 // from the fresh GET, so the write leg landed on value 01 and the restore
-// on 02. Heart tail bytes follow XOR(payload[0..17]) ⊕ 0x68 (0x42 at voice
+// on 02. Heart tail bytes follow XOR(payload[0..len-1)) ⊕ 0x68 — the LAST
+// payload byte (signalMode) excluded; the rule read as XOR(payload[0..17])
+// ⊕ 0x68 was the same byte while signalMode stayed 0 (0x42 at voice
 // 2, 0x41 at voice 1, both verified); the ack tail 0x65 is the 4th command
 // shape matching XOR(whole 7+len prefix) ⊕ 0x07 — it was doc-recomputed
 // pre-run and byte-matched on the wire (SET_GAIN_ACK == SET_GAIN_ACK_WIRE),
@@ -1031,7 +1039,9 @@ const SET_REVERB_ACK: [u8; 64] = [
 /// frame byte 20) moved 00 → 01: gear stays 02 — the docs' certified
 /// gear-keeps-value-through-a-toggle [wire §5.2]. Layout stays [wire]
 /// (E1); the residue drops 0x37 → 0x36 per the heart reply checksum rule
-/// (XOR(payload[0..17]) ⊕ 0x68 — the 00→01 flip moves fold 0x5F → 0x5E,
+/// (XOR(payload[0..16)) ⊕ 0x68 — the LAST payload byte, signalMode, is
+/// NOT in the fold: 2026-11-11 correction, signalMode was 0 in E1 so both
+/// readings give the same byte — the 00→01 flip moves fold 0x5F → 0x5E,
 /// 0x5E⊕0x68 = 0x36).
 const HEART_RX_REVERB_ON: [u8; 64] = [
     0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x01, 0x00, 0x03,
@@ -1216,4 +1226,202 @@ fn set_reverb_rejects_abnormal_acks() {
     let mut c = control(mock);
     let err = c.set_reverb(true, 2).expect_err("2-byte ack must fail");
     assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
+}
+
+// ── Reverb route (b): REAL wire frames join as replay vectors ───────────────
+// Full 64-byte buffers from the owner-executed hardware run of
+// set_reverb_roundtrip_guarded, captured 2026-11-11 (captures/raw/
+// set_reverb_roundtrip.pcap → captures/set_reverb_roundtrip.jsonl,
+// bus 6 dev 3). Frame numbers from the export:
+//   #17/#21          heart, reverb off gear 0, battery 0x3B, tail 51
+//                    (rA; #53/#57 = the restore-state hearts, byte-identical)
+//   #22              SET_REVERB `05 03 AA DD 05 00 02 01 00 EF` — toggle ON
+//                    with the STARTING gear 0 ([isOpen, gear])
+//   #25/#37/#49      ack `05 03 BB DD 05 00 01 00 63` (status 00) — the
+//                    doc-predicted tail 0x63 byte-matched pre-run, closing
+//                    the cmd⊕0x66 rule over 4 command shapes
+//   #29/#33          heart, reverb on gear 0 (switch flipped, GEAR UNTOUCHED),
+//                    tail 50
+//   #34              SET_REVERB `05 03 AA DD 05 00 02 01 01 EF` — the
+//                    neighbouring gear (0→1) while on
+//   #41/#45          heart, reverb on gear 1, tail 51
+//   #46              SET_REVERB `05 03 AA DD 05 00 02 00 00 EF` — restore =
+//                    the starting pair (off, gear 0), the APK toggle-off
+//                    shape with the remembered gear
+//   #53/#57          heart, reverb off gear 0 — full starting pair restored
+// The run's live start state was reverb OFF gear 0 (NOT the E1 mock base's
+// gear 2): the guard computed both legs from the fresh GETs, so the write
+// legs landed on gear 00 → 01 and the restore on [00, 00] — the doc layout
+// byte-matches in every leg. NEW: these are the first hearts on record
+// with signalMode (payload[16]) = 1 — their tails (51/50/51) REFUTE the
+// old XOR(payload[0..17]) ⊕ 0x68 wording and fit XOR(payload[0..16)) ⊕
+// 0x68, the LAST payload byte excluded (tools/residue_check.py 14/14
+// hearts; protocol.md §2 wording corrected).
+
+/// Real SET_REVERB toggle-ON frame of the run (export frame 22) —
+/// [isOpen=1, gear=0]: the starting gear passes through the toggle.
+const SET_REVERB_ON_0_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x05, 0x00, 0x02, 0x01, 0x00, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_REVERB neighbour-gear frame (export frame 34) — [01, 01]:
+/// gear moved 0 → 1 while the switch stayed on.
+const SET_REVERB_ON_1_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x05, 0x00, 0x02, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_REVERB RESTORE frame (export frame 46) — [00, 00]: the APK
+/// toggle-off shape with the starting gear as the value byte.
+const SET_REVERB_OFF_0_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x05, 0x00, 0x02, 0x00, 0x00, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at reverb off gear 0 (export frames 17/21/53/57):
+/// TX1 connected battery 0x3B, TX2 disconnected, NC on level 2, voice 2/0,
+/// light on (0x00 inverted), EQ pad 2, signalMode 1, tail 0x51.
+const HEART_WIRE_REVERB_OFF0: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x00, 0x3B, 0x00, 0x00, 0x00, 0x01, 0x02, 0x02,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at reverb on gear 0 (export frames 29/33): the
+/// switch byte moved 00 → 01 (§5 offset 13), GEAR UNTOUCHED (offset 14
+/// stays 00 — gear-keeps-value through a toggle, [wire] now on the write
+/// path too), tail 0x50.
+const HEART_WIRE_REVERB_ON0: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x00, 0x3B, 0x00, 0x00, 0x00, 0x01, 0x02, 0x02,
+    0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x01, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at reverb on gear 1 (export frames 41/45): the
+/// gear byte moved 00 → 01 on the on state, tail 0x51.
+const HEART_WIRE_REVERB_ON1: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x00, 0x3B, 0x00, 0x00, 0x00, 0x01, 0x02, 0x02,
+    0x00, 0x00, 0x00, 0x02, 0x01, 0x01, 0x00, 0x01, 0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_REVERB ack (export frames 25/37/49): 1-byte status 00 + tail
+/// 0x63 — equal to the doc-recomputed [`SET_REVERB_ACK`], which closes the
+/// residue question for this command shape (see the section comment).
+const SET_REVERB_ACK_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x05, 0x00, 0x01, 0x00, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Full real-session replay (reverb's route (b) closure): the export's
+/// control frames replayed through the op end-to-end in the guarded test's
+/// three-leg shape. TX side asserts byte-exact equality with the captured
+/// SET frames; the lineage pins assert the doc-recomputed layout EQUALS
+/// the observed wire frames (gear byte only); the restore leg targets the
+/// pair set_reverb itself returned from its fresh GET.
+#[test]
+fn set_reverb_roundtrip_replays_the_real_session() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_WIRE_REVERB_OFF0); // op's inner GET (= frames 17/21)
+    mock.push_reply(SET_REVERB_ACK_WIRE); // ack of frame 22's SET [01,00]
+    mock.push_reply(HEART_WIRE_REVERB_ON0); // test's settle GET (frames 29/33)
+    mock.push_reply(HEART_WIRE_REVERB_ON0); // op's inner GET of the gear leg
+    mock.push_reply(SET_REVERB_ACK_WIRE); // ack of frame 34's SET [01,01]
+    mock.push_reply(HEART_WIRE_REVERB_ON1); // test's settle GET (frames 41/45)
+    mock.push_reply(HEART_WIRE_REVERB_ON1); // op's inner GET of the restore
+    mock.push_reply(SET_REVERB_ACK_WIRE); // ack of frame 46's SET [00,00]
+    mock.push_reply(HEART_WIRE_REVERB_OFF0); // test's final GET (frames 53/57)
+
+    let mut c = control(mock);
+    let previous = c
+        .set_reverb(true, 0)
+        .expect("real ack [00]+63 must be accepted (residue ignored)");
+    assert_eq!(previous, (false, 0), "frames 17/21 rest at (off, gear 0)");
+    let after_toggle = c.get_heart_info().expect("real heart (residue 50) parses");
+    assert!(
+        after_toggle.reverb_switch && after_toggle.reverb_level == 0,
+        "heart delta = switch on, GEAR UNTOUCHED (frames 29/33)"
+    );
+    assert_eq!(after_toggle.tx1_battery, 0x3B, "run's battery byte");
+    assert!(!after_toggle.tx2_status, "TX2 disconnected in the run");
+    assert_eq!(
+        after_toggle.signal_mode, 1,
+        "the run's hearts carry signalMode=1 — the checksum split"
+    );
+    let gear_previous = c
+        .set_reverb(true, 1)
+        .expect("real neighbour-gear write must be accepted");
+    assert_eq!(
+        gear_previous,
+        (true, 0),
+        "the gear leg's fresh GET saw the toggle's effect"
+    );
+    let after_gear = c.get_heart_info().expect("real heart (residue 51) parses");
+    assert!(
+        after_gear.reverb_switch && after_gear.reverb_level == 1,
+        "heart delta = gear moved on the on state"
+    );
+    let restore_previous = c
+        .set_reverb(false, 0)
+        .expect("real restore must be accepted");
+    assert_eq!(
+        restore_previous,
+        (true, 1),
+        "the restore's fresh GET saw the gear leg's effect"
+    );
+    let restored = c.get_heart_info().expect("heart back at the start pair");
+    assert!(
+        !restored.reverb_switch && restored.reverb_level == 0,
+        "restore delta verified — full starting pair (off, gear 0)"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(
+        &written[1], &SET_REVERB_ON_0_WIRE,
+        "SET TX byte-exact frame 22"
+    );
+    assert_eq!(
+        &written[4], &SET_REVERB_ON_1_WIRE,
+        "gear-leg TX byte-exact frame 34"
+    );
+    assert_eq!(
+        &written[7], &SET_REVERB_OFF_0_WIRE,
+        "restore TX byte-exact frame 46"
+    );
+    // Lineage pins (roadmap §1(b)): the doc-recomputed layout and the
+    // hardware-observed frames are the SAME bytes — the run's gear differs
+    // from the E1 mock base (00 vs 02), so the pins recompute the doc
+    // vectors' gear byte and assert frame equality; the ack tail 0x63 the
+    // checksum rule predicted pre-run is byte-equal as-is.
+    let mut doc_on0 = SET_REVERB_ON_2_TX;
+    doc_on0[8] = 0x00;
+    assert_eq!(
+        SET_REVERB_ON_0_WIRE, doc_on0,
+        "doc layout == observed wire (toggle leg)"
+    );
+    let mut doc_on1 = SET_REVERB_ON_2_TX;
+    doc_on1[8] = 0x01;
+    assert_eq!(
+        SET_REVERB_ON_1_WIRE, doc_on1,
+        "doc layout == observed wire (gear leg)"
+    );
+    let mut doc_off0 = SET_REVERB_OFF_2_TX;
+    doc_off0[8] = 0x00;
+    assert_eq!(
+        SET_REVERB_OFF_0_WIRE, doc_off0,
+        "doc layout == observed wire (restore leg)"
+    );
+    assert_eq!(SET_REVERB_ACK, SET_REVERB_ACK_WIRE, "ack lineage pin");
 }
