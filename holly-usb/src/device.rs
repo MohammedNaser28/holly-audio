@@ -15,6 +15,12 @@
 //!     FIRST, per the APK builder); same set_* shape (fresh GET inside,
 //!     returns the pre-write pair); [code] until the guarded round trip
 //!     runs.
+//!   - `set_channel_mode(u8)` — cmd 1, single-byte payload `[{value}]`
+//!     (voiceMode, Mono=0/Stereo=1); same set_* shape (fresh GET inside,
+//!     returns the pre-write mode); [code] until the guarded round trip
+//!     runs. THE re-enumeration-risk control: the mode change re-presents
+//!     the audio path, so callers must expect the handle to die briefly
+//!     after the write.
 
 use nusb::MaybeFuture;
 
@@ -296,6 +302,80 @@ impl<T: Transport> HollyControl<T> {
         let (reply, raw) = self.exchange(request)?;
         match reply.payload.as_slice() {
             [0x00] => Ok((state.reverb_switch, state.reverb_level)),
+            [status] => Err(Error::Rejected {
+                status: *status,
+                raw,
+            }),
+            other => Err(Error::BadAck {
+                len: other.len(),
+                raw,
+            }),
+        }
+    }
+
+    /// Write the receiver channel mode — the "Channel mode" panel's
+    /// Mono/Stereo selector — cmd 1 SET_VOICE_MODE, single-byte payload
+    /// `[{value}]` [code docs/set-gate-checklist.md §3 Channel-mode row:
+    /// `UsbMessengerV2.setVoiceMode(int value)` builds
+    /// `saveReserved(new byte[]{(byte) value})` — `UsbMessengerV2.java:185-188`;
+    /// cmd re-derived from `ProSetVoiceMode.getCmd()` = `(byte) 1`
+    /// (`ProSetVoiceMode.java:15-17`)]. Identity write semantics, from the
+    /// APK's own selector caller: the `mono_mode` press sends 0, the
+    /// `stereo_mode` press sends 1 (`HLDevice6302Activity.java:1651-1652`,
+    /// `:1661-1662`). The write space EQUALS the read space (no inversion):
+    /// heart `voiceMode` (§5 offset 9, `ProGetHearInfo.java:69-71`) is the
+    /// same value the read path renders — `monoMode` selected at 0,
+    /// `stereoMode` at 1 (`HLDevice6302Activity.java:1803-1805`, whose field
+    /// is literally named `channelMode`); §5.2 Channel-mode row. The APK's
+    /// GET companion (cmd 2) has NO producer in `UsbMessengerV2` — readback
+    /// rides the heart poll, like light/identify/speaker/shutdown (checklist
+    /// §3 footnote). The frame stays [code] until the guarded PC-side round
+    /// trip captures it on the wire (route (b) — that run settles the §3
+    /// Channel-mode row).
+    ///
+    /// Returns the voiceMode THIS call's fresh `get_heart_info()` reported —
+    /// the value in force on the device immediately **before** the write.
+    /// The fresh GET is the crate's uniform SET discipline (one fresh GET
+    /// inside every SET call; no observable device state is ever cached),
+    /// it gates the SET on a live, answering device, and its mode goes back
+    /// to the caller instead of being dropped: a guarded round trip's
+    /// restore leg targets THAT value, not a possibly older pre-run poll —
+    /// if another client moved the mode between the caller's own GET and
+    /// this SET, the returned mode is the freshest memory the device has.
+    /// (The SET frame itself still carries only `[{value}]` — this payload
+    /// has no preserved byte, §3 Channel-mode row.)
+    ///
+    /// ⚠ THIS is the re-enumeration-risk control (feature prompt §Risks):
+    /// changing the channel mode re-presents the audio path to the host —
+    /// the phone app itself stops its recorder, waits 200 ms and restarts it
+    /// after every mode change [code `HLDevice6302Activity.java:1837-1861`],
+    /// and the dongle may briefly drop its interfaces or change its USB
+    /// address. The control handle can therefore go dead right after a
+    /// successful ack; callers (the guarded test) must reopen by VID:PID
+    /// within a bounded window instead of assuming the op failed.
+    ///
+    /// Ack gating is identical to [`HollyControl::set_gain`] (checklist §3:
+    /// the `data[0] == 0` status rule is uniform across all `ProSet*`
+    /// classes — `ProSetVoiceMode.receiveData` reads `toInt(data[0]) == 0`
+    /// [code `ProSetVoiceMode.java:25-28`]): `[00]` = success; anything else
+    /// surfaces as [`Error::Rejected`]/[`Error::BadAck`] — no retry.
+    /// Reply-tail bytes stay uninterpreted: heart replies carry
+    /// XOR(payload[0..16)) ⊕ 0x68 [wire — LAST payload byte excluded],
+    /// ACK tails follow XOR(whole 7+len prefix) ⊕ 0x07 = cmd ⊕ 0x66 [wire,
+    /// 4 command shapes] (docs/protocol.md §2 — decode discards everything
+    /// past `7+len`, so no decode behaviour changes here either way).
+    /// Values outside the documented 0/1 space are the caller's
+    /// responsibility, not assumed here — family convention (mirror of
+    /// [`HollyControl::set_gain`]).
+    pub fn set_channel_mode(&mut self, value: u8) -> Result<u8, Error> {
+        // Fresh GET inside every SET (crate rule). The channel-mode payload
+        // has no preserved byte (§3 Channel-mode row); the snapshot's mode
+        // is returned to the caller as the pre-write state.
+        let state = self.get_heart_info()?;
+        let request = Frame::new(cmd::SET_VOICE_MODE, vec![value]);
+        let (reply, raw) = self.exchange(request)?;
+        match reply.payload.as_slice() {
+            [0x00] => Ok(state.voice_mode),
             [status] => Err(Error::Rejected {
                 status: *status,
                 raw,

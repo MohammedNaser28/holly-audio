@@ -1425,3 +1425,198 @@ fn set_reverb_roundtrip_replays_the_real_session() {
     );
     assert_eq!(SET_REVERB_ACK, SET_REVERB_ACK_WIRE, "ack lineage pin");
 }
+
+// ── Channel mode (cmd 1, SET_VOICE_MODE) — route (b), doc vectors ───────────
+// Owner rule (roadmap §1(b), same as EQ/gain/reverb): Mock vectors are
+// RECOMPUTED FROM THE DOCS until the hardware run; real usbmon frames join
+// as replay vectors after it. Every frame below is computed from docs only:
+//   frame template       docs/protocol.md §2 (ProtocolV2.getData [code])
+//   cmd 1, payload       docs/set-gate-checklist.md §3 Channel-mode row
+//                        ([{value}] — UsbMessengerV2.java:185-188)
+//   value space 0/1      identity mono→0, stereo→1
+//                        (HLDevice6302Activity.java:1651-1662); read side
+//                        heart voiceMode §5 offset 9 (ProGetHearInfo.java:
+//                        69-71), 0=Mono/1=Stereo (§5.2, :1803-1805)
+// The heart reply is the wire-certified E1 heart (captures/
+// 2026-11-05-hearinfo-first-wire.txt, which already rests at voiceMode 0)
+// with only the value byte moved — the 17-byte heart layout is [wire].
+
+/// SET_VOICE_MODE of Stereo (1) recomputed from the docs:
+/// `05 03 AA DD 01 00 01 01 EF` + zero padding to 64 (big-endian len 00 01).
+const SET_CHANNEL_MODE_1_TX: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x01, 0x00, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// SET_VOICE_MODE ack recomputed from the docs: reply header `05 03 BB DD`
+/// with cmd echo 01, len 00 01, status `00` (checklist §3 ACK rule: one
+/// status byte, `data[0] == 0` = success — `ProSetVoiceMode.receiveData`
+/// reads `toInt(data[0]) == 0` [code :25-28]). The byte behind the payload
+/// follows the reply checksum rule XOR(frame[0..7+len)) ⊕ 0x07 — for cmd 01
+/// the prefix folds to 0x60, 0x60 ⊕ 0x07 = 0x67 (the same byte the 4-shape
+/// cmd ⊕ 0x66 shortcut predicts: 0x01 ⊕ 0x66 = 0x67). The byte stays
+/// UNINTERPRETED by the crate — it must ignore everything past `7+len`, so
+/// the vector still doubles as an ignore-the-residue regression.
+const SET_CHANNEL_MODE_ACK: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x01, 0x00, 0x01, 0x00, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The certified E1 heart with voiceMode (payload offset 9 = frame byte 16)
+/// moved 0 → 1: layout stays [wire] (E1); the flipped value byte is the
+/// doc-recomputed delta side of route (b), and the residue drops to 0x36
+/// per the heart reply checksum rule (XOR(payload[0..16)) ⊕ 0x68 — the LAST
+/// payload byte, signalMode, is NOT in the fold; signalMode was 0 in E1 so
+/// both readings give the same byte; value 00^01 flips that fold,
+/// 0x5F⊕0x68=0x37 → 0x5E⊕0x68=0x36). Every OTHER field stays put — gain
+/// (voiceLevel, offset 8) stays 3 (the §3 Gain row deliberately left this
+/// neighbouring field alone), EQ stays 3, reverb stays (off, gear 2).
+const HEART_RX_MODE1: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x01, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// set_channel_mode(1) (Stereo — the other documented value; the E1 heart
+/// rests at Mono 0 [wire, session 1; §5.2 every heart so far read 0]): the
+/// op must issue its own fresh GET first (uniform SET discipline), then the
+/// byte-exact doc-recomputed SET frame, and hand back the fresh GET's mode
+/// as the pre-write state.
+#[test]
+fn set_channel_mode_tx_frame_is_the_apk_layout() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner fresh GET (device rests at Mono 0)
+    mock.push_reply(SET_CHANNEL_MODE_ACK);
+    let mut c = control(mock);
+
+    let previous = c.set_channel_mode(1).expect("ack 00 must be accepted");
+    assert_eq!(
+        previous, 0,
+        "fresh GET inside set_channel_mode = the mode before write"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(&written[0], &HEART_TX, "op must issue its own GET first");
+    assert_eq!(
+        &written[1], &SET_CHANNEL_MODE_1_TX,
+        "SET channel mode must be the doc-recomputed stereo frame"
+    );
+    assert_eq!(
+        written[1][4],
+        cmd::SET_VOICE_MODE,
+        "cmd echo = 1 [code ProSetVoiceMode.getCmd]"
+    );
+}
+
+/// The documented value space is exactly two values (0=Mono, 1=Stereo —
+/// identity on both the write caller `HLDevice6302Activity.java:1651-1662`
+/// and the read renderer `:1803-1805`): each SET differs from the stereo
+/// frame in the value byte only (cmd stays 01; no second payload byte).
+#[test]
+fn set_channel_mode_value_space_changes_only_the_value_byte() {
+    for value in [0u8, 1] {
+        let mut mock = MockTransport::new();
+        mock.push_reply(HEART_RX_E1);
+        mock.push_reply(SET_CHANNEL_MODE_ACK);
+        let mut c = control(mock);
+
+        let previous = c.set_channel_mode(value).expect("ack 00 must be accepted");
+        assert_eq!(previous, 0, "fresh GET reported mode {value} INCOMING");
+        let mut want = SET_CHANNEL_MODE_1_TX;
+        want[7] = value; // value byte sits at frame offset 7 (tail EF at 8)
+        assert_eq!(&c.transport().written()[1], &want, "mode {value}");
+    }
+}
+
+/// Full doc-vector round trip (route (b), Mock half) in the shape the
+/// guarded hardware test rehearses: device rests at Mono 0 (E1 IS that
+/// state [wire]), write the other documented value (Stereo 1), ack `00`,
+/// heart settles voiceMode → 1 (§5 offset 9) with every neighbouring field
+/// untouched (gain stays 3 — the mode byte is the ONLY delta); restore 0,
+/// heart settles back. Frames asserted both ways round trip; the restore
+/// TARGET comes from set_channel_mode's own return (the fresh GET inside
+/// the write), not a caller-side poll.
+#[test]
+fn set_channel_mode_roundtrip_doc_vectors() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner GET of set_channel_mode(1): device at 0
+    mock.push_reply(SET_CHANNEL_MODE_ACK); // ack for SET_VOICE_MODE [01]
+    mock.push_reply(HEART_RX_MODE1); // post-SET fresh GET: delta = 1
+    mock.push_reply(HEART_RX_MODE1); // inner GET of the restore: device at 1
+    mock.push_reply(SET_CHANNEL_MODE_ACK); // ack for SET_VOICE_MODE [00]
+    mock.push_reply(HEART_RX_E1); // post-restore fresh GET: delta = 0
+
+    let mut c = control(mock);
+    let previous = c
+        .set_channel_mode(1)
+        .expect("channel-mode write must be accepted");
+    assert_eq!(previous, 0, "pre-write mode from the op's own fresh GET");
+    let after = c.get_heart_info().expect("post-SET GET");
+    assert_eq!(
+        after.voice_mode, 1,
+        "heart delta must equal the written mode"
+    );
+    assert_eq!(
+        after.voice_level, 3,
+        "voiceLevel (§5 offset 8, the neighbouring gain field) must never move"
+    );
+    assert_eq!(after.eq_level, 3, "eqLevel (§5 offset 12) must never move");
+    assert_eq!(
+        (after.reverb_switch, after.reverb_level),
+        (false, 2),
+        "reverb fields (§5 offsets 13/14) must never move"
+    );
+    let restore_previous = c
+        .set_channel_mode(previous)
+        .expect("restore must be accepted");
+    assert_eq!(restore_previous, 1, "fresh GET before restore saw mode 1");
+    let restored = c.get_heart_info().expect("post-restore GET");
+    assert_eq!(
+        restored.voice_mode, 0,
+        "heart must be back at the start mode"
+    );
+    assert_eq!(restored.voice_level, 3, "voiceLevel still untouched");
+
+    let written = c.transport().written();
+    let mut set0 = SET_CHANNEL_MODE_1_TX;
+    set0[7] = previous; // value byte at frame offset 7 (tail EF at 8)
+    assert_eq!(&written[1], &SET_CHANNEL_MODE_1_TX, "write leg is stereo 1");
+    assert_eq!(&written[4], &set0, "restore leg is the op's OWN return");
+}
+
+/// Ack gates shared with the SET_NOISE/SET_EQ/SET_GAIN/SET_REVERB families
+/// (checklist §3: uniform `data[0] == 0` success across all `ProSet*`
+/// classes — `ProSetVoiceMode.receiveData` [code :25-28]): nonzero status =
+/// [`Error::Rejected`], wrong ack length = [`Error::BadAck`]. Reason same
+/// as the other families: the ack shape has only ever been seen as `[00]`
+/// [wire E2/E4].
+#[test]
+fn set_channel_mode_rejects_abnormal_acks() {
+    // nonzero status
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_CHANNEL_MODE_ACK;
+    ack[7] = 0x03; // status byte != 0
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_channel_mode(1).expect_err("nonzero ack must fail");
+    assert!(
+        matches!(err, Error::Rejected { status: 0x03, .. }),
+        "{err:?}"
+    );
+
+    // two-byte ack (echo shape) must not be accepted
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_CHANNEL_MODE_ACK;
+    ack[6] = 0x02; // payload len 2
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_channel_mode(1).expect_err("2-byte ack must fail");
+    assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
+}

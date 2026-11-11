@@ -19,6 +19,13 @@
 //! neighbouring gear while on; when it rests ON it only moves the
 //! neighbouring gear and NEVER switches off. Reverb is AUDIBLE on the
 //! mics — the owner keeps recording/monitoring off for the run.
+//! `set_channel_mode_roundtrip_guarded` applies them to channel mode
+//! (cmd 1 SET_VOICE_MODE, Mono=0/Stereo=1) — the one control that can
+//! re-enumerate the dongle (the mode change re-presents the audio path):
+//! every transport failure inside the settle window triggers a reopen by
+//! VID:PID, the restore guard reopens too, and an unreturned device
+//! aborts with the restore NOT verified. The owner keeps recording,
+//! calls, music and monitoring closed for the run.
 
 use holly_usb::{HollyControl, NusbTransport};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -1063,6 +1070,279 @@ fn set_reverb_roundtrip_guarded() {
     );
     match settle_reverb(guard.ctl(), start.0, start.1) {
         Ok(()) => eprintln!("restore confirmed: reverb pair = ({:?})", start),
+        Err(last) => panic!(
+            "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
+        ),
+    }
+}
+
+// ── Channel mode (cmd 1 SET_VOICE_MODE) — the re-enumeration-risk control ───
+
+/// Drop guard for the channel-mode test: mirrors [`ReverbRestoreGuard`],
+/// with the feature-prompt's re-enumeration tolerance (§Risks) — the mode
+/// change can drop the control handle or change the USB address, so the
+/// restore path must REOPEN by VID:PID within a bounded window instead of
+/// trusting the handle the run opened. On any exit path (normal return,
+/// failed assert, panic unwind): up to 4 reopen rounds (the same ≈2 s
+/// budget shape as the settle poll) fetch a fresh GET; the FIRST successful
+/// GET decides — if the mode differs from the run's starting mode, ONE
+/// verified restore attempt via `set_channel_mode(original)`. Errors are
+/// logged, never raised from `drop`; a device that never answers inside
+/// the window aborts with the restore NOT verified (report it, no rerun).
+struct ChannelModeRestoreGuard {
+    ctl: Option<HollyControl<NusbTransport>>,
+    original: u8,
+}
+
+impl ChannelModeRestoreGuard {
+    fn ctl(&mut self) -> &mut HollyControl<NusbTransport> {
+        self.ctl
+            .as_mut()
+            .expect("guard.ctl() may be called only while Some")
+    }
+
+    /// Replace the handle after a suspected re-enumeration: drop the dead
+    /// one (its Drop reattaches the kernel driver — harmless when the node
+    /// is gone), then enumerate afresh and claim IF0. `HollyControl::open`
+    /// matches VID:PID only, so a CHANGED USB device address is fine. One
+    /// attempt per call; callers bound the retries with the settle budget.
+    fn reopen(&mut self) {
+        self.ctl = None;
+        match HollyControl::open() {
+            Ok(c) => {
+                eprintln!("reopen: IF0 re-claimed by VID:PID 3547:0407");
+                self.ctl = Some(c);
+            }
+            Err(e) => eprintln!("reopen by VID:PID failed: {e:?}"),
+        }
+    }
+}
+
+impl Drop for ChannelModeRestoreGuard {
+    fn drop(&mut self) {
+        const ROUNDS: u32 = 4;
+        for round in 0..ROUNDS {
+            if self.ctl.is_none() {
+                std::thread::sleep(Duration::from_millis(500));
+                self.reopen();
+            }
+            let Some(ctl) = self.ctl.as_mut() else {
+                continue;
+            };
+            match ctl.get_heart_info() {
+                Ok(info) => {
+                    if info.voice_mode == self.original {
+                        eprintln!(
+                            "guard: channel mode already at original ({}), nothing to do",
+                            self.original
+                        );
+                    } else {
+                        eprintln!(
+                            "guard: channel mode at {}, original {} — sending one restore SET",
+                            info.voice_mode, self.original
+                        );
+                        if let Err(e) = ctl.set_channel_mode(self.original) {
+                            eprintln!(
+                                "guard: RESTORE FAILED ({e:?}) — device left at {} while original was {}",
+                                info.voice_mode, self.original
+                            );
+                        }
+                        // Verify what the single restore attempt actually did.
+                        match ctl.get_heart_info() {
+                            Ok(post) => {
+                                eprintln!("guard: post-restore voiceMode = {}", post.voice_mode)
+                            }
+                            Err(e) => eprintln!("guard: post-restore GET failed: {e:?}"),
+                        }
+                    }
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("guard: state poll failed (round {round}/{ROUNDS}): {e:?}");
+                    self.ctl = None;
+                }
+            }
+        }
+        eprintln!(
+            "guard: device never answered within the reopen window — restore NOT verified, REPORT"
+        );
+    }
+}
+
+/// Bounded settle poll for the channel-mode delta: 4 fresh GETs ≈ 2 s,
+/// reads only. `Ok(())` = a fresh GET reported the written mode;
+/// `Err(Some(last))` = the budget ran out (`last` = the final mode seen);
+/// `Err(None)` = no parseable heart within the budget.
+///
+/// Re-enumeration tolerance (feature prompt §Risks): the write can drop
+/// the control handle or change the USB address, so a GET failure inside
+/// the budget triggers a reopen by VID:PID and the poll CONTINUES on the
+/// fresh handle within the SAME window. If the device does not come back
+/// inside the window the budget simply runs out — the caller aborts and
+/// the exit guard's own reopen window is the last resort.
+fn settle_channel_mode(guard: &mut ChannelModeRestoreGuard, want: u8) -> Result<(), Option<u8>> {
+    const POLLS: u32 = 4;
+    let mut last = None;
+    for poll in 0..POLLS {
+        if poll > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let Some(ctl) = guard.ctl.as_mut() else {
+            // Handle was lost (or the previous reopen failed): reopen by
+            // VID:PID inside the SAME bounded window, keep polling.
+            guard.reopen();
+            continue;
+        };
+        match ctl.get_heart_info() {
+            Ok(info) => {
+                if info.voice_mode == want {
+                    return Ok(());
+                }
+                last = Some(info.voice_mode);
+            }
+            Err(e) => {
+                eprintln!("settle poll {poll:>2}/{POLLS}: GET failed: {e:?}");
+                guard.reopen();
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Phase 1B route (b): guarded SET_VOICE_MODE round trip on real hardware —
+/// substitute evidence for the §1 step-2 gate; on success the checklist §3
+/// Channel-mode row + protocol.md §4 SET_VOICE_MODE row tag `[wire]
+/// PC-originated round trip` (§5.2's read map gets its write-side
+/// confirmation).
+///
+/// ⚠ THE AUDIO PATH CHANGES: keep recording, calls, music and any
+/// monitoring closed while this runs (feature prompt §Risks). The dongle
+/// may briefly disappear or change its USB address after the write — the
+/// capture script records the whole bus, so the pcap survives an address
+/// change; this test tolerates the gap by reopening by VID:PID.
+///
+/// Rules — the set_reverb_roundtrip_guarded rule set applied to channel
+/// mode:
+///   fresh GET → SET → ACK gate (`data[0]==0`) → bounded settle-verified
+///   heart delta (`voiceMode` §5 offset 9) → restore → settled verify.
+///   Restore attempted on every exit path (with reopen).
+/// - Precondition (feature prompt §Guarded test design): the dongle is
+///   readable and the current mode is one of the two documented values;
+///   anything else refuses the run. The written value is the OTHER
+///   documented value — never outside {0, 1}.
+/// - ACK ≠ 0 or SET transport failure: NO SET retry — one fresh GET (the
+///   exit guard's reopen window covers a vanished device); if the mode
+///   moved from the start, ONE verified restore attempt; abort either way.
+/// - Any heart mismatch is declared only AFTER the fixed ~2 s settle poll.
+/// - The SET leg's own fresh-GET return (the mode in force just before the
+///   write) is the restore target; drift vs the pre-run GET retargets the
+///   guard, and the restore leg's return must report the mode the SET leg
+///   wrote.
+/// - usbmon (owner-executed) captures the run; the .pcap + exported .jsonl
+///   land in captures/ as the evidence files.
+///
+/// Run only at the owner's explicit go, usbmon running:
+///   cargo test -p holly-usb --test hardware -- set_channel_mode_roundtrip_guarded --ignored --nocapture
+#[test]
+#[ignore = "mutates device state; owner-gated run with usbmon capture active — the audio path re-presents; keep REC/CALLS/MUSIC/MONITORING off"]
+fn set_channel_mode_roundtrip_guarded() {
+    let _dev = device_lock();
+    let mut ctl = HollyControl::open().expect("open + claim IF0");
+    let original = ctl.get_heart_info().expect("state poll failed");
+    assert_eq!(original.raw.len(), 17, "certified 17-byte payload shape");
+    eprintln!(
+        "original channel mode: voiceMode={} (0=Mono, 1=Stereo) — ⚠ keep REC/CALLS/MUSIC/MONITORING off",
+        original.voice_mode
+    );
+    eprintln!(
+        "TX states: tx1={} tx2={}",
+        original.tx1_status, original.tx2_status
+    );
+
+    // Precondition: current mode inside the documented space; write the
+    // OTHER documented value. Never out of space (route (b) rule).
+    let target = match original.voice_mode {
+        0 => 1,
+        1 => 0,
+        other => panic!(
+            "voiceMode {other} is outside the documented space 0/1 (Mono/Stereo) — refusing the run"
+        ),
+    };
+
+    let mut guard = ChannelModeRestoreGuard {
+        ctl: Some(ctl),
+        original: original.voice_mode,
+    };
+
+    // WRITE leg: the other documented value. The op's own fresh GET happens
+    // inside set_channel_mode, and the mode it returns is the state in
+    // force JUST before the write: the freshest restore memory the device
+    // has. It wins over the pre-run poll; if another client moved the mode
+    // between the two GETs, the difference is reported and the exit guard
+    // retargets.
+    let start = match guard.ctl().set_channel_mode(target) {
+        Ok(previous) => {
+            if previous != original.voice_mode {
+                eprintln!(
+                    "DRIFT: pre-run GET said {}, op's fresh GET reported {} — restore retargeted",
+                    original.voice_mode, previous
+                );
+                guard.original = previous;
+            }
+            previous
+        }
+        Err(e) => {
+            // Route (b) ACK ≠ 0 / transport-failure path: NO SET retry. One
+            // fresh GET decides (if the device vanished mid-SET this GET
+            // fails and the panic lands in the exit guard's reopen window).
+            eprintln!("SET failed: {e:?} — probing once before the single restore");
+            let now = guard
+                .ctl()
+                .get_heart_info()
+                .expect("post-reject GET failed");
+            eprintln!("channel mode after reject: {}", now.voice_mode);
+            let wanted = guard.original;
+            if now.voice_mode != wanted {
+                eprintln!(
+                    "mode moved ({} -> {}): ONE verified restore attempt",
+                    wanted, now.voice_mode
+                );
+                if let Err(e) = guard.ctl().set_channel_mode(wanted) {
+                    eprintln!("reject-path restore SET failed: {e:?}");
+                }
+                match settle_channel_mode(&mut guard, wanted) {
+                    Ok(()) => eprintln!("reject-path restore verified: mode = {}", wanted),
+                    Err(last) => {
+                        eprintln!("reject-path restore NOT settled (last seen {last:?})")
+                    }
+                }
+            }
+            panic!("SET rejected (ack gate) — aborting with no retry per route (b)");
+        }
+    };
+
+    // Heart-delta verify through the bounded settle poll (route (b) rule,
+    // reopen-tolerant).
+    match settle_channel_mode(&mut guard, target) {
+        Ok(()) => eprintln!("write leg confirmed: voiceMode={target}"),
+        Err(last) => panic!(
+            "heart never reported voiceMode={target} within the fixed settle budget (last seen: {last:?}) — guard restores the original on the way out"
+        ),
+    }
+
+    // Restore leg = exactly the starting mode, via set_channel_mode so the
+    // guard's cross-check style mirrors EQ/gain/reverb: the restore's fresh
+    // GET must report the mode the write leg left.
+    let restore_previous = guard
+        .ctl()
+        .set_channel_mode(start)
+        .expect("restore SET failed");
+    assert_eq!(
+        restore_previous, target,
+        "restore leg's fresh GET must report the mode the write leg left"
+    );
+    match settle_channel_mode(&mut guard, start) {
+        Ok(()) => eprintln!("restore confirmed: voiceMode={start}"),
         Err(last) => panic!(
             "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
         ),
