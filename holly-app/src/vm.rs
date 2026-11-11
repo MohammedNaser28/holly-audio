@@ -318,6 +318,20 @@ pub fn mute_label(muted: bool) -> &'static str {
     if muted { "Muted" } else { "Mute" }
 }
 
+/// The inverse translation a UI click needs: a mic-card index (the
+/// design's Mic 1/Mic 2 cards, 0-based) -> the WIRE slot byte
+/// `set_tx_mute` writes. Identity on 0..=1: the card order IS the wire's
+/// TX1/TX2 order — `txIndex` = `coerceIn(deviceType.ordinal() - 1, 0, 3)`
+/// [code `UsbMessengerV2.java:206-210`, callers naming TX1 first at
+/// `HLDevice6302Activity.java:677`], so Mic 1 → slot 0, Mic 2 → slot 1.
+/// The GUI has exactly two mic cards (design: "Mic 1/Mic 2"), so indices
+/// beyond 1 have no card and no write — even though the wire protocol
+/// itself addresses four slots. Pure function like [`volume_pad_wire`]
+/// so frontends never hardcode device values.
+pub fn tx_mute_wire(mic: usize) -> Option<u8> {
+    (mic <= 1).then_some(mic as u8)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TxVm {
     pub connected: bool,
@@ -325,6 +339,12 @@ pub struct TxVm {
     pub battery: u8,
     pub battery_class: BatteryClass,
     pub muted: bool,
+    /// A TX-mute write ADDRESSED TO THIS PANEL (`PendingWrite::TxMute`
+    /// carrying this panel's own wire slot) is in flight — the mute chip
+    /// dims to the existing in-flight look and ignores clicks until the
+    /// device's verdict. Per-slot scoping: a Mic 1 write never dims
+    /// Mic 2 (one TX per frame, checklist §3).
+    pub applying: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -544,10 +564,30 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
             ViewModel {
                 banner: None,
                 banner_text: None,
-                tx1: Some(tx_vm(heart.tx1_status, heart.tx1_battery, heart.tx1_mute)),
-                tx2: Some(tx_vm(heart.tx2_status, heart.tx2_battery, heart.tx2_mute)),
-                tx3: tail_tx(heart.tx3_status, heart.tx3_battery, heart.tx3_mute),
-                tx4: tail_tx(heart.tx4_status, heart.tx4_battery, heart.tx4_mute),
+                tx1: Some(tx_vm(
+                    heart.tx1_status,
+                    heart.tx1_battery,
+                    heart.tx1_mute,
+                    tx_applying(s, 0),
+                )),
+                tx2: Some(tx_vm(
+                    heart.tx2_status,
+                    heart.tx2_battery,
+                    heart.tx2_mute,
+                    tx_applying(s, 1),
+                )),
+                tx3: tail_tx(
+                    heart.tx3_status,
+                    heart.tx3_battery,
+                    heart.tx3_mute,
+                    tx_applying(s, 2),
+                ),
+                tx4: tail_tx(
+                    heart.tx4_status,
+                    heart.tx4_battery,
+                    heart.tx4_mute,
+                    tx_applying(s, 3),
+                ),
                 nc: NcVm {
                     state: Some(heart.noise_switch),
                     level: Some(heart.noise_level),
@@ -560,6 +600,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                         | Some(PendingWrite::Gain(_))
                         | Some(PendingWrite::Reverb(_, _))
                         | Some(PendingWrite::ChannelMode(_))
+                        | Some(PendingWrite::TxMute { .. })
                         | None => None,
                     },
                     last_error: None,
@@ -630,20 +671,38 @@ fn disconnected_core() -> ViewModel {
     }
 }
 
-fn tx_vm(connected: bool, battery: u8, muted: bool) -> TxVm {
+/// Per-slot pending scoping for the mic cards: a TX-mute write dims ONLY
+/// the panel whose wire slot it addresses (tx 0..=3 = tx1..tx4) — every
+/// other family's pending never touches a mic card. Mirrors the per-family
+/// filters the NC/EQ/gain/reverb/channel panels apply to the same
+/// one-bucket pending.
+fn tx_applying(s: &Snapshot, slot: u8) -> bool {
+    matches!(
+        s.pending_set,
+        Some(PendingWrite::TxMute { tx, .. }) if tx == slot
+    )
+}
+
+fn tx_vm(connected: bool, battery: u8, muted: bool, applying: bool) -> TxVm {
     TxVm {
         connected,
         battery,
         battery_class: battery_class(battery),
         muted,
+        applying,
     }
 }
 
-fn tail_tx(status: Option<bool>, battery: Option<u8>, mute: Option<bool>) -> Option<TxVm> {
+fn tail_tx(
+    status: Option<bool>,
+    battery: Option<u8>,
+    mute: Option<bool>,
+    applying: bool,
+) -> Option<TxVm> {
     // All three fields appear at their own offsets together [code
     // ProGetHearInfo.java:100-123]; if any is None they are None together.
     match (status, battery, mute) {
-        (Some(st), Some(bat), Some(m)) => Some(tx_vm(st, bat, m)),
+        (Some(st), Some(bat), Some(m)) => Some(tx_vm(st, bat, m, applying)),
         _ => None,
     }
 }
@@ -1270,6 +1329,59 @@ mod tests {
         assert_eq!(reverb_selection(2), Some(2), "Large");
         assert_eq!(reverb_selection(3), None, "no certified pad");
         assert_eq!(reverb_selection(255), None, "no certified pad");
+    }
+
+    /// Mic-card → wire-slot translation: the design's Mic 1/Mic 2 card
+    /// indices map identity onto the wire's TX1/TX2 slots [code the APK's
+    /// `ordinal() - 1` clamp, TX1 first]; there are exactly two mic cards,
+    /// so anything beyond has no card and no write.
+    #[test]
+    fn tx_mute_wire_is_the_two_card_identity() {
+        assert_eq!(tx_mute_wire(0), Some(0), "Mic 1 = wire slot 0");
+        assert_eq!(tx_mute_wire(1), Some(1), "Mic 2 = wire slot 1");
+        assert_eq!(tx_mute_wire(2), None, "no mic card beyond the two panels");
+        assert_eq!(tx_mute_wire(255), None);
+    }
+
+    /// A TX-mute write pends ONLY the panel whose slot it addresses (per-
+    /// slot scoping, one TX per frame): a Mic 1 write dims tx1 while tx2
+    /// stays untouched — and no other family's write dims any mic card.
+    #[test]
+    fn tx_mute_applying_is_slot_scoped() {
+        let vm = view_model(&snap(
+            ConnStatus::Connected,
+            Some(e1()),
+            Some(PendingWrite::TxMute { tx: 0, muted: true }),
+            None,
+        ));
+        let tx1 = vm.tx1.expect("tx1 panel exists");
+        assert!(tx1.applying, "a Mic 1 write dims the Mic 1 panel");
+        assert!(!tx1.muted, "state stays the device's");
+        assert!(
+            !vm.tx2.expect("tx2 panel exists").applying,
+            "Mic 2 never sees a Mic 1 write"
+        );
+
+        // A slot-1 write scopes the other way.
+        let vm = view_model(&snap(
+            ConnStatus::Connected,
+            Some(e1()),
+            Some(PendingWrite::TxMute { tx: 1, muted: true }),
+            None,
+        ));
+        assert!(!vm.tx1.expect("tx1").applying, "Mic 1 stays live");
+        assert!(vm.tx2.expect("tx2").applying, "Mic 2 dims");
+
+        // Another family's write: no mic card dims, NC never sees it.
+        let vm = view_model(&snap(
+            ConnStatus::Connected,
+            Some(e1()),
+            Some(PendingWrite::Eq(2)),
+            None,
+        ));
+        assert!(!vm.tx1.expect("tx1").applying);
+        assert!(!vm.tx2.expect("tx2").applying);
+        assert_eq!(vm.nc.pending, None, "EQ write never pends the NC panel");
     }
 
     /// Battery segments: ~20 % per segment, ceil, 0 unlit (presentation-

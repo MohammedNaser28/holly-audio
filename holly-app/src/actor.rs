@@ -80,6 +80,11 @@ pub enum PendingWrite {
     /// lives in `vm::channel_mode_selection`/`vm::channel_mode_pad_wire`,
     /// never here.
     ChannelMode(u8),
+    /// A TX-mute write is in flight: the bytes are the WIRE pair being
+    /// written, `(tx, muted)` — the 0-based slot (TX1=0 … TX4=3) then the
+    /// mute byte, one TX per frame (checklist §3 TX-mute row). The
+    /// identity mapping lives in `vm::tx_mute_wire`, never here.
+    TxMute { tx: u8, muted: bool },
 }
 
 /// Commands the UI/frontend may send.
@@ -120,6 +125,13 @@ pub enum Command {
     /// Coalesces to the latest like every other SET (one SET per batch,
     /// newest intent).
     SetChannelMode(u8),
+    /// Request a TX-mute write, `tx` the WIRE 0-based slot (TX1=0 … TX4=3)
+    /// and `muted` the mute byte 0/1 — one TX per frame (checklist §3
+    /// TX-mute row: write space == read space, §5 offsets 4/5). The
+    /// DISPLAY-order translation lives in the VM (`tx_mute_wire`), never
+    /// in a frontend. Coalesces to the latest like every other SET (one
+    /// SET per batch, newest intent).
+    SetTxMute { tx: u8, muted: bool },
     /// Force one fresh poll/reconnect attempt now.
     Refresh,
 }
@@ -221,6 +233,14 @@ impl DeviceHandle {
     /// the device verdict.
     pub fn set_channel_mode(&self, value: u8) {
         let _ = self.tx.send(Command::SetChannelMode(value));
+    }
+
+    /// Request a TX-mute write (WIRE pair `(tx, muted)`; display-order
+    /// translation is the VM's `tx_mute_wire`). Fire-and-forget like
+    /// every other send: the snapshot stream reports "pending" then the
+    /// device verdict.
+    pub fn set_tx_mute(&self, tx: u8, muted: bool) {
+        let _ = self.tx.send(Command::SetTxMute { tx, muted });
     }
 
     pub fn refresh(&self) {
@@ -338,6 +358,9 @@ impl Core {
                     write = Some(PendingWrite::Reverb(switch, gear))
                 }
                 Command::SetChannelMode(value) => write = Some(PendingWrite::ChannelMode(value)),
+                Command::SetTxMute { tx, muted } => {
+                    write = Some(PendingWrite::TxMute { tx, muted })
+                }
             }
         }
         if self.device.is_none() {
@@ -457,6 +480,7 @@ impl Core {
                 source.set_reverb(switch, gear).map(|_previous| ())
             }
             PendingWrite::ChannelMode(value) => source.set_channel_mode(value).map(|_previous| ()),
+            PendingWrite::TxMute { tx, muted } => source.set_tx_mute(tx, muted).map(|_previous| ()),
         };
         match result {
             Ok(()) => {

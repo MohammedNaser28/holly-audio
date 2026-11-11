@@ -181,6 +181,32 @@ impl StatusSource for DemoDevice {
         heart.voice_mode = value;
         Ok(previous)
     }
+
+    fn set_tx_mute(&mut self, tx: u8, muted: bool) -> Result<Option<bool>, Error> {
+        // Same shape as holly-usb's set_tx_mute: the RETURN is the
+        // ADDRESSED slot's mute the heart held BEFORE the write
+        // (Option<bool> — tx3/tx4 slots exist in the demo payload only if
+        // the heart shape carried them; the certified 17-byte DEMO_PAYLOAD
+        // has none, so those slots return None and stay inert); the write
+        // mutates only the addressed slot's heart byte (tx 0/1 = the
+        // always-present §5 offsets 4/5), one TX per frame, everything
+        // else stays scripted. Pending scenario: stall BEFORE mutation,
+        // so the pending snapshot is always observable first (same shape
+        // as set_gain).
+        let mut heart = self.heart.lock().unwrap();
+        let previous = match tx {
+            0 => Some(heart.tx1_mute),
+            1 => Some(heart.tx2_mute),
+            _ => None,
+        };
+        std::thread::sleep(self.stall);
+        match (tx, previous) {
+            (0, Some(_)) => heart.tx1_mute = muted,
+            (1, Some(_)) => heart.tx2_mute = muted,
+            _ => {} // unaddressable slot (no heart field): nothing to write
+        }
+        Ok(previous)
+    }
 }
 
 /// The OS busy condition, byte-for-byte the real claim failure shape

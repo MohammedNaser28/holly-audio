@@ -101,7 +101,7 @@ use holly_app::vm::{
     Banner, ChannelModeVm, DEVICE_NAME, EqVm, GainVm, NcVm, ReverbVm, TxVm, VID_PID, ViewModel,
     WRITABLE, battery_segment_count, channel_mode_pad_wire, conn_status_word, eq_pad_wire,
     mic_status, mute_label, nc_level_label, nc_status, reverb_gear_wire, reverb_selection,
-    reverb_toggle_wire, view_model, volume_pad_wire,
+    reverb_toggle_wire, tx_mute_wire, view_model, volume_pad_wire,
 };
 
 actions!(
@@ -674,6 +674,20 @@ fn channel_pick(index: usize, channel: &ChannelModeVm) -> ChannelPick {
     ChannelPick::Write
 }
 
+/// Write gate for ONE mic card's mute chip — the three-part conjunction
+/// [`reverb_toggle_accepted`] uses, plus the connectedness half the mute
+/// family needs: the certified family (`WRITABLE.mic_mute` — false until
+/// the guarded round trip lands, so the click path is INERT today without
+/// re-touching any view), the TX CONNECTED (the APK refuses offline mutes
+/// with a toast, no write [code `HLDevice6302Activity.java:668/:682`]),
+/// and nothing in flight for THAT card (per-slot `applying`; ONE SET runs
+/// at a time — any other family's pending blocks too: the actor's
+/// latest-wins coalescing stays the ONLY queue, the UI never queues a
+/// second write).
+fn mic_mute_write_accepted(tx: &TxVm) -> bool {
+    WRITABLE.mic_mute && tx.connected && !tx.applying
+}
+
 /// Banner decoration per kind, decided ONLY from `Banner` (the design
 /// colour rule: amber = needs attention, red = error, grey = everything
 /// else; container stays on the designed BANNER_BG/BANNER_LINE). The
@@ -977,6 +991,26 @@ impl AppModel {
         self.channel_step(1, cx);
     }
 
+    /// One mic card's mute flip path (the chip click; no keyboard action —
+    /// the feature spec wires the Mute button for click only).
+    /// [`mic_mute_write_accepted`] is the whole gate, and the flip target
+    /// is computed from the VERIFIED state (`!muted`) — never optimistically.
+    /// The WIRE slot comes from the VM's tested translation
+    /// ([`tx_mute_wire`]) — this file never names a device slot value.
+    fn flip_mic_mute(&mut self, slot: usize) {
+        let tx = match slot {
+            0 => self.vm.tx1.as_ref(),
+            1 => self.vm.tx2.as_ref(),
+            _ => None,
+        };
+        if let Some(tx) = tx
+            && mic_mute_write_accepted(tx)
+            && let Some(wire) = tx_mute_wire(slot)
+        {
+            self.device.set_tx_mute(wire, !tx.muted);
+        }
+    }
+
     fn refresh_now(&mut self, _: &mut Context<Self>) {
         self.device.refresh();
     }
@@ -1171,8 +1205,8 @@ impl AppModel {
                     .flex()
                     .flex_col()
                     .gap(px(theme::metrics::SPACE_4))
-                    .child(self.mic_card("mic-1", self.vm.tx1.as_ref()).flex_1())
-                    .child(self.mic_card("mic-2", self.vm.tx2.as_ref()).flex_1()),
+                    .child(self.mic_card("mic-1", 0, self.vm.tx1.as_ref(), cx).flex_1())
+                    .child(self.mic_card("mic-2", 1, self.vm.tx2.as_ref(), cx).flex_1()),
             )
             .child(
                 // right: rows 1fr / 132 / 120
@@ -1266,11 +1300,19 @@ impl AppModel {
 
     /// One mic card (336px column, halves): reference recipe — icon in a
     /// WELL circle, name 15/600, LED + status (`mic_status`), mute chip
-    /// (state read `[wire read]`, no write path — `WRITABLE.mic_mute` false),
-    /// the 64px battery readout (LIGHT, "--" when unavailable), 5 battery
+    /// (state read `[wire read]`; the chip is click-interactive only while
+    /// [`mic_mute_write_accepted`] passes — family gate + connectedness —
+    /// and dims to the existing 0.5 while ITS write is in flight), the
+    /// 64px battery readout (LIGHT, "--" when unavailable), 5 battery
     /// segments, and an UNLIT 20-segment level meter (no wire source for
     /// the meter: always unlit, per the writability/evidence rules).
-    fn mic_card(&self, id: &'static str, tx: Option<&TxVm>) -> gpui::Div {
+    fn mic_card(
+        &self,
+        id: &'static str,
+        slot: usize,
+        tx: Option<&TxVm>,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
         let (name, status, muted, digits, live, lit) = match tx {
             Some(tx) => (
                 name_for(id),
@@ -1298,8 +1340,39 @@ impl AppModel {
         } else {
             theme::color::TEXT_3
         });
-        // NO element id: the card is not interactive; its child controls
-        // carry their own affordances (svg needs none).
+        // The card itself stays non-interactive; its child chip carries
+        // the affordance (svg needs none). The chip is keyed by its card
+        // ("mic-1-mute"/"mic-2-mute") — `.id` is required for the gated
+        // click listener, the reverb-toggle shape: the listener attaches
+        // ONLY while the whole gate passes, so a read-only family or an
+        // in-flight write leaves the chip inert without new visuals.
+        let chip_id: &'static str = if slot == 0 { "mic-1-mute" } else { "mic-2-mute" };
+        let applying = tx.is_some_and(|tx| tx.applying);
+        let mut chip = div()
+            .id(chip_id)
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .h(px(36.))
+            .px(px(12.))
+            .rounded(px(theme::metrics::BUTTON_RADIUS))
+            .border_1()
+            .border_color(solid(theme::color::LINE))
+            .bg(solid(theme::color::RAISED))
+            .text_color(solid(theme::color::TEXT))
+            .text_size(px(theme::text::BODY_SIZE))
+            .font_weight(FontWeight::SEMIBOLD)
+            // the family's existing in-flight look (0.5), per-slot pending
+            .when(applying, |chip| chip.opacity(0.5))
+            .child(svg_glyph(ICON_MIC, 14., solid(theme::color::TEXT)))
+            .child(muted);
+        if let Some(tx) = tx
+            && mic_mute_write_accepted(tx)
+        {
+            chip = chip.on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+                this.flip_mic_mute(slot)
+            }));
+        }
         div()
             .flex()
             .flex_col()
@@ -1349,25 +1422,7 @@ impl AppModel {
                             ),
                     )
                     .child(div().flex_1())
-                    .child(
-                        // read-only mute state chip; full opacity (a known
-                        // state displays, it never greys out)
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .h(px(36.))
-                            .px(px(12.))
-                            .rounded(px(theme::metrics::BUTTON_RADIUS))
-                            .border_1()
-                            .border_color(solid(theme::color::LINE))
-                            .bg(solid(theme::color::RAISED))
-                            .text_color(solid(theme::color::TEXT))
-                            .text_size(px(theme::text::BODY_SIZE))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(svg_glyph(ICON_MIC, 14., solid(theme::color::TEXT)))
-                            .child(muted),
-                    ),
+                    .child(chip),
             )
             .child(
                 // battery part + meter part in ONE 10px-gap column
@@ -2559,6 +2614,7 @@ mod tests {
             battery,
             battery_class: battery_class(battery),
             muted: false,
+            applying: false,
         }
     }
 

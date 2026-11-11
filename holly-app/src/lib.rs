@@ -158,6 +158,17 @@ pub trait StatusSource {
     /// (restore-flow datum) exactly like set_gain; the actor's verdict
     /// comes from its own post-SET poll.
     fn set_channel_mode(&mut self, value: u8) -> Result<u8, Error>;
+    /// One SET_TX_MUTE round trip — `tx` is the WIRE 0-based slot
+    /// (TX1=0 … TX4=3, checklist §3 TX-mute row: the APK's
+    /// `setMicMute(on, deviceType)` clamps `ordinal() - 1` [code]), one TX
+    /// per frame; `muted` is the write byte 0/1 (write space == read
+    /// space, §5 offsets 4/5 — no inversion). The return is the fresh
+    /// GET's PRE-write mute of the ADDRESSED slot — the restore-flow
+    /// datum exactly like set_gain — and `None` where the fresh heart's
+    /// length does not carry that slot's field (tx3/tx4 mute gates
+    /// [code ProGetHearInfo.java:100-123]); the actor's verdict comes from
+    /// its own post-SET poll.
+    fn set_tx_mute(&mut self, tx: u8, muted: bool) -> Result<Option<bool>, Error>;
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {
@@ -187,6 +198,10 @@ impl<T: Transport> StatusSource for HollyControl<T> {
 
     fn set_channel_mode(&mut self, value: u8) -> Result<u8, Error> {
         HollyControl::set_channel_mode(self, value)
+    }
+
+    fn set_tx_mute(&mut self, tx: u8, muted: bool) -> Result<Option<bool>, Error> {
+        HollyControl::set_tx_mute(self, tx, muted)
     }
 }
 
