@@ -1620,3 +1620,164 @@ fn set_channel_mode_rejects_abnormal_acks() {
     let err = c.set_channel_mode(1).expect_err("2-byte ack must fail");
     assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
 }
+
+// ── Channel mode route (b): REAL wire frames join as replay vectors ─────────
+// Full 64-byte buffers from the owner-executed hardware run of
+// set_channel_mode_roundtrip_guarded, captured 2026-11-11 (captures/raw/
+// set_channel_mode_roundtrip.pcap → captures/set_channel_mode_roundtrip.jsonl,
+// bus 6 dev 3; 16 data transfers, 65 ms). Row numbers from the export:
+//   #2/#4            heart, voiceMode 0 (Mono), TX1 OFF / TX2 ON battery
+//                    0x64, NC on level 2, voice 4, eq 3, reverb off gear 0,
+//                    signalMode 0, tail 09 (#14/#16 = the restore-state
+//                    hearts, byte-identical)
+//   #5               SET_VOICE_MODE `05 03 AA DD 01 00 01 01 EF` — the OTHER
+//                    documented value (Stereo 1); the run's live start was
+//                    wire 0 (Mono, the last-known state)
+//   #6/#12           ack `05 03 BB DD 01 00 01 00 67` (status 00) — the
+//                    doc-predicted tail 0x67 byte-matched pre-run, closing
+//                    the cmd⊕0x66 rule over 5 command shapes
+//   #8/#10           heart, voiceMode 1 (Stereo) — the ONLY payload byte
+//                    that moved across all six hearts (offset 9, §5), tail 08
+//   #11              SET_VOICE_MODE `05 03 AA DD 01 00 01 00 EF` — restore =
+//                    the starting Mono 0
+//   #14/#16          heart, voiceMode 0 — start state restored (the second
+//                    is the exit guard's own GET, already at original)
+// No re-enumeration occurred: device address 3 throughout, 16/16 transfers
+// succeeded, every settle poll matched on its first GET — the guarded test's
+// reopen-by-VID:PID tolerance was NEVER exercised (it exists for the next
+// run's risk, not this one's). Heart tails fit XOR(payload[0..16)) ⊕ 0x68
+// (09/08) and the ack tail fits XOR(7+len prefix) ⊕ 0x07 — both rules'
+// predictions byte-matched, protocol.md §2.
+
+/// Real SET_VOICE_MODE write frame of the run (export row 5) — value 01
+/// (Stereo): the other documented value, written from Mono 0.
+const SET_CHANNEL_MODE_1_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x01, 0x00, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_VOICE_MODE RESTORE frame (export row 11) — value 00 (Mono): the
+/// starting state written back exactly.
+const SET_CHANNEL_MODE_0_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x01, 0x00, 0x01, 0x00, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at voiceMode 0 (export rows 2/4/14/16): TX1 OFF,
+/// TX2 ON battery 0x64, TX1 battery 0, both unmuted, NC on level 2, voice 4,
+/// Mono 0, shutdown 0, light on (0x00 inverted), eq 3, reverb off gear 0,
+/// txIdentify 0, signalMode 0, tail 0x09.
+const HEART_WIRE_MODE0: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x64, 0x00, 0x00, 0x01, 0x02, 0x04,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at voiceMode 1 (export rows 8/10): ONLY the mode
+/// byte moved 00 → 01 (§5 offset 9 = frame byte 16) across all six hearts —
+/// state-change congruence on the write path; tail 0x08 (the mode flip
+/// folds 0x61 → 0x60, ⊕0x68 → 0x08).
+const HEART_WIRE_MODE1: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x64, 0x00, 0x00, 0x01, 0x02, 0x04,
+    0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_VOICE_MODE ack (export rows 6/12): 1-byte status 00 + tail
+/// 0x67 — equal to the doc-recomputed [`SET_CHANNEL_MODE_ACK`], which
+/// closes the residue question for this command shape (see the section
+/// comment).
+const SET_CHANNEL_MODE_ACK_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x01, 0x00, 0x01, 0x00, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Full real-session replay (channel mode's route (b) closure): the export's
+/// control frames replayed through the op end-to-end in the guarded test's
+/// leg shape (write 1, settle, restore 0, settle, exit guard). TX side
+/// asserts byte-exact equality with the captured SET frames; the lineage
+/// pins assert the doc-recomputed layout EQUALS the observed wire frames;
+/// the restore leg targets the mode set_channel_mode itself returned from
+/// its fresh GET.
+#[test]
+fn set_channel_mode_roundtrip_replays_the_real_session() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_WIRE_MODE0); // op's inner GET (= rows 2/4)
+    mock.push_reply(SET_CHANNEL_MODE_ACK_WIRE); // ack of row 5's SET [01]
+    mock.push_reply(HEART_WIRE_MODE1); // test's settle GET (rows 8/10)
+    mock.push_reply(HEART_WIRE_MODE1); // op's inner GET of the restore (row 10)
+    mock.push_reply(SET_CHANNEL_MODE_ACK_WIRE); // ack of row 11's SET [00]
+    mock.push_reply(HEART_WIRE_MODE0); // test's final GET (rows 14/16)
+
+    let mut c = control(mock);
+    let previous = c
+        .set_channel_mode(1)
+        .expect("real ack [00]+67 must be accepted (residue ignored)");
+    assert_eq!(
+        previous, 0,
+        "rows 2/4 rest at Mono 0 (the last-known state)"
+    );
+    let after = c.get_heart_info().expect("real heart (residue 08) parses");
+    assert_eq!(after.voice_mode, 1, "heart delta = Stereo (rows 8/10)");
+    assert!(
+        !after.tx1_status,
+        "TX1 disconnected in the run (owner note)"
+    );
+    assert!(after.tx2_status, "TX2 connected in the run (owner note)");
+    assert_eq!(after.tx2_battery, 0x64, "run's TX2 battery byte");
+    assert_eq!(after.voice_level, 4, "run's gain byte (phone drift from 3)");
+    assert_eq!(
+        after.signal_mode, 0,
+        "signalMode 0 in this run — both tail readings coincide"
+    );
+    let restore_previous = c
+        .set_channel_mode(0)
+        .expect("real restore must be accepted");
+    assert_eq!(
+        restore_previous, 1,
+        "the restore's fresh GET saw the write leg's effect (row 10)"
+    );
+    let restored = c.get_heart_info().expect("heart back at the start mode");
+    assert_eq!(
+        restored.voice_mode, 0,
+        "restore delta verified — Mono restored (row 14)"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(
+        &written[1], &SET_CHANNEL_MODE_1_WIRE,
+        "SET TX byte-exact row 5"
+    );
+    assert_eq!(
+        &written[4], &SET_CHANNEL_MODE_0_WIRE,
+        "restore TX byte-exact row 11"
+    );
+    // Lineage pins (roadmap §1(b)): the doc-recomputed layout and the
+    // hardware-observed frames are the SAME bytes — the run started at the
+    // same mode the doc vectors assumed (0), so the write-leg pin is
+    // byte-equal as-is and the restore pin recomputes only the value byte;
+    // the ack tail 0x67 the checksum rule predicted pre-run is byte-equal
+    // as-is (n=5 for cmd ⊕ 0x66).
+    assert_eq!(
+        SET_CHANNEL_MODE_1_WIRE, SET_CHANNEL_MODE_1_TX,
+        "doc layout == observed wire (write leg)"
+    );
+    let mut doc_0 = SET_CHANNEL_MODE_1_TX;
+    doc_0[7] = 0x00;
+    assert_eq!(
+        SET_CHANNEL_MODE_0_WIRE, doc_0,
+        "doc layout == observed wire (restore leg)"
+    );
+    assert_eq!(
+        SET_CHANNEL_MODE_ACK, SET_CHANNEL_MODE_ACK_WIRE,
+        "ack lineage pin"
+    );
+}
