@@ -17,19 +17,29 @@ Hypotheses per frame, over three windows (WITHOUT the residue byte itself):
               ProtocolV2.java:179-186, plain XOR) though `getData()` never
               applies it [code]
   * xor+sal — XOR fold ⊕ a fixed salt (sweep: 0x06, 0x07). Salted variants
-              exist because the mock replays name a checksum
-              XOR(payload[0..17]) ⊕ 0x68 for heart replies (mock.rs replay
-              note), and XOR of the 7 heart header bytes is a constant 0x6E,
-              making that equal XOR(whole 7+len prefix) ⊕ 0x06; the sweep
-              found ACK replies obey the same window with salt 0x07, so the
+              exist because the heart replies fit XOR(payload[0..len-1))
+              ⊕ 0x68 (mock.rs replay note — 2026-11-11: len-1, the last
+              payload byte/signalMode excluded, NOT the full 17 bytes),
+              and XOR of the 7 heart header bytes is a constant 0x6E,
+              making that equal XOR(whole 7+len-1 prefix) ⊕ 0x06; the sweep
+              found ACK replies fit the full prefix with salt 0x07, so the
               residue VARIES with the command instead of staying 0x75.
   * crc8    — a fixed sweep of common CRC-8 parameter sets
               (poly x init x refin/refout x xorout)
-Windows: header+cmd+len+payload (the whole 7+len prefix), cmd+len+payload,
-payload only. Verdicts are counted separately for heart replies and SET ACKs;
-rows only print where a hypothesis has at least one hit, to keep the answer
-readable. Pure analysis: nothing here feeds the decoder — do NOT wire any
-hypothesis into holly-proto/holly-usb without its own evidence gate.
+Windows: header+cmd+len+payload (the whole 7+len prefix), the same window
+minus the LAST payload byte, cmd+len+payload, payload only, and payload
+minus the last byte. Verdicts are counted separately for heart replies and
+SET ACKs; rows only print where a hypothesis has at least one hit, to keep
+the answer readable. Pure analysis: nothing here feeds the decoder — do NOT
+wire any hypothesis into holly-proto/holly-usb without its own evidence gate.
+
+2026-11-11 (reverb round trip, signalMode=1 hearts): the FIRST hearts on
+record with payload[16] (signalMode) set to 1 split the two candidate
+payload windows — XOR(payload[0..17]) ⊕ 0x68 (the "×10 certified" 17-byte
+reading, correct only while signalMode was 0) fails them (0x51 observed vs
+0x50 predicted), while XOR(payload[0..16)) ⊕ 0x68 (payload minus its last
+byte) fits EVERY heart on record. docs/protocol.md §2 wording follows this
+tool's verdict.
 
 Evidence: every vector below is parsed from an evidence file in captures/
 (the constant list carries the file + frame identity; frames are the RX legs
@@ -87,14 +97,28 @@ FRAMES: list[tuple[str, bytes, str]] = [
     _heart("gA lv2 b0x2B r17", "01 00 2B 00 00 00 01 02 02 00 00 00 01 00 00 00 00", 0x42),
     _heart("gB lv1 b0x2B r29", "01 00 2B 00 00 00 01 02 01 00 00 00 01 00 00 00 00", 0x41),
     _ack("gW/r ack", 0x03, 0x65),
+    # Reverb round trip — captures/raw/set_reverb_roundtrip.pcap exported as
+    # captures/set_reverb_roundtrip.jsonl frames 17/21/53/57 (rA, reverb off
+    # gear 0), 29/33 (rB, on gear 0), 41/45 (rC, on gear 1), 25/37/49 (ack
+    # cmd 05): TX1 connected, battery 0x3B, NC on level 2, voice 2, EQ pad 2,
+    # reverb off gear 0 at start; SET_REVERB legs [01,00] / [01,01] / [00,00].
+    # FIRST hearts on record with signalMode (payload[16]) = 1 — they split
+    # the 17-byte vs 16-byte checksum windows. Bodies read VERBATIM from the
+    # jsonl `hex` column (frame bytes 7..24+residue).
+    _heart("rA rev-off g0 b0x3B r17", "01 00 3b 00 00 00 01 02 02 00 00 00 02 00 00 00 01", 0x51),
+    _heart("rB rev-on g0 b0x3B r29", "01 00 3b 00 00 00 01 02 02 00 00 00 02 01 00 00 01", 0x50),
+    _heart("rC rev-on g1 b0x3B r41", "01 00 3b 00 00 00 01 02 02 00 00 00 02 01 01 00 01", 0x51),
+    _ack("rW/r ack", 0x05, 0x63),
 ]
 
 # ── hypotheses ──────────────────────────────────────────────────────────────
 
 WINDOWS = {
-    "head7+len": (0, None),    # frame[0 .. 7+len)  (stops before the residue)
-    "cmd..payload": (4, None),
-    "payload": (7, None),
+    "head7+len": (0, 0),       # frame[0 .. 7+len)
+    "head7+len-1": (0, -1),    # frame[0 .. 7+len-1) — prefix minus the LAST payload byte
+    "cmd..payload": (4, 0),
+    "payload": (7, 0),         # payload[0 .. len)
+    "payload-1": (7, -1),      # payload[0 .. len-1) — minus the last payload byte
 }
 
 def xor_fold(data: bytes) -> int:
@@ -102,8 +126,9 @@ def xor_fold(data: bytes) -> int:
 
 # Salted XOR: checksum candidates with a folded-in constant. XOR of the 7
 # heart header bytes (05 03 BB DD 1F 00 11) is the constant 0x6E, so the
-# payload-window checksum XOR(payload[0..17]) ⊕ 0x68 lands here as salt 0x06
-# over the prefix window; the ACK-family salt in the same window is 0x07.
+# payload-minus-last-byte checksum XOR(payload[0..len-1)) ⊕ 0x68 lands here
+# as salt 0x06 over the reduced prefix window; the ACK-family salt in the
+# full prefix window is 0x07.
 XOR_SALTS = (0x06, 0x07)
 
 # CRC-8 sweep: (poly, init, refine_input_reflect_output, xorout). The
@@ -133,11 +158,13 @@ def crc8(data: bytes, poly: int, init: int, refin: bool, xorout: int) -> int:
 # ── evaluation ──────────────────────────────────────────────────────────────
 
 def windows_of(frame: bytes) -> dict[str, bytes]:
-    # payload layout for both shapes here: len field at 5..6 (BE, low byte at 6)
+    # payload layout for both shapes here: len field at 5..6 (BE, low byte at 6).
+    # `hi` offsets the exclusive end by 0 (full window) or -1 (drop the last
+    # payload byte — the signalMode/status slot the 2026-11-11 split exposed).
     end = 7 + frame[6]
     return {
-        name: frame[lo:end]
-        for name, (lo, _hi) in WINDOWS.items()
+        name: frame[lo:end + hi]
+        for name, (lo, hi) in WINDOWS.items()
     }
 
 def main() -> None:
@@ -164,7 +191,7 @@ def main() -> None:
     acks_n = sum(1 for _, _, k in FRAMES if k == "ack")
     print(f"vectors: {hearts_n} heart replies, {acks_n} SET ACKs "
           "(captures/2026-11-05-*.txt + captures/set_eq_roundtrip.jsonl +\n"
-          "captures/set_gain_roundtrip.jsonl)\n")
+          "captures/set_gain_roundtrip.jsonl + captures/set_reverb_roundtrip.jsonl)\n")
 
     print(f"{'hypothesis':42} {'hearts':>9} {'acks':>7} {'total':>7}")
     # aggregate per (hypothesis, window) across both kinds; only hypotheses
@@ -183,24 +210,43 @@ def main() -> None:
         if total:
             print(f"{name:32} {wname:9} {h_ok:>4}/{h_n:<4} {a_ok:>4}/{a_n:<3} {total:>4}/{all_n}")
 
-    # Rule check on the embedded set: heart replies take prefix-salt 0x08,
-    # SET ACKs take prefix-salt 0x07 (mock.rs documents the equivalent
-    # payload-window form XOR(payload[0..17]) ⊕ 0x68 for hearts, since the
-    # heart header XOR is the constant 0x60 = 0x68 ⊕ 0x08).
-    h8 = counters[("xor+06", "head7+len", "heart")]
+    # Rule check on the embedded set: heart replies take the 7+len-minus-1
+    # prefix window with salt 0x06 (≡ XOR(payload[0..len-1)) ⊕ 0x68 — for
+    # the 17-byte hearts: XOR(payload[0..16)) ⊕ 0x68, the signalMode byte
+    # EXCLUDED), SET ACKs take the full 7+len prefix with salt 0x07
+    # (≡ cmd ⊕ 0x66 for the 1-byte-status shape; the status byte is always
+    # 00 so far, so the ACK windows coincide and the distinction is open).
+    # The full-payload heart reading (XOR(payload[0..17]) ⊕ 0x68, mock.rs's
+    # old wording) is checked separately: it can only agree while
+    # signalMode = 0.
+    h16 = counters[("xor+06", "head7+len-1", "heart")]
+    h17 = counters[("xor+06", "head7+len", "heart")]
     a7 = counters[("xor+07", "head7+len", "ack")]
-    h8ok, h8n = sum(h8), len(h8)
+    h16ok, h16n = sum(h16), len(h16)
+    h17ok, h17n = sum(h17), len(h17)
     a7ok, a7n = sum(a7), len(a7)
-    if h8ok == h8n and a7ok == a7n:
+    if h16ok == h16n and a7ok == a7n and h17ok < h17n:
         print(
-            f"\nverdict: the residue byte IS a reproducible XOR-8 checksum over\n"
-            f"the whole 7+len prefix with a fixed salt — heart replies take "
-            f"0x06\n({h8ok}/{h8n} vectors; ≡ XOR(payload[0..17]) ⊕ 0x68, the\n"
-            f"mock-replay checksum), SET ACKs take 0x07 ({a7ok}/{a7n}). The\n"
-            f"ACK residue therefore VARIES with the command (NC 13 -> 0x75,\n"
-            f"EQ 07 -> 0x61) instead of being a constant. What the per-family\n"
-            f"salt is derived from (0x06 vs 0x07) stays open (protocol.md open\n"
-            f"question 2); decode behaviour untouched — no holly-proto change."
+            f"\nverdict: the residue byte IS a reproducible XOR-8 checksum,\n"
+            f"with the last payload byte EXCLUDED from the heart window:\n"
+            f"hearts fit XOR(payload[0..len-1)) ⊕ 0x68 — for the 17-byte\n"
+            f"payload, XOR(payload[0..16)) ⊕ 0x68, signalMode excluded\n"
+            f"({h16ok}/{h16n} vectors) — while SET ACKs fit the full 7+len\n"
+            f"prefix ⊕ 0x07 ({a7ok}/{a7n}; ≡ cmd ⊕ 0x66, n=4 command shapes).\n"
+            f"The old 17-byte heart reading XOR(payload[0..17]) ⊕ 0x68 fits\n"
+            f"only {h17ok}/{h17n}: it coincided with the 16-byte rule while\n"
+            f"signalMode was 0 and is REFUTED by the reverb run's\n"
+            f"signalMode=1 hearts (0x51 observed vs 0x50 predicted). The\n"
+            f"mock-replay note's 'certified ×10' wording was the 16-byte\n"
+            f"rule in disguise. Per-family salt derivation (0x06 vs 0x07)\n"
+            f"stays open (protocol.md open question 2); decode behaviour\n"
+            f"untouched — no holly-proto change."
+        )
+    elif h17ok == h17n and a7ok == a7n:
+        print(
+            f"\nverdict: full-payload 17-byte heart reading holds ({h17ok}/{h17n})\n"
+            f"— the signalMode split did not reproduce; re-check the reverb\n"
+            f"vectors. ACKs {a7ok}/{a7n} at full prefix ⊕ 0x07."
         )
     else:
         print(
