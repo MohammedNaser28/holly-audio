@@ -85,6 +85,11 @@ pub enum PendingWrite {
     /// mute byte, one TX per frame (checklist §3 TX-mute row). The
     /// identity mapping lives in `vm::tx_mute_wire`, never here.
     TxMute { tx: u8, muted: bool },
+    /// A shutdown-timer write is in flight: the byte is the WIRE value
+    /// being written (0 = 15min, 1 = Never — checklist §3
+    /// Shutdown-power-off row, identity on both sides). The identity
+    /// mapping lives in `vm::shutdown_pad_wire`, never here.
+    Shutdown(u8),
 }
 
 /// Commands the UI/frontend may send.
@@ -132,6 +137,13 @@ pub enum Command {
     /// in a frontend. Coalesces to the latest like every other SET (one
     /// SET per batch, newest intent).
     SetTxMute { tx: u8, muted: bool },
+    /// Request a Schedule-power-off write, `value` in the WIRE value space
+    /// {0, 1} (0 = 15min, 1 = Never — checklist §3 Shutdown-power-off row:
+    /// write space == read space, identity). The identity translation
+    /// lives in the VM (`shutdown_pad_wire`), never in a frontend.
+    /// Coalesces to the latest like every other SET (one SET per batch,
+    /// newest intent).
+    SetSchedulePowerOff(u8),
     /// Force one fresh poll/reconnect attempt now.
     Refresh,
 }
@@ -241,6 +253,14 @@ impl DeviceHandle {
     /// device verdict.
     pub fn set_tx_mute(&self, tx: u8, muted: bool) {
         let _ = self.tx.send(Command::SetTxMute { tx, muted });
+    }
+
+    /// Request a Schedule-power-off write (WIRE value {0, 1}; identity
+    /// translation is the VM's `shutdown_pad_wire`). Fire-and-forget like
+    /// every other send: the snapshot stream reports "pending" then the
+    /// device verdict.
+    pub fn set_schedule_power_off(&self, value: u8) {
+        let _ = self.tx.send(Command::SetSchedulePowerOff(value));
     }
 
     pub fn refresh(&self) {
@@ -361,6 +381,7 @@ impl Core {
                 Command::SetTxMute { tx, muted } => {
                     write = Some(PendingWrite::TxMute { tx, muted })
                 }
+                Command::SetSchedulePowerOff(value) => write = Some(PendingWrite::Shutdown(value)),
             }
         }
         if self.device.is_none() {
@@ -481,6 +502,7 @@ impl Core {
             }
             PendingWrite::ChannelMode(value) => source.set_channel_mode(value).map(|_previous| ()),
             PendingWrite::TxMute { tx, muted } => source.set_tx_mute(tx, muted).map(|_previous| ()),
+            PendingWrite::Shutdown(value) => source.set_shutdown_time(value).map(|_previous| ()),
         };
         match result {
             Ok(()) => {

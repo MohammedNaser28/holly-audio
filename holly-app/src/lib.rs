@@ -169,6 +169,14 @@ pub trait StatusSource {
     /// [code ProGetHearInfo.java:100-123]); the actor's verdict comes from
     /// its own post-SET poll.
     fn set_tx_mute(&mut self, tx: u8, muted: bool) -> Result<Option<bool>, Error>;
+    /// One SET_SHUTDOWN_TIME round trip — `value` in the WIRE value space
+    /// {0, 1} (§5.2 Shutdown-power-off row: 0 = 15min, 1 = Never, identity
+    /// on both sides [code HLDevice6302Activity.java:1667-1676/:1864-1867]);
+    /// set_shutdown_time returns the fresh GET's PRE-write timer value
+    /// (restore-flow datum) exactly like set_gain; the actor's verdict
+    /// comes from its own post-SET poll. AGENTS.md lift: timer values
+    /// ONLY, never an immediate power-off (owner, 2026-11-12).
+    fn set_shutdown_time(&mut self, value: u8) -> Result<u8, Error>;
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {
@@ -202,6 +210,10 @@ impl<T: Transport> StatusSource for HollyControl<T> {
 
     fn set_tx_mute(&mut self, tx: u8, muted: bool) -> Result<Option<bool>, Error> {
         HollyControl::set_tx_mute(self, tx, muted)
+    }
+
+    fn set_shutdown_time(&mut self, value: u8) -> Result<u8, Error> {
+        HollyControl::set_shutdown_time(self, value)
     }
 }
 

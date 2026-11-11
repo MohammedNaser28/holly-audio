@@ -98,10 +98,11 @@ use gpui::{
 use holly_app::DeviceHandle;
 use holly_app::demo::DemoScenario;
 use holly_app::vm::{
-    Banner, ChannelModeVm, DEVICE_NAME, EqVm, GainVm, NcVm, ReverbVm, TxVm, VID_PID, ViewModel,
-    WRITABLE, battery_segment_count, channel_mode_pad_wire, conn_status_word, eq_pad_wire,
-    mic_status, mute_label, nc_level_label, nc_status, reverb_gear_wire, reverb_selection,
-    reverb_toggle_wire, tx_mute_wire, view_model, volume_pad_wire,
+    Banner, ChannelModeVm, DEVICE_NAME, EqVm, GainVm, NcVm, ReverbVm, ScheduleVm, TxVm, VID_PID,
+    ViewModel, WRITABLE, battery_segment_count, channel_mode_pad_wire, conn_status_word,
+    eq_pad_wire, mic_status, mute_label, nc_level_label, nc_status, reverb_gear_wire,
+    reverb_selection, reverb_toggle_wire, shutdown_pad_wire, tx_mute_wire, view_model,
+    volume_pad_wire,
 };
 
 actions!(
@@ -120,6 +121,8 @@ actions!(
         ReverbNext,
         ChannelPrev,
         ChannelNext,
+        SchedulePrev,
+        ScheduleNext,
         Refresh,
         Quit
     ]
@@ -369,74 +372,6 @@ fn titled_with_led(title: &'static str, lit: LedLit, status: String) -> gpui::Di
         )
 }
 
-/// A segmented selector group rendered in a well (reference:
-/// `role=radiogroup`, 4px padding, 2px gaps, 36px options, 12px/8px radii).
-/// `selected` = index of the option whose matte pad + tungsten indicator bar
-/// shows; `None` = no selection (unknown state). READ-ONLY here (the
-/// interactive NC level variant is [`AppModel::nc_selector`]).
-fn radio_group(labels: &[&'static str], selected: Option<usize>) -> gpui::Div {
-    let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
-        .flex_row()
-        .p(px(theme::metrics::SELECTOR_PADDING))
-        .gap(px(theme::metrics::SELECTOR_GAP));
-    for (ix, label) in labels.iter().enumerate() {
-        let selected_now = selected == Some(ix);
-        let mut option = div()
-            .flex_1()
-            .min_w_0()
-            .h(px(theme::metrics::SELECTOR_HEIGHT))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
-            .text_size(px(theme::text::BODY_SIZE))
-            .when(selected_now, |o| {
-                o.bg(linear_gradient(
-                    180.,
-                    linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
-                    linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
-                ))
-                .text_color(solid(theme::color::TEXT))
-                .font_weight(FontWeight::SEMIBOLD)
-                .shadow(matte_under_edge(1.))
-            })
-            .when(!selected_now, |o| {
-                o.text_color(solid(theme::color::TEXT_2))
-                    .font_weight(FontWeight::MEDIUM)
-            })
-            .child(*label)
-            .relative();
-        if selected_now {
-            // the 14×2 tungsten indicator bar under the selected option
-            // (index.html:111; glow `0 0 6px rgba(255,181,71,.6)`)
-            option = option.child(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .right(px(0.))
-                    .bottom(px(4.))
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
-                            .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
-                            .rounded(px(1.))
-                            .bg(solid(theme::color::TUNGSTEN))
-                            .shadow(vec![BoxShadow {
-                                color: gpui::Hsla::from(solid(theme::color::TUNGSTEN)).opacity(0.6),
-                                offset: point(px(0.), px(0.)),
-                                blur_radius: px(6.),
-                                spread_radius: px(0.),
-                            }]),
-                    ),
-            );
-        }
-        group = group.child(option);
-    }
-    group
-}
-
 /// The small on/off switch (48×26 track, 20px thumb; reference `tog()`).
 /// The pill itself adds NO interaction — it renders the wire-read state at
 /// full opacity; an interactive caller wraps it (the reverb switch is the
@@ -682,6 +617,36 @@ fn channel_pick(index: usize, channel: &ChannelModeVm) -> ChannelPick {
     ChannelPick::Write
 }
 
+/// Write gate for the Schedule panel: the certified family AND nothing in
+/// flight — the same conjunction as [`channel_write_accepted`] (the
+/// `WRITABLE.schedule_power_off` half is vm.rs's pinned table; the
+/// `applying` half comes from the actor-reported `ScheduleVm`).
+fn schedule_write_accepted(schedule: &ScheduleVm) -> bool {
+    WRITABLE.schedule_power_off && !schedule.applying
+}
+
+/// Decision for ONE Schedule pick — parallel to [`ChannelPick`]: blocked
+/// (the family is read-only or a shutdown-timer write is in flight), noop
+/// (that value is already the device's verified selection), else write.
+/// NO pending target is ever displayed — the selection moves on the
+/// device's verdict only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulePick {
+    Blocked,
+    Noop,
+    Write,
+}
+
+fn schedule_pick(index: usize, schedule: &ScheduleVm) -> SchedulePick {
+    if !schedule_write_accepted(schedule) {
+        return SchedulePick::Blocked;
+    }
+    if schedule.selected == Some(index) {
+        return SchedulePick::Noop;
+    }
+    SchedulePick::Write
+}
+
 /// Write gate for ONE mic card's mute chip — the three-part conjunction
 /// [`reverb_toggle_accepted`] uses, plus the connectedness half the mute
 /// family needs: the certified family (`WRITABLE.mic_mute` — flipped true
@@ -782,6 +747,10 @@ struct AppModel {
     /// other selector wells, its own "channel_selector" key context
     /// (Left/Right step the two mode pads while it holds focus).
     channel_focus: FocusHandle,
+    /// The Schedule selector's keyboard handle — same rule as the
+    /// other selector wells, its own "schedule_selector" key context
+    /// (Left/Right step the two timer pads while it holds focus).
+    schedule_focus: FocusHandle,
     vm: ViewModel,
     device: DeviceHandle,
     demo: Option<DemoScenario>,
@@ -997,6 +966,45 @@ impl AppModel {
 
     fn on_channel_next(&mut self, _: &ChannelNext, _: &mut Window, cx: &mut Context<Self>) {
         self.channel_step(1, cx);
+    }
+
+    /// One Schedule pick for mouse AND keyboard — [`schedule_pick`] is
+    /// the whole decision (read-only family or an in-flight
+    /// shutdown-timer write: blocked; already-selected: noop; else
+    /// write). The WIRE byte comes from the VM's tested translation
+    /// (`shutdown_pad_wire`) — this file never names a device value.
+    /// ⚠ semantic difference from the other pickers: BOTH timer values
+    /// are device actions (Never = disarm, 15min = arm the countdown);
+    /// there is no third value and none may be invented — the VM's
+    /// `Option` returns None outside 0..=1 and the pick simply never
+    /// fires.
+    fn set_schedule_power_off(&mut self, index: usize, _: &mut Context<Self>) {
+        if schedule_pick(index, &self.vm.shutdown) == SchedulePick::Write
+            && let Some(wire) = shutdown_pad_wire(index)
+        {
+            self.device.set_schedule_power_off(wire);
+        }
+    }
+
+    /// Left/Right stepping over the two timer pads (same context-scoped
+    /// rule as the EQ/Volume/reverb/channel wells). With no verified
+    /// selection the step is a noop: the VM's `selected` is the only
+    /// cursor, matching the "no pending target" rule.
+    fn schedule_step(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some(selected) = self.vm.shutdown.selected {
+            let next = selected as isize + step;
+            if (0..=1).contains(&next) {
+                self.set_schedule_power_off(next as usize, cx);
+            }
+        }
+    }
+
+    fn on_schedule_prev(&mut self, _: &SchedulePrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.schedule_step(-1, cx);
+    }
+
+    fn on_schedule_next(&mut self, _: &ScheduleNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.schedule_step(1, cx);
     }
 
     /// One mic card's mute flip path (the chip click; no keyboard action —
@@ -1267,17 +1275,7 @@ impl AppModel {
                             .flex_none()
                             .flex()
                             .gap(px(theme::metrics::SPACE_4))
-                            .child(
-                                self.audio_panel(
-                                    "Schedule power off",
-                                    &["15min", "Never"], // [code index.html:264]
-                                    // quarter("15min") = wire 0,
-                                    // never("Never") = wire 1 [code
-                                    // HLDevice6302Activity.java:1864-1866].
-                                    self.vm.shutdown,
-                                )
-                                .flex_1(),
-                            )
+                            .child(self.schedule_panel(cx).flex_1())
                             .child(
                                 div()
                                     .flex_1()
@@ -1989,24 +1987,103 @@ impl AppModel {
             .child(group)
     }
 
-    /// The read-only audio panel (Schedule): a title and a selector
-    /// group. Selection comes ONLY from the heart's certified byte→pad
-    /// mapping — Schedule maps quarter=0/never=1 (with its
-    /// `HLDevice6302Activity.java` [code] citation at the call site). A
-    /// byte outside the panel's certified set passes None and renders the
-    /// no-selection rule. EQ, Volume and Channel mode no longer route
-    /// here — they graduated to the INTERACTIVE [`AppModel::eq_panel`]
-    /// /[`AppModel::volume_panel`]/[`AppModel::channel_panel`] once their
-    /// SET paths were wire-certified (2026-11-09 EQ, 2026-11-10 gain,
-    /// 2026-11-11 channel mode); Schedule stays read-only. The
-    /// DEVISION-chart dim (busy → 0.6) is intentionally NOT applied:
-    /// unknown is not disabled-looking (documented deviation in README).
-    fn audio_panel(
-        &self,
-        title: &'static str,
-        labels: &[&'static str],
-        selected: Option<usize>,
-    ) -> gpui::Div {
+    /// The Schedule power-off panel — INTERACTIVE. Schedule maps
+    /// quarter = 0 / never = 1 with the identity `shutdown_pad_wire` [code
+    /// `HLDevice6302Activity.java:1864-1866`]; the wire values are the
+    /// panel's own labels in order (15min, Never — index.html:264). While
+    /// a shutdown-timer write is in flight (`ScheduleVm.applying`) the
+    /// selector dims to 0.5 and both mouse and keyboard picks are ignored
+    /// — the snapshot's POST-SET poll moves the selection (no pending
+    /// target is ever shown; same rule as the EQ/Volume/channel
+    /// selectors). Pad order IS byte order (the write caller
+    /// `HLDevice6302Activity.java:1667-1671/:1672-1676` == the read
+    /// renderer `:1864-1866` — identity, exercised BOTH values on the
+    /// wire by the 2026-11-12 round trip). A byte outside the panel's
+    /// certified set passes None and renders the no-selection rule.
+    /// Left/Right step the pads while the well is focused
+    /// ("schedule_selector" key context — bindings in main); the
+    /// DEVISION dim (busy → 0.6) intentionally NOT applied (README).
+    fn schedule_panel(&self, cx: &Context<Self>) -> gpui::Div {
+        let schedule = &self.vm.shutdown;
+        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
+            .flex_1()
+            .min_w(px(0.))
+            .p(px(theme::metrics::SELECTOR_PADDING))
+            .gap(px(theme::metrics::SELECTOR_GAP))
+            .track_focus(&self.schedule_focus)
+            .key_context("schedule_selector")
+            // focus-visible outline = the rocker's rule (2px tungsten).
+            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
+            .when(schedule.applying, |g| g.opacity(0.5));
+        const SCHEDULE_VALUES: [&str; 2] = ["15min", "Never"]; // [code index.html:264]
+        for (index, label) in SCHEDULE_VALUES.iter().enumerate() {
+            let selected = schedule.selected == Some(index);
+            let pick = schedule_pick(index, schedule);
+            let mut option = div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
+                .text_size(px(theme::text::BODY_SIZE))
+                .when(selected, |o| {
+                    o.bg(linear_gradient(
+                        180.,
+                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
+                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
+                    ))
+                    .text_color(solid(theme::color::TEXT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .shadow(matte_under_edge(1.))
+                })
+                .when(!selected, |o| {
+                    o.text_color(solid(theme::color::TEXT_2))
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .child(label.to_string())
+                .relative();
+            if selected {
+                // Same tungsten indicator bar as the other selectors.
+                option = option.child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(5.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
+                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
+                                .rounded(px(1.))
+                                .bg(solid(theme::color::TUNGSTEN))
+                                .shadow(vec![BoxShadow {
+                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
+                                        .opacity(0.6),
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(6.),
+                                    spread_radius: px(0.),
+                                }]),
+                        ),
+                );
+            }
+            let option = if pick != SchedulePick::Blocked {
+                option
+                    .id(ElementId::named_usize("schedule", index))
+                    .hover(|s| s.cursor_pointer())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_schedule_power_off(index, cx);
+                    }))
+                    .into_any_element()
+            } else {
+                option.into_any_element()
+            };
+            group = group.child(option);
+        }
+        // The read-only audio_panel rendered this same shell (panel +
+        // title + selector); the interactivity wraps in it unchanged.
         panel()
             .flex_1()
             .justify_center()
@@ -2015,9 +2092,9 @@ impl AppModel {
                 div()
                     .text_size(px(theme::text::TITLE_SIZE))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
+                    .child("Schedule power off"),
             )
-            .child(radio_group(labels, selected))
+            .child(group)
     }
 
     /// Reverb panel — INTERACTIVE since the reverb round trip (2026-11-11):
@@ -2376,6 +2453,8 @@ impl Render for AppModel {
             .on_action(cx.listener(Self::on_reverb_next))
             .on_action(cx.listener(Self::on_channel_prev))
             .on_action(cx.listener(Self::on_channel_next))
+            .on_action(cx.listener(Self::on_schedule_prev))
+            .on_action(cx.listener(Self::on_schedule_next))
             .on_action(cx.listener(Self::on_refresh))
             .child(self.render_titlebar())
             .children(self.render_banner(cx))
@@ -2435,11 +2514,13 @@ fn main() {
             // "eq_selector"), the Volume stops ONLY while the volume
             // well is focused ("volume_selector"), the reverb gears
             // ONLY while the reverb well is focused ("reverb_selector"),
-            // and the Channel-mode pads ONLY while the channel well is
-            // focused ("channel_selector"); Space/Enter flip the reverb
-            // switch only inside "reverb_toggle" — the design defines no
-            // inter-selector arrow keys (no invented global bindings
-            // stealing NC's 1/2/3).
+            // the Channel-mode pads ONLY while the channel well is
+            // focused ("channel_selector"), and the Schedule pads ONLY
+            // while the schedule well is focused ("schedule_selector");
+            // Space/Enter flip the reverb switch only inside
+            // "reverb_toggle" — the design defines no inter-selector
+            // arrow keys (no invented global bindings stealing NC's
+            // 1/2/3).
             cx.bind_keys([
                 KeyBinding::new("space", ToggleNoise, Some("nc_rocker")),
                 KeyBinding::new("enter", ToggleNoise, Some("nc_rocker")),
@@ -2465,6 +2546,11 @@ fn main() {
                 // disjoint selector contexts, no invented global bindings.
                 KeyBinding::new("left", ChannelPrev, Some("channel_selector")),
                 KeyBinding::new("right", ChannelNext, Some("channel_selector")),
+                // Left/Right step the Schedule pads ONLY while that well
+                // is focused ("schedule_selector" context) — still
+                // disjoint, no invented global bindings.
+                KeyBinding::new("left", SchedulePrev, Some("schedule_selector")),
+                KeyBinding::new("right", ScheduleNext, Some("schedule_selector")),
                 KeyBinding::new("1", NcLow, None),
                 KeyBinding::new("2", NcMedium, None),
                 KeyBinding::new("3", NcStrong, None),
@@ -2539,6 +2625,7 @@ fn main() {
                             let reverb_focus = cx.focus_handle();
                             let reverb_toggle_focus = cx.focus_handle();
                             let channel_focus = cx.focus_handle();
+                            let schedule_focus = cx.focus_handle();
                             AppModel {
                                 focus,
                                 eq_focus,
@@ -2546,6 +2633,7 @@ fn main() {
                                 reverb_focus,
                                 reverb_toggle_focus,
                                 channel_focus,
+                                schedule_focus,
                                 vm: ViewModel::default(),
                                 device,
                                 demo,
@@ -2603,7 +2691,9 @@ mod tests {
         level_pick, nc_led, nc_write_accepted, vm_led,
     };
     use holly_app::NoiseWrite;
-    use holly_app::vm::{Banner, ChannelModeVm, EqVm, GainVm, NcVm, TxVm, ViewModel, battery_class};
+    use holly_app::vm::{
+        Banner, ChannelModeVm, EqVm, GainVm, NcVm, ScheduleVm, TxVm, ViewModel, battery_class,
+    };
 
     /// A rocker/VM shape straight from the VM fields.
     fn nc(level: Option<u8>, state: Option<bool>, pending: Option<NoiseWrite>) -> NcVm {
@@ -2651,7 +2741,10 @@ mod tests {
                 stereo_ok: false,
                 applying: false,
             },
-            shutdown: None,
+            shutdown: ScheduleVm {
+                selected: None,
+                applying: false,
+            },
             signal_mode: None,
             reverb: None,
             updated: None,

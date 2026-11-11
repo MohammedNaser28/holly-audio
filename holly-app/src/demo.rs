@@ -207,6 +207,20 @@ impl StatusSource for DemoDevice {
         }
         Ok(previous)
     }
+
+    fn set_shutdown_time(&mut self, value: u8) -> Result<u8, Error> {
+        // Same shape as holly-usb's set_shutdown_time: the RETURN is the
+        // timer value the heart held BEFORE the write; the write mutates
+        // only the §5-offset-10 byte (0 = 15min, 1 = Never — identity),
+        // everything else stays scripted. Pending scenario: stall BEFORE
+        // mutation, so the pending snapshot is always observable first
+        // (same shape as set_gain).
+        let mut heart = self.heart.lock().unwrap();
+        let previous = heart.shutdown_time;
+        std::thread::sleep(self.stall);
+        heart.shutdown_time = value;
+        Ok(previous)
+    }
 }
 
 /// The OS busy condition, byte-for-byte the real claim failure shape

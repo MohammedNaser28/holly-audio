@@ -88,9 +88,19 @@ pub const VID_PID: &str = "3547:0407";
 ///   (captures/raw/set_tx_mute_roundtrip.pcap + captures/
 ///   set_tx_mute_roundtrip.jsonl; roadmap §1 route (b), checklist §3
 ///   TX-mute row)
-/// - everything else is [code] at best (light cmd 33, mic recognition,
-///   shutdown 39/40 …) and has never been captured, so it stays read-only
-///   today.
+/// - `schedule_power_off` — SET_SHUTDOWN_TIME (cmd 39) [wire]
+///   PC-originated guarded round trip 2026-11-12: frames
+///   `05 03 AA DD 27 00 01 {01,00} EF` → acks `00` tail `0x41` (the
+///   checksum rule's 7th shape; owner-corrected prediction, hex cmd
+///   0x27 ⊕ 0x66) → hearts settled on the written timer value (§5
+///   offset 10, the ONLY heart byte that moved; residues 0x24/0x25 fold
+///   consistently). Timer values ONLY, never an immediate power-off
+///   (owner lift, AGENTS.md) (captures/raw/
+///   set_shutdown_time_roundtrip.pcap + captures/
+///   set_shutdown_time_roundtrip.jsonl; roadmap §1 route (b), checklist
+///   §3 Shutdown-power-off row)
+/// - everything else is [code] at best (light cmd 33, mic recognition …)
+///   and has never been captured, so it stays read-only today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Writable {
     pub nc_toggle: bool,
@@ -115,7 +125,7 @@ pub const WRITABLE: Writable = Writable {
     eq: true,
     reverb: true,
     mic_recognition: false,
-    schedule_power_off: false,
+    schedule_power_off: true,
     indicator_light: false,
 };
 
@@ -233,6 +243,18 @@ pub fn stereo_allowed(tx1_connected: bool, tx2_connected: bool) -> bool {
 /// `heartInfo.getShutdownTime()` (:1278)]. Anything > 1 is unmapped.
 pub fn shutdown_selection(shutdown_time: u8) -> Option<usize> {
     (shutdown_time <= 1).then_some(shutdown_time as usize)
+}
+
+/// The inverse translation a UI click needs: a Schedule pad index
+/// ([`ScheduleVm::selected`]'s space) -> the WIRE byte
+/// `set_shutdown_time` writes. Identity on 0..=1: the §3
+/// Shutdown-power-off row's write space IS the §5.2 read space (write
+/// caller `HLDevice6302Activity.java:1667-1671/:1672-1676`, read renderer
+/// `:1864-1867` — same two values, no inversion). Pure function like
+/// [`channel_mode_pad_wire`] so frontends never hardcode device values;
+/// unmapped (out of 0..=1) returns None.
+pub fn shutdown_pad_wire(index: usize) -> Option<u8> {
+    (index <= 1).then_some(index as u8)
 }
 
 /// The EQ panel's selected pad, in the design's display order
@@ -438,6 +460,20 @@ pub struct ChannelModeVm {
     pub applying: bool,
 }
 
+/// Schedule power-off state: the DEVICE's current timer pad, plus whether
+/// a shutdown-timer write is in flight. `selected` is None for any
+/// non-certified byte (§5 offset 10; see [`shutdown_selection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ScheduleVm {
+    /// Pad index of the active timer value (0 = "15min", 1 = "Never" —
+    /// [code `HLDevice6302Activity.java:1864-1866`]).
+    pub selected: Option<usize>,
+    /// A shutdown-timer SET (only ever [`PendingWrite::Shutdown`]) is in
+    /// flight — the selector dims and ignores picks until the device's
+    /// verdict.
+    pub applying: bool,
+}
+
 /// Reverb state: the DEVICE's current switch and gear bytes, plus whether
 /// a reverb write is in flight. `enabled` is the verified switch byte
 /// (§5 offset 13) — None only where no heart exists, so a toggle never
@@ -497,10 +533,11 @@ pub struct ViewModel {
     /// Stereo [code HLDevice6302Activity.java:1803-1805]), plus the
     /// in-flight flag for its own panel only.
     pub channel_mode: ChannelModeVm,
-    /// Schedule pad (`shutdownTime`, §5 offset 10) via
-    /// [`shutdown_selection`]: 0 = 15min, 1 = Never [code
-    /// HLDevice6302Activity.java:1864-1866]. Unmapped for any other byte.
-    pub shutdown: Option<usize>,
+    /// Schedule pads ([`ScheduleVm`]): display-order selection from the
+    /// device's `shutdownTime` byte (§5 offset 10; 0 = 15min, 1 = Never
+    /// [code HLDevice6302Activity.java:1864-1866]), plus the in-flight
+    /// flag for its own panel only.
+    pub shutdown: ScheduleVm,
     /// §5 offset 16 raw (`signalMode`). The APK parses it but renders it
     /// nowhere (no `update*View` consumer in the decompiled activity) and
     /// no design panel exists — carried read-only, surfaced nowhere by
@@ -543,7 +580,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 stereo_ok: false,
                 applying: false,
             },
-            shutdown: None,
+            shutdown: ScheduleVm {
+                selected: None,
+                applying: false,
+            },
             signal_mode: None,
             reverb: None,
             updated: None,
@@ -633,6 +673,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                         | Some(PendingWrite::Reverb(_, _))
                         | Some(PendingWrite::ChannelMode(_))
                         | Some(PendingWrite::TxMute { .. })
+                        | Some(PendingWrite::Shutdown(_))
                         | None => None,
                     },
                     last_error: None,
@@ -652,7 +693,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                     stereo_ok: stereo_allowed(heart.tx1_status, heart.tx2_status),
                     applying: matches!(s.pending_set, Some(PendingWrite::ChannelMode(_))),
                 },
-                shutdown: shutdown_selection(heart.shutdown_time),
+                shutdown: ScheduleVm {
+                    selected: shutdown_selection(heart.shutdown_time),
+                    applying: matches!(s.pending_set, Some(PendingWrite::Shutdown(_))),
+                },
                 signal_mode: Some(heart.signal_mode),
                 reverb: Some(ReverbVm {
                     enabled: Some(heart.reverb_switch),
@@ -698,7 +742,10 @@ fn disconnected_core() -> ViewModel {
             stereo_ok: false,
             applying: false,
         },
-        shutdown: None,
+        shutdown: ScheduleVm {
+            selected: None,
+            applying: false,
+        },
         signal_mode: None,
         reverb: None,
         updated: None,
@@ -963,7 +1010,13 @@ mod tests {
                 applying: false
             }
         );
-        assert_eq!(vm.shutdown, Some(0), "shutdownTime 0 = 15min [10]");
+        assert_eq!(
+            vm.shutdown,
+            ScheduleVm {
+                selected: Some(0), // shutdownTime 0 = 15min [10]
+                applying: false
+            }
+        );
         assert_eq!(vm.signal_mode, Some(0), "carried raw [16]");
     }
 
@@ -1062,6 +1115,19 @@ mod tests {
         assert_eq!(shutdown_selection(1), Some(1), "Never");
         assert_eq!(shutdown_selection(2), None, "no certified pad");
         assert_eq!(shutdown_selection(255), None, "no certified pad");
+    }
+
+    /// The click translation: pad index -> wire byte, identity on 0..=1
+    /// (write caller `HLDevice6302Activity.java:1667-1671/:1672-1676` ==
+    /// read renderer `:1864-1866` — the §3 Shutdown-power-off row's
+    /// write space IS the read space); anything else unmapped, so a
+    /// frontend can never name a third timer value.
+    #[test]
+    fn shutdown_pad_wire_is_identity_on_the_certified_pair() {
+        assert_eq!(shutdown_pad_wire(0), Some(0), "15min -> 0");
+        assert_eq!(shutdown_pad_wire(1), Some(1), "Never -> 1");
+        assert_eq!(shutdown_pad_wire(2), None, "no third value ever");
+        assert_eq!(shutdown_pad_wire(usize::MAX), None, "no third value ever");
     }
 
     /// EQ pads: display order ["Equalization","Low","Bright"] = wire bytes
@@ -1481,7 +1547,10 @@ mod tests {
     /// 2026-11-11 (captures/set_reverb_roundtrip.jsonl); Channel mode on
     /// 2026-11-11 (captures/set_channel_mode_roundtrip.jsonl); mic mute
     /// on 2026-11-11 — TX1 slot only, the TX2 write stays gated
-    /// (captures/set_tx_mute_roundtrip.jsonl).
+    /// (captures/set_tx_mute_roundtrip.jsonl); Schedule power-off on
+    /// 2026-11-12 (captures/set_shutdown_time_roundtrip.jsonl — timer
+    /// values ONLY per the AGENTS.md lift, never an immediate
+    /// power-off).
     #[test]
     fn writable_table_matches_the_certified_chain() {
         let all_read_only = Writable {
@@ -1510,6 +1579,10 @@ mod tests {
                 // (one flag per design control, per-slot scoping lives in
                 // TxVm.applying / the gate fns).
                 mic_mute: true,
+                // Certified on the 2026-11-12 shutdown-timer round trip —
+                // both documented values {15min, Never} exercised; the
+                // immediate power-off family stays excluded (AGENTS.md).
+                schedule_power_off: true,
                 ..all_read_only
             }
         );
