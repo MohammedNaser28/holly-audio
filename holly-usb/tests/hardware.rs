@@ -1604,3 +1604,265 @@ fn set_tx_mute_roundtrip_guarded() {
         ),
     }
 }
+
+// ── Shutdown timer (cmd 39 SET_SHUTDOWN_TIME) — the power-off schedule ──────
+
+/// Bounded read-only settle poll for the timer value — same shape as
+/// [`settle_tx_mute`] (route (b) owner rule): a FIXED number of fresh GETs
+/// spanning about 2 s run before any heart mismatch is declared — a slow
+/// heart is not a dropped write. GET-only; the SET behind this poll is
+/// never retried. ⚠ The poll must NEVER be stretched to "wait the timer
+/// out": the settle budget bounds every armed-countdown phase to ~2 s
+/// (feature file 02 rule). `Ok(())` = a fresh GET reported the written
+/// value; `Err(Some(last))` = the fixed budget ran out (`last` = the final
+/// value seen); `Err(None)` = no parseable heart within the budget.
+fn settle_shutdown_time(ctl: &mut HollyControl<NusbTransport>, want: u8) -> Result<(), Option<u8>> {
+    /// Fixed settle budget: 4 fresh GETs ≈ 2 s — deterministic, not
+    /// adaptive; nothing beyond this count.
+    const POLLS: u32 = 4;
+    let mut last = None;
+    for poll in 0..POLLS {
+        if poll > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        match ctl.get_heart_info() {
+            Ok(info) => {
+                if info.shutdown_time == want {
+                    return Ok(());
+                }
+                last = Some(info.shutdown_time);
+            }
+            Err(e) => eprintln!("settle poll {poll:>2}/{POLLS}: GET failed: {e:?}"),
+        }
+    }
+    Err(last)
+}
+
+/// Drop guard for the shutdown-timer test: mirrors [`TxMuteRestoreGuard`]
+/// (no re-enumeration tolerance — unlike channel mode, a timer write does
+/// not re-present the audio path). On any exit path (normal return, failed
+/// assert, panic unwind): one fresh GET decides; IF `shutdownTime` differs
+/// from the run's starting value, ONE verified restore attempt via
+/// `set_shutdown_time(original)` — never a write loop. The restore is THE
+/// critical path of this control (a wrongly left "15min" POWERS THE DEVICE
+/// OFF after 15 minutes): if the restore cannot be VERIFIED, print a LOUD
+/// message telling the owner to set the timer to Never from the phone app
+/// immediately (Never is the disarm state — safe regardless of the run's
+/// starting value). Errors are logged, never raised from `drop`.
+struct ShutdownRestoreGuard {
+    ctl: Option<HollyControl<NusbTransport>>,
+    original: u8,
+}
+
+impl ShutdownRestoreGuard {
+    fn ctl(&mut self) -> &mut HollyControl<NusbTransport> {
+        self.ctl
+            .as_mut()
+            .expect("guard.ctl() may be called only while Some")
+    }
+}
+
+impl Drop for ShutdownRestoreGuard {
+    fn drop(&mut self) {
+        let Some(ctl) = self.ctl.as_mut() else {
+            return;
+        };
+        // Restore decisions come only from a fresh GET, never cached state.
+        match ctl.get_heart_info() {
+            Err(e) => eprintln!(
+                "guard: ⚠⚠ state poll failed ({e:?}) — restore CANNOT be verified; original timer was {} (0=15min, 1=Never). IF THE TIMER IS LEFT AT 15MIN, SET IT TO NEVER FROM THE PHONE APP IMMEDIATELY",
+                self.original
+            ),
+            Ok(info) => {
+                if info.shutdown_time == self.original {
+                    eprintln!(
+                        "guard: timer already at original ({}), nothing to do",
+                        self.original
+                    );
+                } else {
+                    eprintln!(
+                        "guard: timer at {}, original {} — sending ONE restore SET",
+                        info.shutdown_time, self.original
+                    );
+                    if let Err(e) = ctl.set_shutdown_time(self.original) {
+                        eprintln!(
+                            "guard: RESTORE FAILED ({e:?}) — device left with timer {} while original was {}",
+                            info.shutdown_time, self.original
+                        );
+                    }
+                    // Verify what the single restore attempt actually did —
+                    // a restore that cannot be verified is the LOUD case.
+                    match ctl.get_heart_info() {
+                        Ok(post) if post.shutdown_time == self.original => eprintln!(
+                            "guard: post-restore timer = {} — restore verified",
+                            post.shutdown_time
+                        ),
+                        Ok(post) => eprintln!(
+                            "guard: ⚠⚠ restore NOT verified (timer {} ≠ original {}) — set the timer to Never from the phone app immediately",
+                            post.shutdown_time, self.original
+                        ),
+                        Err(e) => eprintln!(
+                            "guard: ⚠⚠ post-restore GET failed ({e:?}) — restore CANNOT be verified; original was {}. IF THE TIMER IS LEFT AT 15MIN, SET IT TO NEVER FROM THE PHONE APP IMMEDIATELY",
+                            self.original
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Phase 1B route (b): guarded SET_SHUTDOWN_TIME round trip on real
+/// hardware — substitute evidence for the §1 step-2 gate; on success the
+/// checklist §3 Shutdown-power-off row + protocol.md §4 SET_SHUTDOWN_TIME
+/// row tag `[wire] PC-originated round trip` (§5 offset 10 write==read).
+///
+/// ⚠ THE dangerous control: a wrongly left "15min" value POWERS THE DEVICE
+/// OFF after 15 minutes. The run therefore never lets an armed countdown
+/// outlive the settle poll (~2 s), never waits the timer out, and never
+/// loops a write; the restore is attempted on every exit path.
+///
+/// Rules — the set_channel_mode_roundtrip_guarded rule set applied to the
+/// timer (feature file 02, owner note: read the current value FIRST):
+///   fresh GET → SET → ACK gate (`data[0]==0`) → bounded settle-verified
+///   heart delta (`shutdownTime` §5 offset 10) → restore → settled verify.
+///   Restore attempted on every exit path (panic and Ctrl-C included).
+/// - Direction (both legs stay inside the documented space {0, 1}):
+///   start 15min (0) → write Never (1) FIRST (disarms), confirm, restore
+///   15min — the restore RE-ARMS the countdown at the original setting,
+///   expected and reported; start Never (1) → write 15min (0), confirm,
+///   restore Never immediately after the settle poll (the 15min value is
+///   held ~2 s only).
+/// - Refusal precondition: the fresh heart must be the certified 17-byte
+///   field set, and its timer byte must sit inside {0, 1} — anything else
+///   refuses the run (never guess a third value).
+/// - ACK ≠ 0: NO SET retry — one fresh GET; if the byte moved from the
+///   start, ONE verified restore attempt; abort either way.
+/// - The SET leg's own fresh-GET return (the pre-write timer value) is the
+///   restore target; drift vs the pre-run GET retargets the guard, and the
+///   restore leg's return must report the value the write leg left.
+/// - usbmon (owner-executed) captures the run; the .pcap + exported .jsonl
+///   land in captures/ as the evidence files.
+///
+/// Run only at the owner's explicit go, usbmon running:
+///   cargo test -p holly-usb --test hardware -- set_shutdown_time_roundtrip_guarded --ignored --nocapture
+#[test]
+#[ignore = "mutates device state; owner-gated run with usbmon capture active — a wrongly left 15min timer POWERS THE DEVICE OFF; the armed phase is held ~2 s only"]
+fn set_shutdown_time_roundtrip_guarded() {
+    let _dev = device_lock();
+    let mut ctl = HollyControl::open().expect("open + claim IF0");
+    let original = ctl.get_heart_info().expect("state poll failed");
+    assert_eq!(original.raw.len(), 17, "certified 17-byte payload shape");
+    eprintln!(
+        "original shutdown timer: shutdownTime={} (0=15min, 1=Never)",
+        original.shutdown_time
+    );
+    eprintln!(
+        "TX states: tx1={} tx2={}",
+        original.tx1_status, original.tx2_status
+    );
+
+    // Direction from the fresh heart (feature file 02 + owner note):
+    // write the OTHER documented value, restore the start. The 15min→Never
+    // start disarms first and re-arms on the restore; the Never→15min
+    // start arms for the settle window only.
+    let target = match original.shutdown_time {
+        0 => {
+            eprintln!(
+                "start = 15min: writing Never FIRST (disarms), restoring 15min at the end — the restore re-arms the countdown (expected)"
+            );
+            1
+        }
+        1 => {
+            eprintln!(
+                "start = Never: writing 15min (arms the countdown) — restore to Never follows IMMEDIATELY after the settle poll; the device holds 15min ~2 s only"
+            );
+            0
+        }
+        other => panic!(
+            "shutdownTime {other} is outside the documented space 0/1 (15min/Never) — refusing the run"
+        ),
+    };
+
+    let mut guard = ShutdownRestoreGuard {
+        ctl: Some(ctl),
+        original: original.shutdown_time,
+    };
+
+    // WRITE leg: the other documented value. The op's own fresh GET happens
+    // inside set_shutdown_time, and the value it returns is the state in
+    // force JUST before the write: the freshest restore memory the device
+    // has. It wins over the pre-run poll; if another client moved the timer
+    // between the two GETs, the difference is reported and the exit guard
+    // retargets.
+    let start = match guard.ctl().set_shutdown_time(target) {
+        Ok(previous) => {
+            if previous != original.shutdown_time {
+                eprintln!(
+                    "DRIFT: pre-run GET said {}, op's fresh GET reported {} — restore retargeted",
+                    original.shutdown_time, previous
+                );
+                guard.original = previous;
+            }
+            previous
+        }
+        Err(e) => {
+            // Route (b) ACK ≠ 0 / transport-failure path: NO SET retry. One
+            // fresh GET decides; if the byte moved from the start, ONE
+            // verified restore attempt (the guard would do it too, but the
+            // probe result is logged here while the handle is alive).
+            eprintln!("SET failed: {e:?} — probing once before the single restore");
+            let now = guard
+                .ctl()
+                .get_heart_info()
+                .expect("post-reject GET failed");
+            eprintln!("timer after reject: {}", now.shutdown_time);
+            let wanted = guard.original;
+            if now.shutdown_time != wanted {
+                eprintln!(
+                    "timer moved ({} -> {}): ONE verified restore attempt",
+                    wanted, now.shutdown_time
+                );
+                if let Err(e) = guard.ctl().set_shutdown_time(wanted) {
+                    eprintln!("reject-path restore SET failed: {e:?}");
+                }
+                match settle_shutdown_time(guard.ctl(), wanted) {
+                    Ok(()) => eprintln!("reject-path restore verified: timer = {}", wanted),
+                    Err(last) => {
+                        eprintln!("reject-path restore NOT settled (last seen {last:?})")
+                    }
+                }
+            }
+            panic!("SET rejected (ack gate) — aborting with no retry per route (b)");
+        }
+    };
+
+    // Heart-delta verify through the bounded settle poll (route (b) rule,
+    // ~2 s — never stretched to wait the timer out).
+    match settle_shutdown_time(guard.ctl(), target) {
+        Ok(()) => eprintln!("write leg confirmed: shutdownTime={target}"),
+        Err(last) => panic!(
+            "heart never reported shutdownTime={target} within the fixed settle budget (last seen: {last:?}) — guard restores the original on the way out"
+        ),
+    }
+
+    // Restore leg = exactly the starting value, immediately after the
+    // settle poll (an armed countdown phase must not outlive ~2 s). The
+    // restore TARGET is the SET leg's own return (the freshest restore
+    // memory — see the write leg above), and the restore's fresh GET must
+    // report the value the write leg left.
+    let restore_previous = guard
+        .ctl()
+        .set_shutdown_time(start)
+        .expect("restore SET failed");
+    assert_eq!(
+        restore_previous, target,
+        "restore leg's fresh GET must report the value the write leg left"
+    );
+    match settle_shutdown_time(guard.ctl(), start) {
+        Ok(()) => eprintln!("restore confirmed: shutdownTime={start}"),
+        Err(last) => panic!(
+            "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
+        ),
+    }
+}

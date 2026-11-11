@@ -2204,3 +2204,215 @@ fn set_tx_mute_roundtrip_replays_the_real_session() {
     );
     assert_eq!(SET_TX_MUTE_ACK, SET_TX_MUTE_ACK_WIRE, "ack lineage pin");
 }
+
+// ── Shutdown timer (cmd 39 SET_SHUTDOWN_TIME) — doc-recomputed vectors ──────
+//
+// Route (b) discipline (owner rule, same as EQ/gain/reverb/channel-mode/mute):
+// mock vectors are RECOMPUTED FROM THE DOCS until the hardware run; real
+// usbmon frames join as replay vectors after it. Every frame below is
+// computed from docs only:
+//   frame template       docs/protocol.md §2 (ProtocolV2.getData [code])
+//   cmd 39, payload      docs/set-gate-checklist.md §3 Shutdown-power-off row
+//                        ([{value}] — UsbMessengerV2.java:157-161; cmd from
+//                        ProSetShutdownTime.getCmd() = GET_MUTE → 39
+//                        [code PostProtocol.java:27])
+//   value space 0/1      identity quarter("15min")→0, never("Never")→1
+//                        (HLDevice6302Activity.java:1667-1671/:1672-1676);
+//                        read side heart shutdownTime §5 offset 10
+//                        (ProGetHearInfo.java:73), same identity
+//                        (§5.2, :1864-1867)
+// The heart reply is the wire-certified E1 heart (captures/
+// 2026-11-05-hearinfo-first-wire.txt, which already rests at shutdownTime 0
+// = 15min [wire]) with only the value byte moved — the 17-byte heart layout
+// is [wire]. ACK tail prediction, owner-corrected: the wire cmd byte is
+// decimal 39 = hex 0x27, so 0x27 ⊕ 0x66 = 0x41 (NOT 0x5F — that came from
+// XORing the decimal digits as if they were hex).
+
+/// SET_SHUTDOWN_TIME of Never (1) recomputed from the docs:
+/// `05 03 AA DD 27 00 01 01 EF` + zero padding to 64 (big-endian len 00 01).
+const SET_SHUTDOWN_1_TX: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x27, 0x00, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// SET_SHUTDOWN_TIME ack recomputed from the docs: reply header `05 03 BB DD`
+/// with cmd echo 27, len 00 01, status `00` (checklist §3 ACK rule: one
+/// status byte, `data[0] == 0` = success — `ProSetShutdownTime.receiveData`
+/// reads `toInt(data[0]) == 0` [code :26-30]). The byte behind the payload
+/// follows the reply checksum rule XOR(frame[0..7+len)) ⊕ 0x07 — for cmd 27
+/// the prefix folds to 0x46, 0x46 ⊕ 0x07 = 0x41 (the same byte the 6-shape
+/// cmd ⊕ 0x66 shortcut predicts: 0x27 ⊕ 0x66 = 0x41, owner-corrected —
+/// wire byte 0x27, not the decimal digits). The byte stays UNENFORCED by
+/// the crate — it must ignore everything past `7+len`, so the vector still
+/// doubles as an ignore-the-residue regression.
+const SET_SHUTDOWN_ACK: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x27, 0x00, 0x01, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The certified E1 heart with shutdownTime (payload offset 10 = frame byte
+/// 17) moved 0 → 1: layout stays [wire] (E1); the flipped value byte is the
+/// doc-recomputed delta side of route (b), and the residue drops to 0x36
+/// per the heart reply checksum rule (XOR(payload[0..16)) ⊕ 0x68 — the LAST
+/// payload byte, signalMode, is NOT in the fold; value 00^01 flips that
+/// fold, 0x5F⊕0x68=0x37 → 0x5E⊕0x68=0x36). Every OTHER field stays put —
+/// mode (voiceMode, offset 9) stays 0, gain stays 3, EQ stays 3, reverb
+/// stays (off, gear 2).
+const HEART_RX_SHUTDOWN1: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x01, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// set_shutdown_time(1) (Never — the other documented value; the E1 heart
+/// rests at shutdownTime 0 = 15min [wire, session 1]): the op must issue its
+/// own fresh GET first (uniform SET discipline), then the byte-exact
+/// doc-recomputed SET frame, and hand back the fresh GET's timer value as
+/// the pre-write state.
+#[test]
+fn set_shutdown_time_tx_frame_is_the_apk_layout() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner fresh GET (device rests at 15min 0)
+    mock.push_reply(SET_SHUTDOWN_ACK);
+    let mut c = control(mock);
+
+    let previous = c.set_shutdown_time(1).expect("ack 00 must be accepted");
+    assert_eq!(
+        previous, 0,
+        "fresh GET inside set_shutdown_time = the timer value before write"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(&written[0], &HEART_TX, "op must issue its own GET first");
+    assert_eq!(
+        &written[1], &SET_SHUTDOWN_1_TX,
+        "SET shutdown time must be the doc-recomputed Never frame"
+    );
+    assert_eq!(
+        written[1][4],
+        cmd::SET_SHUTDOWN_TIME,
+        "cmd echo = 39 = 0x27 [code ProSetShutdownTime.getCmd]"
+    );
+}
+
+/// The documented value space is exactly two values (0=15min, 1=Never —
+/// identity on both the write caller `HLDevice6302Activity.java:1667-1671/
+/// :1672-1676` and the read renderer `:1864-1867`): each SET differs from
+/// the Never frame in the value byte only (cmd stays 27; no second payload
+/// byte).
+#[test]
+fn set_shutdown_time_value_space_changes_only_the_value_byte() {
+    for value in [0u8, 1] {
+        let mut mock = MockTransport::new();
+        mock.push_reply(HEART_RX_E1);
+        mock.push_reply(SET_SHUTDOWN_ACK);
+        let mut c = control(mock);
+
+        let previous = c.set_shutdown_time(value).expect("ack 00 must be accepted");
+        assert_eq!(previous, 0, "fresh GET reported timer {value} INCOMING");
+        let mut want = SET_SHUTDOWN_1_TX;
+        want[7] = value; // value byte sits at frame offset 7 (tail EF at 8)
+        assert_eq!(&c.transport().written()[1], &want, "timer {value}");
+    }
+}
+
+/// Full doc-vector round trip (route (b), Mock half) in the shape the
+/// guarded hardware test rehearses: device rests at shutdownTime 0 = 15min
+/// (E1 IS that state [wire]), write the other documented value (Never 1),
+/// ack `00`, heart settles shutdownTime → 1 (§5 offset 10) with every
+/// neighbouring field untouched (mode stays 0, gain stays 3 — the timer
+/// byte is the ONLY delta); restore 0, heart settles back. Frames asserted
+/// both ways round trip; the restore TARGET comes from set_shutdown_time's
+/// own return (the fresh GET inside the write), not a caller-side poll.
+#[test]
+fn set_shutdown_time_roundtrip_doc_vectors() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner GET of set_shutdown_time(1): device at 0
+    mock.push_reply(SET_SHUTDOWN_ACK); // ack for SET_SHUTDOWN_TIME [01]
+    mock.push_reply(HEART_RX_SHUTDOWN1); // post-SET fresh GET: delta = 1
+    mock.push_reply(HEART_RX_SHUTDOWN1); // inner GET of the restore: device at 1
+    mock.push_reply(SET_SHUTDOWN_ACK); // ack for SET_SHUTDOWN_TIME [00]
+    mock.push_reply(HEART_RX_E1); // post-restore fresh GET: delta = 0
+
+    let mut c = control(mock);
+    let previous = c
+        .set_shutdown_time(1)
+        .expect("shutdown-timer write must be accepted");
+    assert_eq!(
+        previous, 0,
+        "pre-write timer value from the op's own fresh GET"
+    );
+    let after = c.get_heart_info().expect("post-SET GET");
+    assert_eq!(
+        after.shutdown_time, 1,
+        "heart delta must equal the written timer value"
+    );
+    assert_eq!(
+        after.voice_mode, 0,
+        "voiceMode (§5 offset 9, the neighbouring mode field) must never move"
+    );
+    assert_eq!(
+        after.voice_level, 3,
+        "voiceLevel (§5 offset 8, the neighbouring gain field) must never move"
+    );
+    assert_eq!(after.eq_level, 3, "eqLevel (§5 offset 12) must never move");
+    assert_eq!(
+        (after.reverb_switch, after.reverb_level),
+        (false, 2),
+        "reverb fields (§5 offsets 13/14) must never move"
+    );
+    let restore_previous = c
+        .set_shutdown_time(previous)
+        .expect("restore must be accepted");
+    assert_eq!(restore_previous, 1, "fresh GET before restore saw timer 1");
+    let restored = c.get_heart_info().expect("post-restore GET");
+    assert_eq!(
+        restored.shutdown_time, 0,
+        "heart must be back at the start timer value"
+    );
+    assert_eq!(restored.voice_mode, 0, "voiceMode still untouched");
+
+    let written = c.transport().written();
+    let mut set0 = SET_SHUTDOWN_1_TX;
+    set0[7] = previous; // value byte at frame offset 7 (tail EF at 8)
+    assert_eq!(&written[1], &SET_SHUTDOWN_1_TX, "write leg is Never 1");
+    assert_eq!(&written[4], &set0, "restore leg is the op's OWN return");
+}
+
+/// Ack gates shared with the SET_NOISE/SET_EQ/SET_GAIN/SET_REVERB/
+/// SET_VOICE_MODE/SET_TX_MUTE families (checklist §3: uniform
+/// `data[0] == 0` success across all `ProSet*` classes —
+/// `ProSetShutdownTime.receiveData` [code :26-30]): nonzero status =
+/// [`Error::Rejected`], wrong ack length = [`Error::BadAck`]. Reason same
+/// as the other families: the ack shape has only ever been seen as `[00]`
+/// [wire E2/E4].
+#[test]
+fn set_shutdown_time_rejects_abnormal_acks() {
+    // nonzero status
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_SHUTDOWN_ACK;
+    ack[7] = 0x03; // status byte != 0
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_shutdown_time(1).expect_err("nonzero ack must fail");
+    assert!(
+        matches!(err, Error::Rejected { status: 0x03, .. }),
+        "{err:?}"
+    );
+
+    // two-byte ack (echo shape) must not be accepted
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_SHUTDOWN_ACK;
+    ack[6] = 0x02; // payload len 2
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_shutdown_time(1).expect_err("2-byte ack must fail");
+    assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
+}
