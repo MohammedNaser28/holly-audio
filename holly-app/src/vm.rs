@@ -79,7 +79,16 @@ pub const VID_PID: &str = "3547:0407";
 ///   (captures/raw/set_channel_mode_roundtrip.pcap + captures/
 ///   set_channel_mode_roundtrip.jsonl; roadmap §1 route (b), checklist §3
 ///   Channel mode row)
-/// - everything else is [code] at best (mic mute cmd 22, light cmd 33,
+/// - `mic_mute` — SET_TX_MUTE (cmd 22) [wire] PC-originated guarded round
+///   trip 2026-11-11: frames `05 03 AA DD 16 00 02 {00 01, 00 00} EF` →
+///   acks `00` tail `0x70` → hearts settled on the written slot (§5
+///   offset 4, the ONLY heart byte that moved; TX2's slot byte stayed 00
+///   — one TX per frame). TX1 slot ONLY: the TX2 write remains [code]-
+///   gated until "22 lifted for TX2" (checklist §3)
+///   (captures/raw/set_tx_mute_roundtrip.pcap + captures/
+///   set_tx_mute_roundtrip.jsonl; roadmap §1 route (b), checklist §3
+///   TX-mute row)
+/// - everything else is [code] at best (light cmd 33, mic recognition,
 ///   shutdown 39/40 …) and has never been captured, so it stays read-only
 ///   today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +109,7 @@ pub struct Writable {
 pub const WRITABLE: Writable = Writable {
     nc_toggle: true,
     nc_level: true,
-    mic_mute: false,
+    mic_mute: true,
     volume: true,
     channel_mode: true,
     eq: true,
@@ -1412,7 +1421,9 @@ mod tests {
     /// captures/set_eq_roundtrip.jsonl); Volume joined the same route
     /// (b) on 2026-11-10 (captures/set_gain_roundtrip.jsonl); Reverb on
     /// 2026-11-11 (captures/set_reverb_roundtrip.jsonl); Channel mode on
-    /// 2026-11-11 (captures/set_channel_mode_roundtrip.jsonl).
+    /// 2026-11-11 (captures/set_channel_mode_roundtrip.jsonl); mic mute
+    /// on 2026-11-11 — TX1 slot only, the TX2 write stays gated
+    /// (captures/set_tx_mute_roundtrip.jsonl).
     #[test]
     fn writable_table_matches_the_certified_chain() {
         let all_read_only = Writable {
@@ -1436,6 +1447,11 @@ mod tests {
                 volume: true,
                 reverb: true,
                 channel_mode: true,
+                // Certified on the TX1 slot's route-(b) run; the family
+                // gate opens while the TX2 slot's write stays [code]-only
+                // (one flag per design control, per-slot scoping lives in
+                // TxVm.applying / the gate fns).
+                mic_mute: true,
                 ..all_read_only
             }
         );

@@ -676,14 +676,14 @@ fn channel_pick(index: usize, channel: &ChannelModeVm) -> ChannelPick {
 
 /// Write gate for ONE mic card's mute chip — the three-part conjunction
 /// [`reverb_toggle_accepted`] uses, plus the connectedness half the mute
-/// family needs: the certified family (`WRITABLE.mic_mute` — false until
-/// the guarded round trip lands, so the click path is INERT today without
-/// re-touching any view), the TX CONNECTED (the APK refuses offline mutes
-/// with a toast, no write [code `HLDevice6302Activity.java:668/:682`]),
-/// and nothing in flight for THAT card (per-slot `applying`; ONE SET runs
-/// at a time — any other family's pending blocks too: the actor's
-/// latest-wins coalescing stays the ONLY queue, the UI never queues a
-/// second write).
+/// family needs: the certified family (`WRITABLE.mic_mute` — flipped true
+/// on the 2026-11-11 TX1-slot round trip, captures/
+/// set_tx_mute_roundtrip.jsonl; the TX2 slot's write stays gated), the TX
+/// CONNECTED (the APK refuses offline mutes with a toast, no write [code
+/// `HLDevice6302Activity.java:668/:682`]), and nothing in flight for THAT
+/// card (per-slot `applying`; ONE SET runs at a time — any other family's
+/// pending blocks too: the actor's latest-wins coalescing stays the ONLY
+/// queue, the UI never queues a second write).
 fn mic_mute_write_accepted(tx: &TxVm) -> bool {
     WRITABLE.mic_mute && tx.connected && !tx.applying
 }
