@@ -26,6 +26,15 @@
 //! VID:PID, the restore guard reopens too, and an unreturned device
 //! aborts with the restore NOT verified. The owner keeps recording,
 //! calls, music and monitoring closed for the run.
+//! `set_shutdown_time_roundtrip_guarded` applies them to the auto-power-off
+//! timer (cmd 39, values ONLY — AGENTS.md lift): the armed phase is held
+//! ~2 s and the restore re-arms the countdown (expected, printed).
+//! `set_light_roundtrip_guarded` applies them to the indicator light
+//! (cmd 33, INVERTED value space 0 = on / 1 = off on both APK sides): the
+//! lowest-risk control in the batch — a visible LED only, no audio effect,
+//! no re-enumeration — so the owner's only extra duty is confirming
+//! VISUALLY that the LED changes during the brief off phase and comes
+//! back (a manual observation, reported as such, never evidence).
 
 use holly_usb::{HollyControl, NusbTransport};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -1861,6 +1870,263 @@ fn set_shutdown_time_roundtrip_guarded() {
     );
     match settle_shutdown_time(guard.ctl(), start) {
         Ok(()) => eprintln!("restore confirmed: shutdownTime={start}"),
+        Err(last) => panic!(
+            "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
+        ),
+    }
+}
+
+// ── Indicator light (cmd 33 SET_LIGHT) — the inverted LED toggle ────────────
+
+/// Bounded read-only settle poll for the light byte — same shape as
+/// [`settle_shutdown_time`] (route (b) owner rule): a FIXED number of fresh
+/// GETs spanning about 2 s run before any heart mismatch is declared — a
+/// slow heart is not a dropped write. GET-only; the SET behind this poll is
+/// never retried. The comparison is in the INVERTED wire space
+/// (`u8::from(!light_on)`: 0 = on / 1 = off — the documented parse
+/// `lightStatus == 0` → on [code `ProGetHearInfo.java:75-76`], §5 offset
+/// 11), which equals payload[11] verbatim on the documented space {0, 1};
+/// abnormal bytes are refused by the run's precondition, never polled.
+/// `Ok(())` = a fresh GET reported the written byte; `Err(Some(last))` =
+/// the fixed budget ran out (`last` = the final byte seen); `Err(None)` =
+/// no parseable heart within the budget.
+fn settle_light(ctl: &mut HollyControl<NusbTransport>, want: u8) -> Result<(), Option<u8>> {
+    /// Fixed settle budget: 4 fresh GETs ≈ 2 s — deterministic, not
+    /// adaptive; nothing beyond this count.
+    const POLLS: u32 = 4;
+    let mut last = None;
+    for poll in 0..POLLS {
+        if poll > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        match ctl.get_heart_info() {
+            Ok(info) => {
+                let wire = u8::from(!info.light_on);
+                if wire == want {
+                    return Ok(());
+                }
+                last = Some(wire);
+            }
+            Err(e) => eprintln!("settle poll {poll:>2}/{POLLS}: GET failed: {e:?}"),
+        }
+    }
+    Err(last)
+}
+
+/// Drop guard for the indicator-light test: mirrors [`ShutdownRestoreGuard`]
+/// (no re-enumeration tolerance — an LED write does not re-present the
+/// audio path). On any exit path (normal return, failed assert, panic
+/// unwind): one fresh GET decides; IF the light byte differs from the run's
+/// starting byte, ONE verified restore attempt via `set_light(original)`.
+/// The worst a wrongly left state can do is an LED stuck on or off — the
+/// lowest-stakes control in the batch — but the restore is verified the
+/// same way as every other control. Errors are logged, never raised from
+/// `drop`.
+struct LightRestoreGuard {
+    ctl: Option<HollyControl<NusbTransport>>,
+    original: u8,
+}
+
+impl LightRestoreGuard {
+    fn ctl(&mut self) -> &mut HollyControl<NusbTransport> {
+        self.ctl
+            .as_mut()
+            .expect("guard.ctl() may be called only while Some")
+    }
+}
+
+impl Drop for LightRestoreGuard {
+    fn drop(&mut self) {
+        let Some(ctl) = self.ctl.as_mut() else {
+            return;
+        };
+        // Restore decisions come only from a fresh GET, never cached state.
+        match ctl.get_heart_info() {
+            Err(e) => eprintln!("guard: state poll failed, cannot verify restore: {e:?}"),
+            Ok(info) => {
+                let wire = u8::from(!info.light_on);
+                if wire == self.original {
+                    eprintln!(
+                        "guard: light already at original ({}), nothing to do",
+                        self.original
+                    );
+                } else {
+                    eprintln!(
+                        "guard: light at {}, original {} — sending ONE restore SET",
+                        wire, self.original
+                    );
+                    if let Err(e) = ctl.set_light(self.original) {
+                        eprintln!(
+                            "guard: RESTORE FAILED ({e:?}) — device left with light byte {} while original was {}",
+                            wire, self.original
+                        );
+                    }
+                    // Verify what the single restore attempt actually did.
+                    match ctl.get_heart_info() {
+                        Ok(post) => eprintln!(
+                            "guard: post-restore light byte = {} ({})",
+                            u8::from(!post.light_on),
+                            if post.light_on { "on" } else { "off" }
+                        ),
+                        Err(e) => eprintln!("guard: post-restore GET failed: {e:?}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Phase 1B route (b): guarded SET_LIGHT round trip on real hardware —
+/// substitute evidence for the §1 step-2 gate; on success the checklist §3
+/// Indicator-light row + protocol.md §4 SET_LIGHT row tag `[wire]
+/// PC-originated round trip` (§5 offset 11 write==read, INVERTED both
+/// sides).
+///
+/// ℹ the lowest-risk control in the batch: a visible receiver LED only —
+/// no audio effect, no re-enumeration, no dangerous phase either way
+/// (unlike the shutdown timer, holding "off" is harmless). The owner's
+/// extra duty is VISUAL: confirm the LED changes during the brief off
+/// phase and comes back — a manual observation, reported as such, never
+/// evidence.
+///
+/// Rules — the set_shutdown_time_roundtrip_guarded rule set applied to the
+/// light (feature file 04; cmd 33 is NOT on the AGENTS.md excluded list —
+/// no lift needed):
+///   fresh GET → SET → ACK gate (`data[0]==0`) → bounded settle-verified
+///   heart delta (lightStatus §5 offset 11, wire space 0=on/1=off) →
+///   restore → settled verify. Restore attempted on every exit path.
+/// - Direction (both legs stay inside the documented space {0, 1}): write
+///   the OTHER documented value (toggle), restore the start — the op is
+///   IDENTITY on that space (BOTH APK sides carry the same inversion
+///   [code `HLDevice6302Activity.java:662`, `ProGetHearInfo.java:75-76`]),
+///   so no inverted-write translation happens here.
+/// - Refusal precondition: the fresh heart must be the certified 17-byte
+///   field set, and its light byte must sit inside {0, 1} — anything else
+///   refuses the run (never guess a third value).
+/// - ACK ≠ 0: NO SET retry — one fresh GET; if the byte moved from the
+///   start, ONE verified restore attempt; abort either way.
+/// - The SET leg's own fresh-GET return (the pre-write light byte,
+///   payload[11] verbatim) is the restore target; drift vs the pre-run
+///   GET retargets the guard, and the restore leg's return must report
+///   the byte the write leg left.
+/// - usbmon (owner-executed) captures the run; the .pcap + exported .jsonl
+///   land in captures/ as the evidence files.
+///
+/// Run only at the owner's explicit go, usbmon running:
+///   cargo test -p holly-usb --test hardware -- set_light_roundtrip_guarded --ignored --nocapture
+#[test]
+#[ignore = "mutates device state; owner-gated run with usbmon capture active — watch the receiver LED during the brief off phase (visual confirmation, reported as such)"]
+fn set_light_roundtrip_guarded() {
+    let _dev = device_lock();
+    let mut ctl = HollyControl::open().expect("open + claim IF0");
+    let original = ctl.get_heart_info().expect("state poll failed");
+    assert_eq!(original.raw.len(), 17, "certified 17-byte payload shape");
+    let original_byte = original.raw[11];
+    eprintln!(
+        "original indicator light: byte={} ({}) — watch the receiver LED; the off phase is brief and the restore brings it back",
+        original_byte,
+        if original.light_on { "on" } else { "off" }
+    );
+
+    // Direction from the fresh heart: write the OTHER documented value
+    // (toggle), restore the start. Abnormal bytes refuse the run.
+    let target = match original_byte {
+        0 => {
+            eprintln!("start = ON (0): writing OFF (1), restoring ON at the end");
+            1
+        }
+        1 => {
+            eprintln!("start = OFF (1): writing ON (0), restoring OFF at the end");
+            0
+        }
+        other => panic!(
+            "lightStatus {other} is outside the documented space 0/1 (on/off, INVERTED) — refusing the run"
+        ),
+    };
+
+    let mut guard = LightRestoreGuard {
+        ctl: Some(ctl),
+        original: original_byte,
+    };
+
+    // WRITE leg: the other documented value. The op's own fresh GET happens
+    // inside set_light, and the byte it returns is the state in force JUST
+    // before the write (payload[11] verbatim — see set_light's return
+    // doc): the freshest restore memory the device has. It wins over the
+    // pre-run poll; if another client moved the light between the two
+    // GETs, the difference is reported and the exit guard retargets.
+    let start = match guard.ctl().set_light(target) {
+        Ok(previous) => {
+            if previous != original_byte {
+                eprintln!(
+                    "DRIFT: pre-run GET said byte {}, op's fresh GET reported byte {} — restore retargeted",
+                    original_byte, previous
+                );
+                guard.original = previous;
+            }
+            previous
+        }
+        Err(e) => {
+            // Route (b) ACK ≠ 0 / transport-failure path: NO SET retry. One
+            // fresh GET decides; if the byte moved from the start, ONE
+            // verified restore attempt (the guard would do it too, but the
+            // probe result is logged here while the handle is alive).
+            eprintln!("SET failed: {e:?} — probing once before the single restore");
+            let now = guard
+                .ctl()
+                .get_heart_info()
+                .expect("post-reject GET failed");
+            let now_wire = u8::from(!now.light_on);
+            eprintln!(
+                "light after reject: byte={now_wire} ({})",
+                if now.light_on { "on" } else { "off" }
+            );
+            let wanted = guard.original;
+            if now_wire != wanted {
+                eprintln!(
+                    "light byte moved ({} -> {}): ONE verified restore attempt",
+                    wanted, now_wire
+                );
+                if let Err(e) = guard.ctl().set_light(wanted) {
+                    eprintln!("reject-path restore SET failed: {e:?}");
+                }
+                match settle_light(guard.ctl(), wanted) {
+                    Ok(()) => eprintln!("reject-path restore verified: byte = {}", wanted),
+                    Err(last) => {
+                        eprintln!("reject-path restore NOT settled (last seen {last:?})")
+                    }
+                }
+            }
+            panic!("SET rejected (ack gate) — aborting with no retry per route (b)");
+        }
+    };
+
+    // Heart-delta verify through the bounded settle poll (route (b) rule,
+    // ~2 s — the off phase stays brief either direction).
+    match settle_light(guard.ctl(), target) {
+        Ok(()) => eprintln!(
+            "write leg confirmed: light byte={target} ({})",
+            if target == 0 { "on" } else { "off" }
+        ),
+        Err(last) => panic!(
+            "heart never reported light byte={target} within the fixed settle budget (last seen: {last:?}) — guard restores the original on the way out"
+        ),
+    }
+
+    // Restore leg = exactly the starting byte, immediately after the
+    // settle poll. The restore TARGET is the SET leg's own return (the
+    // freshest restore memory — see the write leg above), and the
+    // restore's fresh GET must report the byte the write leg left.
+    let restore_previous = guard.ctl().set_light(start).expect("restore SET failed");
+    assert_eq!(
+        restore_previous, target,
+        "restore leg's fresh GET must report the byte the write leg left"
+    );
+    match settle_light(guard.ctl(), start) {
+        Ok(()) => eprintln!(
+            "restore confirmed: light byte={start} ({})",
+            if start == 0 { "on" } else { "off" }
+        ),
         Err(last) => panic!(
             "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
         ),

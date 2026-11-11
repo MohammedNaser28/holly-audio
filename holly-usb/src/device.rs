@@ -32,6 +32,12 @@
 //!     inside, returns the pre-write value); [code] until the guarded
 //!     round trip runs. AGENTS.md lift: timer values ONLY, never an
 //!     immediate power-off (owner, 2026-11-12).
+//!   - `set_light(u8)` — cmd 33, single-byte payload `[{value}]`
+//!     (lightStatus, 0 = on / 1 = off — INVERTED relative to the UI toggle
+//!     on BOTH APK sides); same set_* shape (fresh GET inside, returns the
+//!     pre-write wire byte); [code] until the guarded round trip runs. The
+//!     UI-bool ↔ wire-byte inversion lives in exactly one place upstream
+//!     (holly-app's vm.rs), never here.
 
 use nusb::MaybeFuture;
 
@@ -520,6 +526,77 @@ impl<T: Transport> HollyControl<T> {
         let (reply, raw) = self.exchange(request)?;
         match reply.payload.as_slice() {
             [0x00] => Ok(state.shutdown_time),
+            [status] => Err(Error::Rejected {
+                status: *status,
+                raw,
+            }),
+            other => Err(Error::BadAck {
+                len: other.len(),
+                raw,
+            }),
+        }
+    }
+
+    /// Write the receiver indicator light — the "Indicator light" toggle —
+    /// cmd 33 SET_LIGHT, single-byte payload `[{value}]` [code
+    /// docs/set-gate-checklist.md §3 Indicator-light row:
+    /// `UsbMessengerV2.setLight(int value)` builds
+    /// `saveReserved(new byte[]{(byte) value})`
+    /// (`UsbMessengerV2.java:214-218`); cmd re-derived from
+    /// `ProSetLight.getCmd()` = `PostProtocol.Command.GET_TX_GAIN`
+    /// (`ProSetLight.java:15-18`), the constant folding to 33
+    /// (`PostProtocol.java:34`; corroborated by the independent constant
+    /// `ProtocolV2.HID_SET_LIGHT = 33`, `ProtocolV2.java:45`)]. THE
+    /// inverted control: the wire byte space is 0 = light **on** / 1 =
+    /// light **off** — the APK's own toggle handler writes the OPPOSITE of
+    /// the switch state (`setLight(!z ? 1 : 0)`, switch on → 0,
+    /// `HLDevice6302Activity.java:662`) and the heart reads the same
+    /// inversion back (`lightStatus` = `toInt(data[11]) == 0` → on,
+    /// `ProGetHearInfo.java:75-76` — §5 offset 11; docs/protocol.md §5.2
+    /// "0 = light on"). BOTH sides carry the SAME inversion (checklist §3:
+    /// "light and speaker are inverted on BOTH sides"), so there is no
+    /// inverted-write mismatch to undo and this op is IDENTITY on the
+    /// documented space {0, 1}: the caller speaks WIRE bytes (0 = on), and
+    /// the UI-bool ↔ wire-byte inversion lives in exactly one place
+    /// upstream (holly-app's `vm.rs`, with its one unit test) — never in a
+    /// view, never here.
+    ///
+    /// Returns the pre-write `lightStatus` byte from THIS call's fresh
+    /// `get_heart_info()` (§5 offset 11) — the value in force on the
+    /// device immediately before the write (the crate's uniform SET
+    /// discipline — one fresh GET inside every SET call, no observable
+    /// device state cached; the value is the guarded test's restore
+    /// datum, like `set_shutdown_time`'s returned timer). The heart's
+    /// typed `light_on` already applied the documented parse inversion
+    /// (`== 0` → on [code :75-76]); the returned byte is that same field
+    /// verbatim in its own wire space (`!light_on`), i.e. payload[11] of
+    /// the fresh heart — no second rule is created here.
+    ///
+    /// Ack gating is identical to [`HollyControl::set_shutdown_time`]
+    /// (checklist §3: the `data[0] == 0` status rule is uniform across all
+    /// `ProSet*` classes — `ProSetLight.receiveData` reads
+    /// `toInt(data[0]) == 0` [code `ProSetLight.java:26-29`]):
+    /// `[00]` = success; anything else surfaces as
+    /// [`Error::Rejected`]/[`Error::BadAck`] — no retry. Reply-tail bytes
+    /// stay uninterpreted: heart replies carry XOR(payload[0..16)) ⊕ 0x68
+    /// [wire — LAST payload byte excluded], ACK tails follow
+    /// XOR(whole 7+len prefix) ⊕ 0x07 = cmd ⊕ 0x66 [wire, 6 command
+    /// shapes] (docs/protocol.md §2 — decode discards everything past
+    /// `7+len`, so no decode behaviour changes here either way; for cmd
+    /// 0x21 the rule predicts 0x47, settling as the 7th point only when
+    /// the run byte-matches). Values outside the documented space {0, 1}
+    /// have no certified meaning and are the caller's responsibility,
+    /// not assumed here (family convention).
+    pub fn set_light(&mut self, value: u8) -> Result<u8, Error> {
+        // Fresh GET inside every SET (crate rule). The light payload has
+        // no preserved byte (§3 Indicator-light row); the snapshot's
+        // lightStatus byte is returned to the caller as the pre-write
+        // state (payload[11] verbatim — see the return doc above).
+        let state = self.get_heart_info()?;
+        let request = Frame::new(cmd::SET_LIGHT, vec![value]);
+        let (reply, raw) = self.exchange(request)?;
+        match reply.payload.as_slice() {
+            [0x00] => Ok(u8::from(!state.light_on)),
             [status] => Err(Error::Rejected {
                 status: *status,
                 raw,

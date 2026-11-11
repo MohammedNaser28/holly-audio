@@ -2578,3 +2578,234 @@ fn set_shutdown_time_roundtrip_replays_the_real_session() {
         "ack lineage pin (tail 0x41)"
     );
 }
+
+// ── Indicator light (cmd 33 SET_LIGHT) — doc-recomputed vectors ─────────────
+//
+// Route (b) discipline (owner rule, same as EQ/gain/reverb/channel-mode/
+// mute/shutdown): mock vectors are RECOMPUTED FROM THE DOCS until the
+// hardware run; real usbmon frames join as replay vectors after it. Every
+// frame below is computed from docs only:
+//   frame template       docs/protocol.md §2 (ProtocolV2.getData [code])
+//   cmd 33, payload      docs/set-gate-checklist.md §3 Indicator-light row
+//                        ([{value}] — UsbMessengerV2.java:214-218; cmd from
+//                        ProSetLight.getCmd() = GET_TX_GAIN → 33
+//                        [code PostProtocol.java:34; ProtocolV2.HID_SET_LIGHT
+//                        = 33, ProtocolV2.java:45])
+//   value space 0/1      INVERTED both sides: 0 = light on, 1 = off — write
+//                        caller `setLight(!z ? 1 : 0)`
+//                        (HLDevice6302Activity.java:662); read side heart
+//                        lightStatus §5 offset 11, 0 = on
+//                        (ProGetHearInfo.java:75-76; protocol.md §5.2).
+//                        The op takes the WIRE byte — the UI-bool ↔ wire
+//                        inversion lives ONLY in holly-app's vm.rs.
+// The heart reply is the wire-certified E1 heart (captures/
+// 2026-11-05-hearinfo-first-wire.txt, which already rests at lightStatus 0
+// = ON [wire]) with only the value byte moved — the 17-byte heart layout
+// is [wire]. ACK tail prediction: the wire cmd byte is decimal 33 = hex
+// 0x21, so 0x21 ⊕ 0x66 = 0x47 (the same byte the prefix rule gives:
+// XOR(05 03 BB DD 21 00 01 00) ⊕ 0x07 = 0x40 ⊕ 0x07 = 0x47 — docs/
+// protocol.md §2; the run settles it as the 8th command shape).
+
+/// SET_LIGHT of off (wire 1) recomputed from the docs:
+/// `05 03 AA DD 21 00 01 01 EF` + zero padding to 64 (big-endian len 00 01).
+/// Wire 1 = light OFF — the INVERTED value: a UI-off toggle writes this byte
+/// (HLDevice6302Activity.java:662 `!z ? 1 : 0`).
+const SET_LIGHT_1_TX: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x21, 0x00, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// SET_LIGHT ack recomputed from the docs: reply header `05 03 BB DD` with
+/// cmd echo 21, len 00 01, status `00` (checklist §3 ACK rule: one status
+/// byte, `data[0] == 0` = success — `ProSetLight.receiveData` reads
+/// `toInt(data[0]) == 0` [code :26-29]). The byte behind the payload
+/// follows the reply checksum rule XOR(frame[0..7+len)) ⊕ 0x07 — for cmd 21
+/// the prefix folds to 0x40, 0x40 ⊕ 0x07 = 0x47 (the same byte the
+/// cmd ⊕ 0x66 shortcut predicts: 0x21 ⊕ 0x66 = 0x47). The byte stays
+/// UNENFORCED by the crate — it must ignore everything past `7+len`, so the
+/// vector still doubles as an ignore-the-residue regression.
+const SET_LIGHT_ACK: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x21, 0x00, 0x01, 0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The certified E1 heart with lightStatus (payload offset 11 = frame byte
+/// 18) moved 0 → 1 (on → off): layout stays [wire] (E1); the flipped value
+/// byte is the doc-recomputed delta side of route (b), and the residue
+/// drops to 0x36 per the heart reply checksum rule (XOR(payload[0..16)) ⊕
+/// 0x68 — the LAST payload byte, signalMode, is NOT in the fold; light
+/// 00^01 flips that fold, 0x5F⊕0x68=0x37 → 0x5E⊕0x68=0x36 — the same
+/// residue the shutdown-1 heart carries, both being one 0→1 flip). Every
+/// OTHER field stays put — mode (voiceMode, offset 9) stays 0, gain stays
+/// 3, EQ stays 3, reverb stays (off, gear 2), shutdown stays 0.
+const HEART_RX_LIGHT1: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x00, 0x01, 0x03, 0x00, 0x02, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// set_light(1) (off — the other documented value; the E1 heart rests at
+/// lightStatus 0 = ON [wire, session 1]): the op must issue its own fresh
+/// GET first (uniform SET discipline), then the byte-exact doc-recomputed
+/// SET frame, and hand back the fresh GET's lightStatus byte as the
+/// pre-write state — 0, the inverted byte for "on".
+#[test]
+fn set_light_tx_frame_is_the_apk_layout() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner fresh GET (device rests at light ON 0)
+    mock.push_reply(SET_LIGHT_ACK);
+    let mut c = control(mock);
+
+    let previous = c.set_light(1).expect("ack 00 must be accepted");
+    assert_eq!(
+        previous, 0,
+        "fresh GET inside set_light = the lightStatus byte before write (0 = ON, inverted space)"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(&written[0], &HEART_TX, "op must issue its own GET first");
+    assert_eq!(
+        &written[1], &SET_LIGHT_1_TX,
+        "SET light must be the doc-recomputed off frame"
+    );
+    assert_eq!(
+        written[1][4],
+        cmd::SET_LIGHT,
+        "cmd echo = 33 = 0x21 [code ProSetLight.getCmd]"
+    );
+}
+
+/// The documented value space is exactly two values (0 = ON, 1 = OFF —
+/// inverted on BOTH the write caller `HLDevice6302Activity.java:662` and
+/// the read parser `ProGetHearInfo.java:75-76`): each SET differs from the
+/// off frame in the value byte only (cmd stays 21; no second payload byte).
+#[test]
+fn set_light_value_space_changes_only_the_value_byte() {
+    for value in [0u8, 1] {
+        let mut mock = MockTransport::new();
+        // The fresh GET inside set_light reports the PRE-write state, so
+        // each leg serves the OPPOSITE heart: writing on (0) from off
+        // (LIGHT1 heart), writing off (1) from on (E1 heart) — proving the
+        // returned byte is the fresh GET's lightStatus, never the written
+        // value echoed back.
+        mock.push_reply(if value == 1 {
+            HEART_RX_E1
+        } else {
+            HEART_RX_LIGHT1
+        });
+        mock.push_reply(SET_LIGHT_ACK);
+        let mut c = control(mock);
+
+        let previous = c.set_light(value).expect("ack 00 must be accepted");
+        assert_eq!(
+            previous,
+            value ^ 1,
+            "fresh GET must report the PRE-write byte (0 = on, inverted space), not the written value"
+        );
+        let mut want = SET_LIGHT_1_TX;
+        want[7] = value; // value byte sits at frame offset 7 (tail EF at 8)
+        assert_eq!(&c.transport().written()[1], &want, "light {value}");
+    }
+}
+
+/// Full doc-vector round trip (route (b), Mock half) in the shape the
+/// guarded hardware test rehearses: device rests at lightStatus 0 = ON (E1
+/// IS that state [wire]), write the other documented value (off = 1), ack
+/// `00`, heart settles lightStatus → 1 (§5 offset 11, INVERTED read: the
+/// typed `light_on` goes true → false) with every neighbouring field
+/// untouched (mode stays 0, gain stays 3, EQ stays 3, reverb stays (off,
+/// gear 2), shutdown stays 0 — the light byte is the ONLY delta); restore
+/// 0, heart settles back. Frames asserted both ways round trip; the
+/// restore TARGET comes from set_light's own return (the fresh GET inside
+/// the write), not a caller-side poll.
+#[test]
+fn set_light_roundtrip_doc_vectors() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner GET of set_light(1): device at ON 0
+    mock.push_reply(SET_LIGHT_ACK); // ack for SET_LIGHT [01]
+    mock.push_reply(HEART_RX_LIGHT1); // post-SET fresh GET: delta = 1 (off)
+    mock.push_reply(HEART_RX_LIGHT1); // inner GET of the restore: device at 1
+    mock.push_reply(SET_LIGHT_ACK); // ack for SET_LIGHT [00]
+    mock.push_reply(HEART_RX_E1); // post-restore fresh GET: delta = 0 (on)
+
+    let mut c = control(mock);
+    let previous = c
+        .set_light(1)
+        .expect("indicator-light write must be accepted");
+    assert_eq!(previous, 0, "pre-write lightStatus byte (0 = on, inverted)");
+    let after = c.get_heart_info().expect("post-SET GET");
+    assert!(
+        !after.light_on,
+        "heart delta must equal the written state (1 = off — the inverted parse)"
+    );
+    assert_eq!(
+        after.voice_mode, 0,
+        "voiceMode (§5 offset 9, the neighbouring mode field) must never move"
+    );
+    assert_eq!(
+        after.voice_level, 3,
+        "voiceLevel (§5 offset 8, the neighbouring gain field) must never move"
+    );
+    assert_eq!(after.eq_level, 3, "eqLevel (§5 offset 12) must never move");
+    assert_eq!(
+        (after.reverb_switch, after.reverb_level),
+        (false, 2),
+        "reverb fields (§5 offsets 13/14) must never move"
+    );
+    assert_eq!(
+        after.shutdown_time, 0,
+        "shutdownTime (§5 offset 10) must never move"
+    );
+    let restore_previous = c.set_light(previous).expect("restore must be accepted");
+    assert_eq!(restore_previous, 1, "fresh GET before restore saw light 1");
+    let restored = c.get_heart_info().expect("post-restore GET");
+    assert!(
+        restored.light_on,
+        "heart must be back at the start state (0 = on)"
+    );
+    assert_eq!(restored.voice_mode, 0, "voiceMode still untouched");
+
+    let written = c.transport().written();
+    let mut set0 = SET_LIGHT_1_TX;
+    set0[7] = previous; // value byte at frame offset 7 (tail EF at 8)
+    assert_eq!(&written[1], &SET_LIGHT_1_TX, "write leg is off 1");
+    assert_eq!(&written[4], &set0, "restore leg is the op's OWN return");
+}
+
+/// Ack gates shared with the SET_NOISE/SET_EQ/SET_GAIN/SET_REVERB/
+/// SET_VOICE_MODE/SET_TX_MUTE/SET_SHUTDOWN_TIME families (checklist §3:
+/// uniform `data[0] == 0` success across all `ProSet*` classes —
+/// `ProSetLight.receiveData` [code :26-29]): nonzero status =
+/// [`Error::Rejected`], wrong ack length = [`Error::BadAck`]. Reason same
+/// as the other families: the ack shape has only ever been seen as `[00]`
+/// [wire E2/E4].
+#[test]
+fn set_light_rejects_abnormal_acks() {
+    // nonzero status
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_LIGHT_ACK;
+    ack[7] = 0x03; // status byte != 0
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_light(1).expect_err("nonzero ack must fail");
+    assert!(
+        matches!(err, Error::Rejected { status: 0x03, .. }),
+        "{err:?}"
+    );
+
+    // two-byte ack (echo shape) must not be accepted
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_LIGHT_ACK;
+    ack[6] = 0x02; // payload len 2
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_light(1).expect_err("2-byte ack must fail");
+    assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
+}
