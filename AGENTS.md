@@ -25,7 +25,9 @@ hardcode device rules or strings.
 - Forbidden interfaces: IF1/IF2/IF3 (UAC audio + vendor bulk). Only IF0 is
   claimed.
 - Forbidden commands: the OTA/reboot/pairing/reset family; shutdown (39),
-  identify (35), speaker (37), TX mute (22).
+  identify (35), speaker (37). TX mute (22) is lifted for per-transmitter
+  mute on/off, TX1 first (owner, 2026-11-12); TX2 stays gated until
+  "22 lifted for TX2" — TX2 may not be powered during the run.
 - No cached device state: every SET derives from a fresh GET issued inside
   the same call.
 - Captures are observation only (usbmon, airgap): we never inject frames
