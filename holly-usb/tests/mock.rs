@@ -2013,3 +2013,194 @@ fn set_tx_mute_rejects_abnormal_acks() {
     let err = c.set_tx_mute(0, true).expect_err("2-byte ack must fail");
     assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
 }
+
+// ── TX mute route (b): REAL wire frames join as replay vectors ──────────────
+// Full 64-byte buffers from the owner-executed hardware run of
+// set_tx_mute_roundtrip_guarded, captured 2026-11-11 (captures/raw/
+// set_tx_mute_roundtrip.pcap → captures/set_tx_mute_roundtrip.jsonl,
+// bus 6 dev 2; 16 data transfers). Frame numbers from the export:
+//   #14/#18          GET poll `05 03 AA DD 1F 00 00 EF` (byte-identical to
+//                    the session-1 HEART_TX)
+//   #17/#21          heart, mutes off — TX1 CONNECTED battery 0x4B, TX2
+//                    CONNECTED battery 0x51 (TX2 was POWERED during the
+//                    run — reported only; its slot byte was never written
+//                    and its mute byte stayed 00), NC on level 0, voice 4,
+//                    eq 3, reverb off gear 0, signalMode 0, tail 74
+//                    (#41/#45 = the restored hearts, byte-identical)
+//   #22              SET_TX_MUTE `05 03 AA DD 16 00 02 00 01 EF` — the TX1
+//                    slot muted (txIndex 0, muted 01)
+//   #25/#37          ack `05 03 BB DD 16 00 01 00 70` (status 00) — the
+//                    doc-predicted tail 0x70 byte-matched pre-run, closing
+//                    the cmd⊕0x66 rule over 6 command shapes
+//   #29/#33          heart, tx1_mute 01 — the ONLY payload byte that moved
+//                    across all six hearts (offset 4, §5), tail 75
+//   #34              SET_TX_MUTE `05 03 AA DD 16 00 02 00 00 EF` — restore =
+//                    the starting byte (muted 00)
+//   #38/#41          heart, mutes off — restore delta verified (the first
+//                    settle GET already matched)
+//   #42/#45          heart, mutes off — the exit guard's own GET, already
+//                    at original ("nothing to do")
+// No rejections, no retries: every settle poll matched on its first GET
+// (like the channel-mode run). Heart tails fit XOR(payload[0..16)) ⊕ 0x68
+// (74/75) and the ack tail fits XOR(7+len prefix) ⊕ 0x07 — both rules'
+// predictions byte-matched, protocol.md §2.
+
+/// Real SET_TX_MUTE write frame of the run (export frame 22) —
+/// [txIndex=0, muted=01]: the TX1 slot muted.
+const SET_TX_MUTE_ON_TX1_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x16, 0x00, 0x02, 0x00, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_TX_MUTE restore frame of the run (export frame 34) — the
+/// starting byte (txIndex 0, muted 00).
+const SET_TX_MUTE_OFF_TX1_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x16, 0x00, 0x02, 0x00, 0x00, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real ack of the run (export frames 25/37) — status 00, tail 0x70.
+const SET_TX_MUTE_ACK_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x16, 0x00, 0x01, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real start heart of the run (export frames 17/21; the restored hearts
+/// #41/#45 are byte-identical) — TX1 connected battery 0x4B, TX2 connected
+/// battery 0x51, BOTH mutes 00, NC on level 0, voice 4, eq 3, reverb off
+/// gear 0, signalMode 0, tail 74 (XOR(payload[0..16)) ⊕ 0x68: 0x1C ⊕ 0x68).
+const HEART_RX_RUN_MUTES_OFF: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x01, 0x4B, 0x51, 0x00, 0x00, 0x01, 0x00, 0x04,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real muted heart of the run (export frames 29/33) — [`HEART_RX_RUN_MUTES_OFF`]
+/// with ONLY tx1_mute (payload[4] = frame byte 11) moved 00 → 01: TX2's
+/// mute byte (payload[5]) and every other field stay put, tail drops
+/// 0x74 → 0x75 per the heart reply checksum rule (0x1D ⊕ 0x68).
+const HEART_RX_RUN_TX1_MUTED: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x01, 0x4B, 0x51, 0x01, 0x00, 0x01, 0x00, 0x04,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x75, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// set_tx_mute round trip replays the owner run's frames end to end —
+/// pre-run GET, op's inner fresh GET, write leg + ack, settle GET, the
+/// restore's inner GET, restore SET + ack, restore settle GET, exit-guard
+/// GET (eight rounds exactly as the guarded test drove them).
+#[test]
+fn set_tx_mute_roundtrip_replays_the_real_session() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_RUN_MUTES_OFF); // pre-run GET (frames 14/17)
+    mock.push_reply(HEART_RX_RUN_MUTES_OFF); // op's inner GET (frames 18/21)
+    mock.push_reply(SET_TX_MUTE_ACK_WIRE); // ack of frame 22 [00 01]
+    mock.push_reply(HEART_RX_RUN_TX1_MUTED); // settle GET (frames 26/29)
+    mock.push_reply(HEART_RX_RUN_TX1_MUTED); // restore's inner GET (frames 30/33)
+    mock.push_reply(SET_TX_MUTE_ACK_WIRE); // ack of frame 34 [00 00]
+    mock.push_reply(HEART_RX_RUN_MUTES_OFF); // restore settle GET (frames 38/41)
+    mock.push_reply(HEART_RX_RUN_MUTES_OFF); // exit-guard GET (frames 42/45)
+
+    let mut c = control(mock);
+
+    // Pre-run poll: the guarded test's own GET before the op — shape
+    // check, TX1-connected check, and the starting mutes (frames 14/17).
+    let start = c
+        .get_heart_info()
+        .expect("real heart (mutes-off pair, residue 74) parses");
+    assert!(start.tx1_status, "guard refuses unless TX1 is connected");
+    assert!(
+        !start.tx1_mute && !start.tx2_mute,
+        "the run started at mutes-off — both write legs byte-equal their doc vectors"
+    );
+
+    // Write leg: the op's inner fresh GET (frames 18/21), SET frame 22,
+    // ack frame 25 [00]+70.
+    let previous = c
+        .set_tx_mute(0, true)
+        .expect("real ack [00]+70 must be accepted (residue ignored)");
+    assert_eq!(
+        previous,
+        Some(false),
+        "frames 18/21 rest at tx1_mute 00 (the last-known state)"
+    );
+    // Settle poll (frames 26/29).
+    let after = c
+        .get_heart_info()
+        .expect("real heart (muted pair, residue 75) parses");
+    assert!(
+        after.tx1_mute,
+        "heart delta = TX1 muted — offset 4 is the ONLY byte that moved (frames 29/33)"
+    );
+    assert!(
+        !after.tx2_mute,
+        "TX2's mute byte stayed 00 — one TX per frame on the wire"
+    );
+    assert!(after.tx1_status, "TX1 connected through the run");
+    assert!(
+        after.tx2_status,
+        "TX2 was powered during the run (battery 0x51) — read-side only, never written"
+    );
+    assert_eq!(after.tx1_battery, 0x4B, "run's TX1 battery byte");
+    assert_eq!(after.voice_level, 4, "run's gain byte");
+    assert_eq!(
+        after.signal_mode, 0,
+        "signalMode 0 in this run — both tail readings coincide"
+    );
+
+    // Restore leg: inner GET (frames 30/33 — the fresh GET sees the write
+    // leg's effect), SET frame 34, ack frame 37.
+    let restore_previous = c
+        .set_tx_mute(0, false)
+        .expect("real restore must be accepted");
+    assert_eq!(
+        restore_previous,
+        Some(true),
+        "the restore's fresh GET saw the write leg's effect (frames 30/33)"
+    );
+    // Restore settle poll (frames 38/41).
+    let restored = c.get_heart_info().expect("heart back at the start pair");
+    assert!(
+        !restored.tx1_mute,
+        "restore delta verified — mutes off (frames 38/41)"
+    );
+    // Exit-guard poll (frames 42/45): the guard's own GET, already at
+    // original ("nothing to do").
+    let exit = c.get_heart_info().expect("exit-guard GET parses");
+    assert!(
+        !exit.tx1_mute,
+        "exit guard found TX1 already at its original mute"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(
+        &written[2], &SET_TX_MUTE_ON_TX1_WIRE,
+        "SET TX byte-exact frame 22"
+    );
+    assert_eq!(
+        &written[5], &SET_TX_MUTE_OFF_TX1_WIRE,
+        "restore TX byte-exact frame 34"
+    );
+    // Lineage pins (roadmap §1(b)): the doc-recomputed layout and the
+    // hardware-observed frames are the SAME bytes — the run started at
+    // mutes-off, so both write legs are byte-equal as-is, and the ack tail
+    // 0x70 the checksum rule predicted pre-run is byte-equal as-is
+    // (n=6 for cmd ⊕ 0x66).
+    assert_eq!(
+        SET_TX_MUTE_ON_TX1_WIRE, SET_TX_MUTE_ON_TX1,
+        "doc layout == observed wire (write leg)"
+    );
+    assert_eq!(
+        SET_TX_MUTE_OFF_TX1_WIRE, SET_TX_MUTE_OFF_TX1,
+        "doc layout == observed wire (restore leg)"
+    );
+    assert_eq!(SET_TX_MUTE_ACK, SET_TX_MUTE_ACK_WIRE, "ack lineage pin");
+}
