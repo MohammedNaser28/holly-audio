@@ -662,15 +662,18 @@ impl AppModel {
     }
 
     /// Volume panel — the reference's title + six-stop selector row, now
-    /// INTERACTIVE: picks send `set_gain` (wire stops via `volume_pad_wire`)
-    /// through the same actor path as the NC/EQ controls, gated by
-    /// `volume_pick`. While a gain write is in flight (`GainVm.applying`)
-    /// the selector dims to 0.5 and both mouse and keyboard picks are
-    /// ignored — the snapshot's POST-SET poll moves the selection (no
-    /// pending target is ever shown; same rule as the EQ selector). Stop
-    /// order IS byte order ("1".."6" [code index.html:260]; byte N = stop
-    /// N+1, §5.2 Volume row [wire session 3b + the 2026-11-10 round trip]).
-    /// Left/Right step the stops while the well is focused
+    /// INTERACTIVE and in the mock's HORIZONTAL orientation (options 36px
+    /// tall, indicator bar 4px up — index.html:106-112; the interactive
+    /// rewrite had copied the NC rocker's vertical stack, commit F restores
+    /// the designed row): picks send `set_gain` (wire stops via
+    /// `volume_pad_wire`) through the same actor path as the NC/EQ
+    /// controls, gated by `volume_pick`. While a gain write is in flight
+    /// (`GainVm.applying`) the selector dims to 0.5 and both mouse and
+    /// keyboard picks are ignored — the snapshot's POST-SET poll moves the
+    /// selection (no pending target is ever shown; same rule as the EQ
+    /// selector). Stop order IS byte order ("1".."6" [code index.html:260];
+    /// byte N = stop N+1, §5.2 Volume row [wire session 3b + the 2026-11-10
+    /// round trip]). Left/Right step the stops while the well is focused
     /// ("volume_selector" key context — bindings in main); the DEVISION
     /// dim (busy → 0.6) intentionally NOT applied (README).
     fn volume_panel(&self, cx: &Context<Self>) -> gpui::Div {
@@ -689,7 +692,9 @@ impl AppModel {
                 // keys.
                 is_pickable: &|index| volume_pick(index, volume) != VolumePick::Blocked,
                 on_pick: |this, index, cx| this.set_gain_stop(index, cx),
-                horizontal: false,
+                // The mock renders the six stops as one horizontal row
+                // (index.html:111), NOT the NC rocker's vertical stack.
+                horizontal: true,
                 dim: volume.applying,
                 focus: Some((&self.volume_focus, "volume_selector")),
             },
