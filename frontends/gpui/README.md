@@ -139,10 +139,20 @@ All deferred with a reason; none invented:
   gpui counterpart (outset `BoxShadow` only). Wells render as flat fills;
   theme.rs keeps the `HIGHLIGHT_*` numbers as designed data with a
   `dead_code` allow carrying that reason.
-- **Meter segments.** The mock lights segment bars from HeartInfo values we
-  have never decoded — HeartInfo exposes no per-mic level — so the meter is
-  ALWAYS-UNLIT (`METER_PEAK_FROM` similarly parked). This is a decode
-  requirement, not a UI decision.
+- **Meter segments (source).** The meter now RENDERS the mock's lit recipe
+  (TEXT_2 segments, TUNGSTEN from 0-based index 17 — the APK's own
+  18..=20 distortion-report zone [code BleSingleVolumeView.java:setVolume]
+  matching index.html:230) from the VM's per-mic dBFS level. The dB→segments
+  curve is the APK's exact `getVolumeProgress2` [code], never a frontend
+  constant (vm.rs `meter_lit`/`meter_lit_for`; offline/muted/no-source
+  cards show zero). What stays unfinished is the LEVEL SOURCE: the wire
+  has no level field, so real hardware reads `None` and the meter stays
+  unlit; `--demo` scripts a −16..0 dBFS sweep (DEMO marker rule). The real
+  source is the OS-audio tap — PipeWire/ALSA capture of the dongle's UAC
+  input, the desktop twin of the APK's own path
+  [code HLDevice6302Activity.java:476 → AudioRecordUtils] — parked until
+  the owner authorizes it (`pw-record` subprocess design agreed
+  2026-11-12).
 - **Battery segments.** The mock lights ALL five battery segments whenever
   the link is live, regardless of the percent shown next to it
   (index.html:229). The desktop bar lights `battery_segment_count(pct)`
