@@ -555,6 +555,7 @@ fn snapshot_json_shape() {
         heart: Some(heart),
         pending_set: Some(PendingWrite::Noise(NoiseWrite::Switch(true))),
         received_at: None,
+        tx_levels: [None, None],
     };
     let value: serde_json::Value = serde_json::to_value(&snap).expect("serializable");
 
@@ -588,7 +589,8 @@ fn snapshot_json_shape() {
             "raw": [0, 1, 0, 93, 0, 0, 1, 0, 3, 0, 0, 0, 3, 0, 2, 0, 0]
         },
         "pending_set": {"noise": {"switch": true}},
-        "received_at": null
+        "received_at": null,
+        "tx_levels": [null, null]
     });
     assert_eq!(value, expected, "published JSON shape changed");
 }
@@ -609,6 +611,7 @@ fn view_model_connected_shape() {
         heart: Some(heart),
         pending_set: Some(PendingWrite::Noise(NoiseWrite::Switch(false))),
         received_at: None,
+        tx_levels: [None, None],
     });
     assert_eq!(vm.banner, None);
     assert_eq!(vm.banner_text, None);

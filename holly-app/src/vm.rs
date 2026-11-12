@@ -201,6 +201,51 @@ pub fn battery_segment_count(pct: u8) -> usize {
     pct.div_ceil(20) as usize
 }
 
+/// Level meter segments LIT on the 20-segment bar, from a HOST-measured
+/// dBFS level (−99..=0; full scale = 0 dB). The exact APK curve [code
+/// `BleSingleVolumeView.java getVolumeProgress2`], boundary-checked end to
+/// end: the dB is truncated to int BEFORE mapping (`getVolumeProgress2((int)
+/// volume)` — the tap/demo floors, this fn receives ints), the bands are
+/// piecewise-linear with the APK's own sensitivities (most sensitive
+/// −17..−10 dBFS, 1 dB per segment), and >0 dB is invalid → 0 exactly like
+/// the APK. Segments 18..=20 (0-based index ≥ 17) are the APK's
+/// distortion-report zone (its `setVolume` flags 18..=20 as
+/// AUDIO_DISTORTION) — the design's tungsten peak.
+///
+/// PRESENTATION-ONLY like [`battery_segment_count`]: a display curve, not a
+/// wire fact. Never a frontend constant — frontends read [`meter_lit_for`].
+pub fn meter_lit(level: i16) -> usize {
+    // Kotlin roundToInt = Math.round = floor(x + 0.5); integer numerators
+    // over the APK's float divisors make exact .5 ties unreachable in
+    // practice, so f32::round (half away from zero) matches every input.
+    let lit = if level < -45 {
+        0.0
+    } else if level < -17 {
+        ((level + 45) as f32 / 4.6).round()
+    } else if level < -10 {
+        (level + 23) as f32
+    } else if level < -3 {
+        ((level + 10) as f32 / 1.2).round() + 13.0
+    } else if level <= 0 {
+        ((level + 3) as f32 / 1.5).round() + 18.0
+    } else {
+        // > 0 dB: above full scale — the APK returns 0 (invalid input).
+        0.0
+    };
+    lit.clamp(0.0, 20.0) as usize
+}
+
+/// [`meter_lit`] under the card's display gates: a meter is a live-signal
+/// read, so an UNCONNECTED or MUTED mic shows zero (owner rule 2026-11-12)
+/// and no measurement source ([`TxVm::level`] `None`) shows zero — the
+/// honest "nothing to display" state, never a fabricated stillness.
+pub fn meter_lit_for(tx: &TxVm) -> usize {
+    if !tx.connected || tx.muted {
+        return 0;
+    }
+    tx.level.map(meter_lit).unwrap_or(0)
+}
+
 /// NC level byte -> the phone app's own value name [code
 /// HLDevice6302Activity.java:1593/:1610/:1626-1631; §5.1 identity mapping
 /// strong = 2, medium = 1, low = 0 — read 0/1 and written 1/2 [wire
@@ -468,6 +513,13 @@ pub struct TxVm {
     pub battery: u8,
     pub battery_class: BatteryClass,
     pub muted: bool,
+    /// Host-measured audio level in dBFS (−99..=0; full scale 0), from
+    /// [`crate::Snapshot::tx_levels`]. `None` = no measurement source —
+    /// the wire has no level field, so real hardware reports None until
+    /// the OS-audio tap lands (frontends/gpui/README: meter unlit); demo
+    /// scripts its values. The dB→segments translation is [`meter_lit`],
+    /// never a frontend constant.
+    pub level: Option<i16>,
     /// A TX-mute write ADDRESSED TO THIS PANEL (`PendingWrite::TxMute`
     /// carrying this panel's own wire slot) is in flight — the mute chip
     /// dims to the existing in-flight look and ignores clicks until the
@@ -763,12 +815,14 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                     heart.tx1_status,
                     heart.tx1_battery,
                     heart.tx1_mute,
+                    s.tx_levels[0],
                     tx_applying(s, 0),
                 )),
                 tx2: Some(tx_vm(
                     heart.tx2_status,
                     heart.tx2_battery,
                     heart.tx2_mute,
+                    s.tx_levels[1],
                     tx_applying(s, 1),
                 )),
                 tx3: tail_tx(
@@ -901,12 +955,13 @@ fn tx_applying(s: &Snapshot, slot: u8) -> bool {
     )
 }
 
-fn tx_vm(connected: bool, battery: u8, muted: bool, applying: bool) -> TxVm {
+fn tx_vm(connected: bool, battery: u8, muted: bool, level: Option<i16>, applying: bool) -> TxVm {
     TxVm {
         connected,
         battery,
         battery_class: battery_class(battery),
         muted,
+        level,
         applying,
     }
 }
@@ -919,8 +974,10 @@ fn tail_tx(
 ) -> Option<TxVm> {
     // All three fields appear at their own offsets together [code
     // ProGetHearInfo.java:100-123]; if any is None they are None together.
+    // No level: the multi-TX tail has no UI card (demo scripts slots 0/1
+    // only) and no OS-audio tap maps beyond TX2.
     match (status, battery, mute) {
-        (Some(st), Some(bat), Some(m)) => Some(tx_vm(st, bat, m, applying)),
+        (Some(st), Some(bat), Some(m)) => Some(tx_vm(st, bat, m, None, applying)),
         _ => None,
     }
 }
@@ -959,6 +1016,7 @@ mod tests {
             heart,
             pending_set: pending,
             received_at: None,
+            tx_levels: [None, None],
         }
     }
 
@@ -1717,6 +1775,51 @@ mod tests {
         ] {
             assert_eq!(battery_segment_count(pct), want, "battery {pct}%");
         }
+    }
+
+    /// The meter curve is the APK's exact `getVolumeProgress2` [code
+    /// BleSingleVolumeView.java]: silence floor, band edges, the sensitive
+    /// middle, the hot zone, the >0 invalid guard. The demo's at-rest
+    /// values (−16/−12 dB = the mock's 7/11 lit) ride along.
+    #[test]
+    fn meter_lit_is_the_apk_curve() {
+        for (db, want) in [
+            (-99i16, 0), // silence sentinel (RMS == 0)
+            (-46, 0),
+            (-45, 0),  // band 1 lower edge
+            (-40, 1),  // ~4.6 dB per segment
+            (-17, 6),  // band 1 upper edge
+            (-16, 7),  // band 2 (v+23) — the mock's Mic 2 at rest
+            (-12, 11), // band 2 — the mock's Mic 1 at rest
+            (-10, 13), // band 2 upper edge
+            (-9, 14),  // band 3 (~1.2 dB per segment)
+            (-4, 18),
+            (-3, 18), // band 4 lower edge
+            (-2, 19),
+            (0, 20), // full scale
+            (1, 0),  // above full scale: invalid → 0, exactly like the APK
+        ] {
+            assert_eq!(meter_lit(db), want, "meter at {db} dBFS");
+        }
+    }
+
+    /// The card gates: unconnected / muted / no-source all show zero; a
+    /// connected unmuted mic maps through [`meter_lit`]; mute wins over a
+    /// hot signal.
+    #[test]
+    fn meter_lit_for_gates_the_card() {
+        let tx = |connected: bool, muted: bool, level: Option<i16>| TxVm {
+            connected,
+            battery: 93,
+            battery_class: battery_class(93),
+            muted,
+            level,
+            applying: false,
+        };
+        assert_eq!(meter_lit_for(&tx(true, false, Some(-12))), 11);
+        assert_eq!(meter_lit_for(&tx(true, false, None)), 0, "no source");
+        assert_eq!(meter_lit_for(&tx(true, true, Some(0))), 0, "muted wins");
+        assert_eq!(meter_lit_for(&tx(false, false, Some(0))), 0, "offline");
     }
 
     /// The writability table is a fixed contract: exactly the

@@ -84,6 +84,13 @@ pub struct Snapshot {
     /// (actor-stamped; footer presentation + staleness display). `None`
     /// until the first poll succeeds, cleared on disconnect.
     pub received_at: Option<u64>,
+    /// Per-slot audio levels in dBFS (slot 0 = TX1, 1 = TX2), −99..=0 —
+    /// HOST-measured (`StatusSource::tx_levels`), never device data: the
+    /// wire has no level field (HeartInfo §5 carries none; the APK measures
+    /// its meter from local PCM [code AudioRecordUtils.java]). `None` = no
+    /// measurement available (real hardware until the OS-audio tap lands;
+    /// demo scripts its values). Cleared with the claim.
+    pub tx_levels: [Option<i16>; 2],
 }
 
 impl Snapshot {
@@ -198,6 +205,14 @@ pub trait StatusSource {
     /// connected before the first write — the APK's own UI precondition
     /// (HLDevice6302Activity.java:805-812), carried by the VM gate.
     fn set_mic_recognition(&mut self, value: u8) -> Result<u8, Error>;
+    /// Host-side per-slot audio levels (dBFS −99..=0; slot 0 = TX1, 1 =
+    /// TX2). Out-of-band host data — the wire has no level field — so the
+    /// default is "no measurement" and the real control transport keeps
+    /// returning it until an OS-audio tap exists (frontends/gpui/README:
+    /// meter stays unlit on real hardware). `DemoDevice` scripts values.
+    fn tx_levels(&mut self) -> [Option<i16>; 2] {
+        [None, None]
+    }
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {

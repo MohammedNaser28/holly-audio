@@ -347,6 +347,12 @@ pub struct Core {
     /// Core (not inside `snapshot()`) so the emit-on-change dedup stays
     /// byte-stable between polls.
     updated: Option<u64>,
+    /// Latest per-slot host-measured levels (dBFS) — from the source's own
+    /// out-of-band [`StatusSource::tx_levels`] read, never device data.
+    /// Cleared with the claim. Lives on the Core so `emit`'s full-snapshot
+    /// dedup sees level-only movement (a new snapshot pushes, the footer
+    /// stamp does NOT move — it tracks device GETs only).
+    tx_levels: [Option<i16>; 2],
     /// Last composed snapshot (emit-on-change dedup base).
     last: Option<Snapshot>,
 }
@@ -362,6 +368,7 @@ impl Core {
             heart: None,
             pending: None,
             updated: None,
+            tx_levels: [None, None],
             last: None,
         };
         // Baseline BEFORE anything ran: a subscriber joining right after
@@ -387,6 +394,7 @@ impl Core {
             heart: self.heart.clone(),
             pending_set: self.pending,
             received_at: self.updated,
+            tx_levels: self.tx_levels,
         }
     }
 
@@ -459,6 +467,7 @@ impl Core {
         self.heart = None;
         self.pending = None;
         self.updated = None;
+        self.tx_levels = [None, None];
         self.device = None; // never double-holding
         self.emit();
         match (self.factory)() {
@@ -491,6 +500,13 @@ impl Core {
         };
         match source.poll() {
             Ok(heart) => {
+                // Host-side levels ride OUT-OF-BAND (the wire heart has no
+                // level field): read while `source` is still borrowed, then
+                // store below. A scripted/measured level steps once per
+                // poll tick; level-only movement pushes through `emit`'s
+                // full-snapshot dedup WITHOUT moving `updated` — the footer
+                // stamp tracks device GETs.
+                let levels = source.tx_levels();
                 // Stamp wall-clock only when device-visible content moved,
                 // or on the session's first success: `emit` dedups on full
                 // snapshot equality, so re-stamping every poll would push a
@@ -503,6 +519,7 @@ impl Core {
                 self.status = ConnStatus::Connected;
                 self.heart = Some(heart);
                 self.error_clear();
+                self.tx_levels = levels;
                 if changed || self.updated.is_none() {
                     self.updated = Some(unix_secs());
                 }
@@ -513,6 +530,7 @@ impl Core {
                 self.device = None;
                 self.pending = None;
                 self.heart = None;
+                self.tx_levels = [None, None];
                 self.updated = None;
                 self.status = ConnStatus::NotFound;
                 self.error_set(e.to_string());
@@ -564,6 +582,7 @@ impl Core {
                 self.device = None;
                 self.pending = None;
                 self.heart = None;
+                self.tx_levels = [None, None];
                 self.updated = None;
                 self.status = ConnStatus::NotFound;
                 self.error_set(e.to_string());
