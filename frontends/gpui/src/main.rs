@@ -233,6 +233,31 @@ impl AppModel {
         }
     }
 
+    /// The shared Left/Right stepper for the four context-scoped selectors
+    /// (EQ/Volume/Channel/Schedule — reverb keeps its own trio: its cursor
+    /// is the gear byte, not `selected`, and no cx rides). With no verified
+    /// selection the step is a noop — the VM's `selected` is the only
+    /// cursor, matching the "no pending target" rule — and outside
+    /// `0..=last` it stops at the edge. `set` is the SAME pick path the
+    /// mouse uses (a fn pointer, so the capture-less call-site closures
+    /// coerce), keeping mouse and keyboard on one decision
+    /// ([`controls::*_pick`]).
+    fn step_selection(
+        &mut self,
+        selected: Option<usize>,
+        last: isize,
+        step: isize,
+        set: fn(&mut AppModel, usize, &mut Context<AppModel>),
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(selected) = selected {
+            let next = selected as isize + step;
+            if (0..=last).contains(&next) {
+                set(self, next as usize, cx);
+            }
+        }
+    }
+
     /// One EQ pad pick for mouse AND keyboard — [`eq_pick`] is the whole
     /// decision (read-only family or an in-flight EQ write: blocked;
     /// already-selected: noop; else write). The WIRE byte comes from the
@@ -252,12 +277,13 @@ impl AppModel {
     /// step is a noop: the VM's `selected` is the only cursor, matching the
     /// "no pending target" rule.
     fn eq_step(&mut self, step: isize, cx: &mut Context<Self>) {
-        if let Some(selected) = self.vm.eq.selected {
-            let next = selected as isize + step;
-            if (0..=2).contains(&next) {
-                self.set_eq_pad(next as usize, cx);
-            }
-        }
+        self.step_selection(
+            self.vm.eq.selected,
+            2,
+            step,
+            |this, index, cx| this.set_eq_pad(index, cx),
+            cx,
+        );
     }
 
     fn on_eq_prev(&mut self, _: &EqPrev, _: &mut Window, cx: &mut Context<Self>) {
@@ -286,12 +312,13 @@ impl AppModel {
     /// With no verified selection the step is a noop: the VM's `selected`
     /// is the only cursor, matching the "no pending target" rule.
     fn volume_step(&mut self, step: isize, cx: &mut Context<Self>) {
-        if let Some(selected) = self.vm.volume.selected {
-            let next = selected as isize + step;
-            if (0..=5).contains(&next) {
-                self.set_gain_stop(next as usize, cx);
-            }
-        }
+        self.step_selection(
+            self.vm.volume.selected,
+            5,
+            step,
+            |this, index, cx| this.set_gain_stop(index, cx),
+            cx,
+        );
     }
 
     fn on_volume_prev(&mut self, _: &VolumePrev, _: &mut Window, cx: &mut Context<Self>) {
@@ -425,12 +452,13 @@ impl AppModel {
     /// VM's `selected` is the only cursor, matching the "no pending
     /// target" rule.
     fn channel_step(&mut self, step: isize, cx: &mut Context<Self>) {
-        if let Some(selected) = self.vm.channel_mode.selected {
-            let next = selected as isize + step;
-            if (0..=1).contains(&next) {
-                self.set_channel_mode(next as usize, cx);
-            }
-        }
+        self.step_selection(
+            self.vm.channel_mode.selected,
+            1,
+            step,
+            |this, index, cx| this.set_channel_mode(index, cx),
+            cx,
+        );
     }
 
     fn on_channel_prev(&mut self, _: &ChannelPrev, _: &mut Window, cx: &mut Context<Self>) {
@@ -464,12 +492,13 @@ impl AppModel {
     /// selection the step is a noop: the VM's `selected` is the only
     /// cursor, matching the "no pending target" rule.
     fn schedule_step(&mut self, step: isize, cx: &mut Context<Self>) {
-        if let Some(selected) = self.vm.shutdown.selected {
-            let next = selected as isize + step;
-            if (0..=1).contains(&next) {
-                self.set_schedule_power_off(next as usize, cx);
-            }
-        }
+        self.step_selection(
+            self.vm.shutdown.selected,
+            1,
+            step,
+            |this, index, cx| this.set_schedule_power_off(index, cx),
+            cx,
+        );
     }
 
     fn on_schedule_prev(&mut self, _: &SchedulePrev, _: &mut Window, cx: &mut Context<Self>) {

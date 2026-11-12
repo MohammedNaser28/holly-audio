@@ -313,6 +313,42 @@ pub(crate) fn toggle_switch(on: bool) -> gpui::Div {
     )
 }
 
+/// The keyboard/click shell around a [`toggle_switch`] pill — the reverb /
+/// Indicator-light / Mic-recognition panels' switches: an id'd, focusable
+/// wrapper (the rocker's 2px tungsten focus outline, `key_context` scoped)
+/// that adds NO padding (the pill's own footprint, so the row's
+/// space-between keeps the toggle where the read-only render had it), dims
+/// to the established 0.5 while the control's OWN write is in flight, and —
+/// ONLY while the flip may go out (`accepted`, the caller's
+/// `controls::*_toggle_accepted` gate) — carries the click listener.
+/// `focus` is the keyboard scope (handle + key_context), the same shape as
+/// [`SelectorSpec::focus`] minus the None case. `on_flip` is a plain fn
+/// pointer for the same 'static listener bound as
+/// [`segmented_selector`]'s `on_pick` (gpui `Context::listener`,
+/// context.rs:252); the non-capturing call-site closures coerce to it.
+pub(crate) fn toggle_shell(
+    id: &'static str,
+    focus: (&FocusHandle, &'static str),
+    dim: bool,
+    on: bool,
+    accepted: bool,
+    on_flip: fn(&mut AppModel),
+    cx: &Context<AppModel>,
+) -> gpui::Stateful<gpui::Div> {
+    let mut shell = div()
+        .id(id)
+        .rounded(px(theme::metrics::TOGGLE_RADIUS))
+        .track_focus(focus.0)
+        .key_context(focus.1)
+        .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
+        .when(dim, |t| t.opacity(0.5))
+        .child(toggle_switch(on));
+    if accepted {
+        shell = shell.on_click(cx.listener(move |this, _: &ClickEvent, _, _| on_flip(this)));
+    }
+    shell
+}
+
 // ---- the segmented multi-choice selector ---------------------------------------
 
 /// One segmented selector's wiring, stated once per control (the only

@@ -28,7 +28,7 @@ use crate::controls::{
 use crate::theme;
 use crate::widgets::{
     ICON_CHARGER, ICON_CLOSE, ICON_MIC, LedLit, SelectorSpec, led_dot, matte_under_edge, panel,
-    segmented_selector, solid, svg_glyph, titled_with_led, toggle_switch, well,
+    segmented_selector, solid, svg_glyph, titled_with_led, toggle_shell, well,
 };
 
 impl AppModel {
@@ -860,12 +860,10 @@ impl AppModel {
             .children((enabled == Some(true)).then(|| self.reverb_selector(applying, cx)))
     }
 
-    /// The panel's switch: the read-only `toggle_switch` pill wrapped in
-    /// the keyboard shell (track_focus + "reverb_toggle" context + the
-    /// rocker's 2px tungsten focus outline) and — ONLY while the flip may
-    /// go out — a click listener. The wrapper adds NO padding: it is the
-    /// pill's own footprint, so the row's space-between keeps the toggle
-    /// exactly where the read-only render had it.
+    /// The panel's switch: the read-only `toggle_switch` pill in the shared
+    /// [`toggle_shell`] ("reverb_toggle" context + the rocker's 2px
+    /// tungsten focus outline) and — ONLY while the flip may go out — a
+    /// click listener.
     fn reverb_toggle(
         &self,
         enabled: Option<bool>,
@@ -873,20 +871,15 @@ impl AppModel {
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let reverb = self.vm.reverb.as_ref();
-        let mut shell = div()
-            .id("reverb-toggle")
-            .rounded(px(theme::metrics::TOGGLE_RADIUS))
-            .track_focus(&self.reverb_toggle_focus)
-            .key_context("reverb_toggle")
-            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
-            .when(applying, |t| t.opacity(0.5))
-            .child(toggle_switch(enabled == Some(true)));
-        if let Some(reverb) = reverb
-            && reverb_toggle_accepted(reverb)
-        {
-            shell = shell.on_click(cx.listener(|this, _: &ClickEvent, _, _| this.flip_reverb()));
-        }
-        shell
+        toggle_shell(
+            "reverb-toggle",
+            (&self.reverb_toggle_focus, "reverb_toggle"),
+            applying,
+            enabled == Some(true),
+            reverb.is_some_and(reverb_toggle_accepted),
+            |this| this.flip_reverb(),
+            cx,
+        )
     }
 
     /// The panel's size selector: the read-only radio_group recipe
@@ -950,53 +943,40 @@ impl AppModel {
     }
 
     /// The Indicator light panel's switch: the read-only `toggle_switch`
-    /// pill wrapped in the keyboard shell (track_focus + "light_toggle"
-    /// context + the rocker's 2px tungsten focus outline) and — ONLY while
-    /// the flip may go out ([`light_toggle_accepted`]) — a click listener.
-    /// The wrapper adds NO padding: it is the pill's own footprint, so the
-    /// row's space-between keeps the toggle exactly where the read-only
-    /// render had it (same recipe as [`Self::reverb_toggle`]); the
-    /// established 0.5 dim rides while `LightVm.applying`.
+    /// pill in the shared [`toggle_shell`] ("light_toggle" context) — ONLY
+    /// while the flip may go out ([`light_toggle_accepted`]) a click
+    /// listener; the established 0.5 dim rides while `LightVm.applying`
+    /// (same recipe as [`Self::reverb_toggle`]).
     fn light_toggle(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let light = &self.vm.light;
-        let mut shell = div()
-            .id("light-toggle")
-            .rounded(px(theme::metrics::TOGGLE_RADIUS))
-            .track_focus(&self.light_toggle_focus)
-            .key_context("light_toggle")
-            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
-            .when(light.applying, |t| t.opacity(0.5))
-            .child(toggle_switch(light.on == Some(true)));
-        if light_toggle_accepted(light) {
-            shell = shell.on_click(cx.listener(|this, _: &ClickEvent, _, _| this.flip_light()));
-        }
-        shell
+        toggle_shell(
+            "light-toggle",
+            (&self.light_toggle_focus, "light_toggle"),
+            light.applying,
+            light.on == Some(true),
+            light_toggle_accepted(light),
+            |this| this.flip_light(),
+            cx,
+        )
     }
 
     /// The Mic-recognition panel's switch: the read-only `toggle_switch`
-    /// pill wrapped in the keyboard shell (track_focus + "mic_toggle"
-    /// context + the rocker's 2px tungsten focus outline) and — ONLY while
-    /// the flip may go out ([`mic_toggle_accepted`], the family gate plus
-    /// BOTH mics connected) — a click listener. The wrapper adds NO
-    /// padding: it is the pill's own footprint, so the row's space-between
-    /// keeps the toggle exactly where the read-only render had it (same
-    /// recipe as [`Self::light_toggle`]); the established 0.5 dim rides
-    /// while `MicRecognitionVm.applying`.
+    /// pill in the shared [`toggle_shell`] ("mic_toggle" context) — ONLY
+    /// while the flip may go out ([`mic_toggle_accepted`], the family gate
+    /// plus BOTH mics connected) a click listener; the established 0.5 dim
+    /// rides while `MicRecognitionVm.applying` (same recipe as
+    /// [`Self::light_toggle`]).
     fn mic_toggle(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let mic = &self.vm.mic_recognition;
-        let mut shell = div()
-            .id("mic-toggle")
-            .rounded(px(theme::metrics::TOGGLE_RADIUS))
-            .track_focus(&self.mic_toggle_focus)
-            .key_context("mic_toggle")
-            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
-            .when(mic.applying, |t| t.opacity(0.5))
-            .child(toggle_switch(mic.on == Some(true)));
-        if mic_toggle_accepted(&self.vm) {
-            shell = shell
-                .on_click(cx.listener(|this, _: &ClickEvent, _, _| this.flip_mic_recognition()));
-        }
-        shell
+        toggle_shell(
+            "mic-toggle",
+            (&self.mic_toggle_focus, "mic_toggle"),
+            mic.applying,
+            mic.on == Some(true),
+            mic_toggle_accepted(&self.vm),
+            |this| this.flip_mic_recognition(),
+            cx,
+        )
     }
 
     // ---- footer (32px) --------------------------------------------------------
