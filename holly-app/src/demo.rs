@@ -116,14 +116,17 @@ fn scripted_level(tick: u32) -> i16 {
 
 impl StatusSource for DemoDevice {
     fn poll(&mut self) -> Result<HeartInfo, Error> {
-        self.tick += 1; // the meter's step; the heart itself never moves here
         Ok(self.heart.lock().unwrap().clone())
     }
 
     /// Out-of-band host data (wire has none): TX1 is offline in the demo
-    /// payload — no channel to measure; TX2 rides [`scripted_level`].
+    /// payload — no channel to measure; TX2 rides [`scripted_level`]. The
+    /// sweep steps on LEVEL READS (the actor's once-per-successful-poll
+    /// read), with the FIRST read at the mock's at-rest −16 dB.
     fn tx_levels(&mut self) -> [Option<i16>; 2] {
-        [None, Some(scripted_level(self.tick))]
+        let level = scripted_level(self.tick);
+        self.tick += 1;
+        [None, Some(level)]
     }
 
     fn set_noise(&mut self, on: bool) -> Result<(), Error> {
