@@ -754,7 +754,9 @@ impl AppModel {
                 // mouse AND the Left/Right keys.
                 is_pickable: &|index| channel_pick(index, channel) != ChannelPick::Blocked,
                 on_pick: |this, index, cx| this.set_channel_mode(index, cx),
-                horizontal: false,
+                // The mock renders the two mode pads as one horizontal row
+                // (index.html:121-123), NOT the NC rocker's vertical stack.
+                horizontal: true,
                 dim: channel.applying,
                 focus: Some((&self.channel_focus, "channel_selector")),
             },
