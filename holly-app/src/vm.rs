@@ -169,9 +169,18 @@ pub enum BatteryClass {
     Critical,
 }
 
-/// Battery color-class thresholds. PRESENTATION-ONLY: neither the APK nor
-/// any capture defines device-side battery thresholds; these bands
-/// (75/40/15 %) are a display choice, documented here as not protocol data.
+/// Battery color-class thresholds. PRESENTATION-ONLY: neither the heart
+/// protocol nor any capture defines device-side battery thresholds; these
+/// bands (75/40/15 %) are a display choice, documented here as not protocol
+/// data. The APK's own UI rule for the same display: `BatteryClipView` —
+/// the 6108 screen's battery widget (`hldevice_new_battery_6108.xml:24-32`,
+/// wired in `HLDevice6302Activity.updateBatteryView`) — draws WHITE above
+/// its low level and RED at/below it (low default 600/10000 = 6 %,
+/// `BatteryClipView.java:27` + `:165-173`; GREEN only while charging,
+/// `:167-168`); the 6108 activity never overrides that threshold. The GUI
+/// maps those colour roles onto THIS VM's four classes — Full/High → TEXT,
+/// Low → TUNGSTEN, Critical → ALERT (owner 2026-11-12): TEXT ≈ the APK's
+/// white / the mock's lit #ECEEF1, ALERT ≈ its red role.
 pub fn battery_class(pct: u8) -> BatteryClass {
     match pct {
         0..=14 => BatteryClass::Critical,

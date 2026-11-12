@@ -14,8 +14,8 @@ use gpui::{
 };
 
 use holly_app::vm::{
-    Banner, DEVICE_NAME, TxVm, VID_PID, battery_segment_count, conn_status_word, mic_status,
-    mute_label, nc_level_label, nc_status, reverb_selection,
+    Banner, BatteryClass, DEVICE_NAME, TxVm, VID_PID, battery_segment_count, conn_status_word,
+    mic_status, mute_label, nc_level_label, nc_status, reverb_selection,
 };
 
 use crate::AppModel;
@@ -443,7 +443,12 @@ impl AppModel {
                     .child(div().flex_1())
                     .child(chip),
             )
-            .child(battery_block(&digits, live, lit))
+            .child(battery_block(
+                &digits,
+                live,
+                lit,
+                tx.map(|tx| tx.battery_class),
+            ))
             .child(level_meter_block())
     }
 
@@ -1050,7 +1055,27 @@ pub(crate) fn name_for(id: &str) -> &'static str {
 /// the rest stay the unlit RAISED fill. DEVIATION from the mock, which
 /// lit all five on any live link regardless of percent (index.html:229) —
 /// kept proportional so the bar agrees with the digits (README).
-pub(crate) fn battery_block(digits: &str, live: bool, lit: usize) -> gpui::Div {
+pub(crate) fn battery_block(
+    digits: &str,
+    live: bool,
+    lit: usize,
+    class: Option<BatteryClass>,
+) -> gpui::Div {
+    // The class tint (owner 2026-11-12), the APK's colour roles mapped onto
+    // the closed token set: Full/High → TEXT (the mock's lit segments,
+    // index.html:229, ≈ the APK's white/normal role [code
+    // BatteryClipView.java:173]), Low → TUNGSTEN, Critical → ALERT (≈ the
+    // APK's red role [code ic_battery_red.xml #fa5151,
+    // BatteryClipView.java:173]; ALERT #FF6B6B is the closed set's nearest
+    // signal colour). The APK tints the BAR, not the number (the 6108's %
+    // text keeps a static colour, `HLDevice6302Activity.java:1759-1761`),
+    // so the digits keep the mock's live/dead rule (numColor,
+    // index.html:228) and only the segments ride the class.
+    let tint = class.map(|class| match class {
+        BatteryClass::Full | BatteryClass::High => theme::color::TEXT,
+        BatteryClass::Low => theme::color::TUNGSTEN,
+        BatteryClass::Critical => theme::color::ALERT,
+    });
     div()
         .flex()
         .flex_col()
@@ -1086,9 +1111,10 @@ pub(crate) fn battery_block(digits: &str, live: bool, lit: usize) -> gpui::Div {
                 ),
         )
         .child(
-            // 5 segments, h8 r3, gap 4; `lit` of them white (real %), the
-            // rest the unlit RAISED fill (proportional deviation from the
-            // mock's light-all-five, documented in README).
+            // 5 segments, h8 r3, gap 4; `lit` of them in the CLASS colour
+            // (Full/High → TEXT keeps today's/mock's look, Low → TUNGSTEN,
+            // Critical → ALERT), the rest the unlit RAISED fill. Lit count
+            // stays the honest per-charge rule (`battery_segment_count`).
             div().flex().gap(px(theme::metrics::SPACE_1)).children(
                 (0..theme::metrics::BATTERY_SEGMENTS).map(|segment| {
                     div()
@@ -1096,7 +1122,7 @@ pub(crate) fn battery_block(digits: &str, live: bool, lit: usize) -> gpui::Div {
                         .h(px(8.))
                         .rounded(px(theme::metrics::BATTERY_SEGMENT_RADIUS))
                         .bg(solid(if live && segment < lit {
-                            theme::color::TEXT
+                            tint.unwrap_or(theme::color::TEXT)
                         } else {
                             theme::color::RAISED
                         }))
