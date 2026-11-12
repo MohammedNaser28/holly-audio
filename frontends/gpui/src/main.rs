@@ -98,11 +98,11 @@ use gpui::{
 use holly_app::DeviceHandle;
 use holly_app::demo::DemoScenario;
 use holly_app::vm::{
-    Banner, ChannelModeVm, DEVICE_NAME, EqVm, GainVm, NcVm, ReverbVm, ScheduleVm, TxVm, VID_PID,
-    ViewModel, WRITABLE, battery_segment_count, channel_mode_pad_wire, conn_status_word,
-    eq_pad_wire, mic_status, mute_label, nc_level_label, nc_status, reverb_gear_wire,
-    reverb_selection, reverb_toggle_wire, shutdown_pad_wire, tx_mute_wire, view_model,
-    volume_pad_wire,
+    Banner, ChannelModeVm, DEVICE_NAME, EqVm, GainVm, LightVm, NcVm, ReverbVm, ScheduleVm, TxVm,
+    VID_PID, ViewModel, WRITABLE, battery_segment_count, channel_mode_pad_wire, conn_status_word,
+    eq_pad_wire, indicator_light_wire, mic_status, mute_label, nc_level_label, nc_status,
+    reverb_gear_wire, reverb_selection, reverb_toggle_wire, shutdown_pad_wire, tx_mute_wire,
+    view_model, volume_pad_wire,
 };
 
 actions!(
@@ -123,6 +123,7 @@ actions!(
         ChannelNext,
         SchedulePrev,
         ScheduleNext,
+        ToggleLight,
         Refresh,
         Quit
     ]
@@ -553,6 +554,16 @@ fn reverb_toggle_accepted(reverb: &ReverbVm) -> bool {
     reverb_write_accepted(reverb) && reverb.enabled.is_some()
 }
 
+/// May THIS light toggle go out right now? Guard for the switch flip: the
+/// family gate plus a VERIFIED switch state — the flip target is `!on`,
+/// and an unknown state never invents one (same rule as
+/// [`reverb_toggle_accepted`]). The family gate's `WRITABLE` half is
+/// vm.rs's pinned table (certified 2026-11-12), the `applying` half comes
+/// from the actor-reported `LightVm`.
+fn light_toggle_accepted(light: &LightVm) -> bool {
+    WRITABLE.indicator_light && !light.applying && light.on.is_some()
+}
+
 /// Decision for ONE reverb gear pick — parallel to [`EqPick`]: blocked (the
 /// family is read-only, a reverb write is in flight, or the switch state is
 /// unverified), noop (that gear is already the device's verified selection
@@ -751,6 +762,10 @@ struct AppModel {
     /// other selector wells, its own "schedule_selector" key context
     /// (Left/Right step the two timer pads while it holds focus).
     schedule_focus: FocusHandle,
+    /// The Indicator-light switch's keyboard handle — its own
+    /// "light_toggle" key context (Space/Enter flip while the switch
+    /// wrapper holds focus), the same rule as the reverb switch.
+    light_toggle_focus: FocusHandle,
     vm: ViewModel,
     device: DeviceHandle,
     demo: Option<DemoScenario>,
@@ -894,6 +909,26 @@ impl AppModel {
 
     fn on_toggle_reverb(&mut self, _: &ToggleReverb, _: &mut Window, _: &mut Context<Self>) {
         self.flip_reverb();
+    }
+
+    /// The light toggle's single flip path (Space/Enter via the action,
+    /// click via the switch wrapper); [`light_toggle_accepted`] is the
+    /// whole gate. The flip target is computed from the VERIFIED state;
+    /// the WIRE byte comes from the VM's tested inversion
+    /// ([`indicator_light_wire`]) — this file never names a device value
+    /// (the wire space is INVERTED, 0 = on; both APK sides carry the same
+    /// inversion, checklist §3).
+    fn flip_light(&mut self) {
+        if light_toggle_accepted(&self.vm.light)
+            && let Some(on) = self.vm.light.on
+        {
+            let wire = indicator_light_wire(!on);
+            self.device.set_indicator_light(wire);
+        }
+    }
+
+    fn on_toggle_light(&mut self, _: &ToggleLight, _: &mut Window, _: &mut Context<Self>) {
+        self.flip_light();
     }
 
     /// One reverb gear pick for mouse AND keyboard — [`reverb_pick`] is the
@@ -1287,17 +1322,15 @@ impl AppModel {
                                             "Mic recognition",
                                             // §5 offset 15 read (`vm.mic_recognition`), not
                                             // a hardcoded false; unknown => off like
-                                            // `light.unwrap_or` below.
-                                            self.vm.mic_recognition.unwrap_or(false),
+                                            // the light's unknown state below.
+                                            toggle_switch(self.vm.mic_recognition.unwrap_or(false))
+                                                .into_any_element(),
                                         )
                                         .flex_1(),
                                     )
                                     .child(
-                                        self.led_toggle_panel(
-                                            "Indicator light",
-                                            self.vm.light.unwrap_or(false),
-                                        )
-                                        .flex_1(),
+                                        self.led_toggle_panel("Indicator light", self.light_toggle(cx).into_any_element())
+                                            .flex_1(),
                                     ),
                             ),
                     ),
@@ -2257,10 +2290,12 @@ impl AppModel {
     /// reference's one-row layout (`align-items:center;
     /// justify-content:space-between`, index.html:158). Mic recognition has
     /// NO wire read → renders the OFF switch at full opacity (an unknown
-    /// state shows, it never greys out); the indicator light is the
-    /// wire-read `light` byte (§5 offset 11, inverted). BOTH are read-only
-    /// (`WRITABLE`, no listeners).
-    fn led_toggle_panel(&self, title: &'static str, on_state: bool) -> gpui::Div {
+    /// state shows, it never greys out) and stays READ-ONLY (`WRITABLE`,
+    /// no listeners); the indicator light is the wire-read `light` byte
+    /// (§5 offset 11, inverted) and is INTERACTIVE since the light round
+    /// trip (2026-11-12) — its switch arrives prebuilt from
+    /// [`Self::light_toggle`].
+    fn led_toggle_panel(&self, title: &'static str, switch: gpui::AnyElement) -> gpui::Div {
         panel()
             .flex_row()
             .items_center()
@@ -2271,7 +2306,31 @@ impl AppModel {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
-            .child(toggle_switch(on_state))
+            .child(switch)
+    }
+
+    /// The Indicator light panel's switch: the read-only `toggle_switch`
+    /// pill wrapped in the keyboard shell (track_focus + "light_toggle"
+    /// context + the rocker's 2px tungsten focus outline) and — ONLY while
+    /// the flip may go out ([`light_toggle_accepted`]) — a click listener.
+    /// The wrapper adds NO padding: it is the pill's own footprint, so the
+    /// row's space-between keeps the toggle exactly where the read-only
+    /// render had it (same recipe as [`Self::reverb_toggle`]); the
+    /// established 0.5 dim rides while `LightVm.applying`.
+    fn light_toggle(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let light = &self.vm.light;
+        let mut shell = div()
+            .id("light-toggle")
+            .rounded(px(theme::metrics::TOGGLE_RADIUS))
+            .track_focus(&self.light_toggle_focus)
+            .key_context("light_toggle")
+            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
+            .when(light.applying, |t| t.opacity(0.5))
+            .child(toggle_switch(light.on == Some(true)));
+        if light_toggle_accepted(light) {
+            shell = shell.on_click(cx.listener(|this, _: &ClickEvent, _, _| this.flip_light()));
+        }
+        shell
     }
 
     // ---- footer (32px) --------------------------------------------------------
@@ -2455,6 +2514,7 @@ impl Render for AppModel {
             .on_action(cx.listener(Self::on_channel_next))
             .on_action(cx.listener(Self::on_schedule_prev))
             .on_action(cx.listener(Self::on_schedule_next))
+            .on_action(cx.listener(Self::on_toggle_light))
             .on_action(cx.listener(Self::on_refresh))
             .child(self.render_titlebar())
             .children(self.render_banner(cx))
@@ -2518,7 +2578,8 @@ fn main() {
             // focused ("channel_selector"), and the Schedule pads ONLY
             // while the schedule well is focused ("schedule_selector");
             // Space/Enter flip the reverb switch only inside
-            // "reverb_toggle" — the design defines no inter-selector
+            // "reverb_toggle" and the Indicator-light switch only inside
+            // "light_toggle" — the design defines no inter-selector
             // arrow keys (no invented global bindings stealing NC's
             // 1/2/3).
             cx.bind_keys([
@@ -2551,6 +2612,12 @@ fn main() {
                 // disjoint, no invented global bindings.
                 KeyBinding::new("left", SchedulePrev, Some("schedule_selector")),
                 KeyBinding::new("right", ScheduleNext, Some("schedule_selector")),
+                // Space/Enter flip the Indicator-light switch ONLY while
+                // the switch wrapper is focused ("light_toggle" context) —
+                // the same rule as the reverb switch, still disjoint, no
+                // invented global bindings.
+                KeyBinding::new("space", ToggleLight, Some("light_toggle")),
+                KeyBinding::new("enter", ToggleLight, Some("light_toggle")),
                 KeyBinding::new("1", NcLow, None),
                 KeyBinding::new("2", NcMedium, None),
                 KeyBinding::new("3", NcStrong, None),
@@ -2626,6 +2693,7 @@ fn main() {
                             let reverb_toggle_focus = cx.focus_handle();
                             let channel_focus = cx.focus_handle();
                             let schedule_focus = cx.focus_handle();
+                            let light_toggle_focus = cx.focus_handle();
                             AppModel {
                                 focus,
                                 eq_focus,
@@ -2634,6 +2702,7 @@ fn main() {
                                 reverb_toggle_focus,
                                 channel_focus,
                                 schedule_focus,
+                                light_toggle_focus,
                                 vm: ViewModel::default(),
                                 device,
                                 demo,
@@ -2692,7 +2761,8 @@ mod tests {
     };
     use holly_app::NoiseWrite;
     use holly_app::vm::{
-        Banner, ChannelModeVm, EqVm, GainVm, NcVm, ScheduleVm, TxVm, ViewModel, battery_class,
+        Banner, ChannelModeVm, EqVm, GainVm, LightVm, NcVm, ScheduleVm, TxVm, ViewModel,
+        battery_class,
     };
 
     /// A rocker/VM shape straight from the VM fields.
@@ -2729,7 +2799,10 @@ mod tests {
             tx3: None,
             tx4: None,
             nc: nc(None, None, None),
-            light: None,
+            light: LightVm {
+                on: None,
+                applying: false,
+            },
             volume: GainVm {
                 selected: None,
                 applying: false,

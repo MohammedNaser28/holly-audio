@@ -221,6 +221,23 @@ impl StatusSource for DemoDevice {
         heart.shutdown_time = value;
         Ok(previous)
     }
+
+    fn set_indicator_light(&mut self, value: u8) -> Result<u8, Error> {
+        // Same shape as holly-usb's set_light: the RETURN is the WIRE
+        // byte the heart held BEFORE the write (the fresh GET's
+        // payload[11] verbatim — restore-flow datum); the write mutates
+        // only the §5-offset-11 byte — INVERTED (0 = on [code
+        // ProGetHearInfo.java:75-76], so the demo heart stores the parsed
+        // BOOL exactly like the real parse) — everything else stays
+        // scripted. Pending scenario: stall BEFORE mutation, so the
+        // pending snapshot is always observable first (same shape as
+        // set_gain).
+        let mut heart = self.heart.lock().unwrap();
+        let previous = u8::from(!heart.light_on);
+        std::thread::sleep(self.stall);
+        heart.light_on = value == 0;
+        Ok(previous)
+    }
 }
 
 /// The OS busy condition, byte-for-byte the real claim failure shape

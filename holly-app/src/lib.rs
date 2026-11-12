@@ -177,6 +177,16 @@ pub trait StatusSource {
     /// comes from its own post-SET poll. AGENTS.md lift: timer values
     /// ONLY, never an immediate power-off (owner, 2026-11-12).
     fn set_shutdown_time(&mut self, value: u8) -> Result<u8, Error>;
+    /// One SET_LIGHT round trip — `value` in the WIRE value space {0, 1},
+    /// INVERTED (0 = on, 1 = off; §5.2 Indicator-light row: both APK sides
+    /// carry the same inversion [code HLDevice6302Activity.java:662 /
+    /// ProGetHearInfo.java:75-76], so the wire round trip is identity on
+    /// the inverted space; the UI-bool translation lives in
+    /// vm::indicator_light_wire, never here). set_indicator_light returns
+    /// the fresh GET's PRE-write byte (restore-flow datum) exactly like
+    /// set_shutdown_time; the actor's verdict comes from its own post-SET
+    /// poll.
+    fn set_indicator_light(&mut self, value: u8) -> Result<u8, Error>;
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {
@@ -214,6 +224,10 @@ impl<T: Transport> StatusSource for HollyControl<T> {
 
     fn set_shutdown_time(&mut self, value: u8) -> Result<u8, Error> {
         HollyControl::set_shutdown_time(self, value)
+    }
+
+    fn set_indicator_light(&mut self, value: u8) -> Result<u8, Error> {
+        HollyControl::set_light(self, value)
     }
 }
 

@@ -90,6 +90,13 @@ pub enum PendingWrite {
     /// Shutdown-power-off row, identity on both sides). The identity
     /// mapping lives in `vm::shutdown_pad_wire`, never here.
     Shutdown(u8),
+    /// A light write is in flight: the byte is the WIRE value being
+    /// written on the INVERTED space (0 = on, 1 = off — checklist §3
+    /// Indicator-light row; BOTH APK sides carry the same inversion, so
+    /// the round trip is identity on the wire). The one UI-bool → WIRE
+    /// translation lives in `vm::indicator_light_wire`, never here and
+    /// never in a frontend.
+    Light(u8),
 }
 
 /// Commands the UI/frontend may send.
@@ -144,6 +151,13 @@ pub enum Command {
     /// Coalesces to the latest like every other SET (one SET per batch,
     /// newest intent).
     SetSchedulePowerOff(u8),
+    /// Request an Indicator-light write, `value` in the WIRE value space
+    /// {0, 1} — INVERTED (0 = on, 1 = off; checklist §3 Indicator-light
+    /// row: both APK sides carry the same inversion, wire round trip
+    /// identity). The one UI-bool translation lives in the VM
+    /// (`indicator_light_wire`), never in a frontend. Coalesces to the
+    /// latest like every other SET (one SET per batch, newest intent).
+    SetIndicatorLight(u8),
     /// Force one fresh poll/reconnect attempt now.
     Refresh,
 }
@@ -261,6 +275,14 @@ impl DeviceHandle {
     /// device verdict.
     pub fn set_schedule_power_off(&self, value: u8) {
         let _ = self.tx.send(Command::SetSchedulePowerOff(value));
+    }
+
+    /// Request an Indicator-light write (WIRE value {0, 1}, INVERTED —
+    /// 0 = on; the UI-bool translation is the VM's `indicator_light_wire`).
+    /// Fire-and-forget like every other send: the snapshot stream reports
+    /// "pending" then the device verdict.
+    pub fn set_indicator_light(&self, value: u8) {
+        let _ = self.tx.send(Command::SetIndicatorLight(value));
     }
 
     pub fn refresh(&self) {
@@ -382,6 +404,7 @@ impl Core {
                     write = Some(PendingWrite::TxMute { tx, muted })
                 }
                 Command::SetSchedulePowerOff(value) => write = Some(PendingWrite::Shutdown(value)),
+                Command::SetIndicatorLight(value) => write = Some(PendingWrite::Light(value)),
             }
         }
         if self.device.is_none() {
@@ -503,6 +526,7 @@ impl Core {
             PendingWrite::ChannelMode(value) => source.set_channel_mode(value).map(|_previous| ()),
             PendingWrite::TxMute { tx, muted } => source.set_tx_mute(tx, muted).map(|_previous| ()),
             PendingWrite::Shutdown(value) => source.set_shutdown_time(value).map(|_previous| ()),
+            PendingWrite::Light(value) => source.set_indicator_light(value).map(|_previous| ()),
         };
         match result {
             Ok(()) => {

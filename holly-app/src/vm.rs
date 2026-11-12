@@ -99,7 +99,17 @@ pub const VID_PID: &str = "3547:0407";
 ///   set_shutdown_time_roundtrip.pcap + captures/
 ///   set_shutdown_time_roundtrip.jsonl; roadmap §1 route (b), checklist
 ///   §3 Shutdown-power-off row)
-/// - everything else is [code] at best (light cmd 33, mic recognition …)
+/// - `indicator_light` — SET_LIGHT (cmd 33) [wire] PC-originated guarded
+///   round trip 2026-11-12: frames `05 03 AA DD 21 00 01 {01,00} EF` →
+///   acks `00` tail `0x47` (the checksum rule's 8th shape, cmd
+///   0x21 ⊕ 0x66) → hearts settled on the written light byte (§5 offset
+///   11, the ONLY heart byte that moved; residues 0x6C/0x6D fold
+///   consistently). INVERTED value space on BOTH sides (0 = on) — the
+///   one inversion lives in [`indicator_light_wire`], never in a view
+///   (captures/raw/set_light_roundtrip.pcap + captures/
+///   set_light_roundtrip.jsonl; roadmap §1 route (b), checklist §3
+///   Indicator-light row)
+/// - everything else is [code] at best (mic recognition …)
 ///   and has never been captured, so it stays read-only today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Writable {
@@ -126,7 +136,10 @@ pub const WRITABLE: Writable = Writable {
     reverb: true,
     mic_recognition: false,
     schedule_power_off: true,
-    indicator_light: false,
+    // Certified on the 2026-11-12 indicator-light round trip — both
+    // documented values {on, off} exercised; the INVERTED space is
+    // translated only in `indicator_light_wire`, never in a view.
+    indicator_light: true,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -255,6 +268,21 @@ pub fn shutdown_selection(shutdown_time: u8) -> Option<usize> {
 /// unmapped (out of 0..=1) returns None.
 pub fn shutdown_pad_wire(index: usize) -> Option<u8> {
     (index <= 1).then_some(index as u8)
+}
+
+/// THE one inversion of the indicator-light control: the UI's switch
+/// boolean -> the WIRE byte `set_light` writes. The APK's own toggle
+/// handler writes the OPPOSITE of the switch state (`setLight(!z ? 1 : 0)`,
+/// switch on → 0 [code `HLDevice6302Activity.java:662`]) and the heart
+/// reads the same inversion back (`lightStatus == 0` → on [code
+/// `ProGetHearInfo.java:75-76`, §5 offset 11]) — BOTH sides carry the SAME
+/// inversion (checklist §3), so the wire round trip is identity and this
+/// single function is the whole translation. Pure function like
+/// [`shutdown_pad_wire`] so frontends never hardcode device values and the
+/// mapping is tested once here (the feature file's one unit test), never
+/// duplicated in a view.
+pub fn indicator_light_wire(on: bool) -> u8 {
+    u8::from(!on)
 }
 
 /// The EQ panel's selected pad, in the design's display order
@@ -474,6 +502,23 @@ pub struct ScheduleVm {
     pub applying: bool,
 }
 
+/// Indicator-light state: the DEVICE's current switch byte as the UI's
+/// boolean, plus whether a light write is in flight. `on` is None for any
+/// non-connected snapshot; the byte↔bool inversion happens exactly once
+/// on this side ([`indicator_light_wire`] and the parse's documented
+/// `== 0` read [code `ProGetHearInfo.java:75-76`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LightVm {
+    /// The device's current light state (§5 offset 11, inverted byte:
+    /// 0 = on). The ONLY value the toggle may display as actual state;
+    /// changes only via snapshots.
+    pub on: Option<bool>,
+    /// A light SET (only ever [`PendingWrite::Light`]) is in flight —
+    /// the toggle dims (the existing 0.5 look) and ignores input until
+    /// the device's verdict.
+    pub applying: bool,
+}
+
 /// Reverb state: the DEVICE's current switch and gear bytes, plus whether
 /// a reverb write is in flight. `enabled` is the verified switch byte
 /// (§5 offset 13) — None only where no heart exists, so a toggle never
@@ -509,10 +554,11 @@ pub struct ViewModel {
     pub tx3: Option<TxVm>,
     pub tx4: Option<TxVm>,
     pub nc: NcVm,
-    /// Receiver indicator light (HeartInfo §5 offset 11; the byte is
-    /// inverted — 0 means on `[code ProGetHearInfo.java:75-76]`, captured
-    /// value [wire]). Read-only until SET_LIGHT (cmd 33) passes the §1 gate.
-    pub light: Option<bool>,
+    /// Indicator light ([`LightVm`]): the device's switch state from
+    /// HeartInfo §5 offset 11 (the byte is inverted — 0 means on [code
+    /// ProGetHearInfo.java:75-76], captured value [wire]), plus the
+    /// in-flight flag for its own panel only.
+    pub light: LightVm,
     /// Gain (§5 field `voiceLevel`) as the selector's VM state
     /// ([`GainVm`]): display-order selection from the device's byte
     /// (§5 offset 8; write space == read space, 0..=5 — checklist §3
@@ -565,7 +611,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 pending: None,
                 last_error: None,
             },
-            light: None,
+            light: LightVm {
+                on: None,
+                applying: false,
+            },
             volume: GainVm {
                 selected: None,
                 applying: false,
@@ -674,11 +723,15 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                         | Some(PendingWrite::ChannelMode(_))
                         | Some(PendingWrite::TxMute { .. })
                         | Some(PendingWrite::Shutdown(_))
+                        | Some(PendingWrite::Light(_))
                         | None => None,
                     },
                     last_error: None,
                 },
-                light: Some(heart.light_on),
+                light: LightVm {
+                    on: Some(heart.light_on),
+                    applying: matches!(s.pending_set, Some(PendingWrite::Light(_))),
+                },
                 volume: GainVm {
                     selected: volume_selection(heart.voice_level),
                     applying: matches!(s.pending_set, Some(PendingWrite::Gain(_))),
@@ -727,7 +780,10 @@ fn disconnected_core() -> ViewModel {
             pending: None,
             last_error: None,
         },
-        light: None,
+        light: LightVm {
+            on: None,
+            applying: false,
+        },
         volume: GainVm {
             selected: None,
             applying: false,
@@ -1550,7 +1606,9 @@ mod tests {
     /// (captures/set_tx_mute_roundtrip.jsonl); Schedule power-off on
     /// 2026-11-12 (captures/set_shutdown_time_roundtrip.jsonl — timer
     /// values ONLY per the AGENTS.md lift, never an immediate
-    /// power-off).
+    /// power-off); Indicator light on 2026-11-12
+    /// (captures/set_light_roundtrip.jsonl — both inverted values {on,
+    /// off} exercised).
     #[test]
     fn writable_table_matches_the_certified_chain() {
         let all_read_only = Writable {
@@ -1583,6 +1641,11 @@ mod tests {
                 // both documented values {15min, Never} exercised; the
                 // immediate power-off family stays excluded (AGENTS.md).
                 schedule_power_off: true,
+                // Certified on the 2026-11-12 indicator-light round trip —
+                // both documented values {on, off} exercised; the
+                // INVERTED wire space is translated only in
+                // `indicator_light_wire`, never in a view.
+                indicator_light: true,
                 ..all_read_only
             }
         );
@@ -1641,16 +1704,51 @@ mod tests {
     }
 
     /// Indicator light passthrough: header field semantics (offset 11,
-    /// inverted byte) surface straight to the view; unknown without a heart.
+    /// inverted byte) surface straight to the view as the LightVm switch
+    /// boolean; unknown without a heart.
     #[test]
     fn light_passthrough() {
         let vm = view_model(&snap(ConnStatus::Connecting, None, None, None));
-        assert_eq!(vm.light, None);
+        assert_eq!(
+            vm.light,
+            LightVm {
+                on: None,
+                applying: false
+            }
+        );
 
         // E1: light byte 0 -> light_on (inverted) -> Some(true). The demo
         // payloads and both live captures carry the same semantics.
         let vm = view_model(&snap(ConnStatus::Connected, Some(e1()), None, None));
-        assert_eq!(vm.light, Some(true));
+        assert_eq!(
+            vm.light,
+            LightVm {
+                on: Some(true),
+                applying: false
+            }
+        );
+    }
+
+    /// THE one inversion of the indicator-light control (feature-file
+    /// requirement: the mapping lives in exactly one place and is tested
+    /// once here, never in a view). The APK's toggle writes the OPPOSITE
+    /// of the switch state and the heart reads the same inversion back —
+    /// both sides carry the same inversion [code
+    /// HLDevice6302Activity.java:662 / ProGetHearInfo.java:75-76], so the
+    /// wire byte is `!on` for BOTH directions (checklist §3: identity
+    /// round trip on the inverted space).
+    #[test]
+    fn indicator_light_wire_is_the_single_inversion() {
+        assert_eq!(
+            indicator_light_wire(true),
+            0,
+            "switch on -> wire 0 (the APK's setLight(0) on-toggle)"
+        );
+        assert_eq!(
+            indicator_light_wire(false),
+            1,
+            "switch off -> wire 1 (the APK's setLight(1) off-toggle)"
+        );
     }
 
     /// Device name: the const is the single source (views must not carry a
