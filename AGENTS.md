@@ -24,13 +24,18 @@ hardcode device rules or strings.
 
 - Forbidden interfaces: IF1/IF2/IF3 (UAC audio + vendor bulk). Only IF0 is
   claimed.
-- Forbidden commands: the OTA/reboot/pairing/reset family; identify (35),
-  speaker (37). Shutdown (39) is lifted for timer values only (owner,
-  2026-11-12): only the two documented timer values 0 = 15min, 1 = Never
-  [code `HLDevice6302Activity.java:1668/:1673`], never an immediate
-  power-off. TX mute (22) is lifted for per-transmitter mute on/off, TX1
-  first (owner, 2026-11-12); TX2 stays gated until "22 lifted for TX2" —
-  TX2 may not be powered during the run.
+- Forbidden commands: the OTA/reboot/pairing/reset family; speaker (37).
+  Shutdown (39) is lifted for timer values only (owner, 2026-11-12): only
+  the two documented timer values 0 = 15min, 1 = Never [code
+  `HLDevice6302Activity.java:1668/:1673`], never an immediate power-off.
+  TX mute (22) is lifted for per-transmitter mute on/off, TX1 first (owner,
+  2026-11-12); TX2 stays gated until "22 lifted for TX2" — TX2 may not be
+  powered during the run. Identify (35) is lifted for mic recognition
+  on/off only (owner, 2026-11-12): only the two documented values
+  OFF = 0, ON = 1 [code `HLDevice6302Activity.java:819-824`,
+  `DeviceConnectVariable.java:652-654`], and any device run for it
+  requires BOTH transmitters connected (heart offsets 0/1) before the
+  first write [code `HLDevice6302Activity.java:805-812`].
 - No cached device state: every SET derives from a fresh GET issued inside
   the same call.
 - Captures are observation only (usbmon, airgap): we never inject frames
