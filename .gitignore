@@ -19,3 +19,12 @@ android-x86-9.0-r2.iso
 tools/android-x86.qcow2
 tools/android-x86-v2.qcow2
 tools/android-x86-r2.qcow2
+
+# Owner working files (approved 2026-11-12, stay local): the frozen route-(a)
+# rig's scratch build dir, the per-control feature prompts and their zip, the
+# original design bundle zip (docs/design/ is the tracked expansion), and the
+# saved browser page of the theme.
+/.build/
+/features/
+holly-*.zip
+Holly theme.html
