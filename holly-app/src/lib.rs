@@ -187,6 +187,17 @@ pub trait StatusSource {
     /// set_shutdown_time; the actor's verdict comes from its own post-SET
     /// poll.
     fn set_indicator_light(&mut self, value: u8) -> Result<u8, Error>;
+    /// One SET_TX_IDENTIFY round trip — `value` in the WIRE value space
+    /// {0, 1} (§5.2 Mic-recognition row: OFF = 0, ON = 1, identity on both
+    /// sides [code HLDevice6302Activity.java:819-824 +
+    /// DeviceConnectVariable.java:652-654 / ProGetHearInfo.java:88]);
+    /// set_mic_recognition returns the fresh GET's PRE-write identify byte
+    /// (restore-flow datum) exactly like set_shutdown_time; the actor's
+    /// verdict comes from its own post-SET poll. AGENTS.md lift: mic
+    /// recognition on/off ONLY (owner, 2026-11-12), and BOTH transmitters
+    /// connected before the first write — the APK's own UI precondition
+    /// (HLDevice6302Activity.java:805-812), carried by the VM gate.
+    fn set_mic_recognition(&mut self, value: u8) -> Result<u8, Error>;
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {
@@ -228,6 +239,10 @@ impl<T: Transport> StatusSource for HollyControl<T> {
 
     fn set_indicator_light(&mut self, value: u8) -> Result<u8, Error> {
         HollyControl::set_light(self, value)
+    }
+
+    fn set_mic_recognition(&mut self, value: u8) -> Result<u8, Error> {
+        HollyControl::set_tx_identify(self, value)
     }
 }
 

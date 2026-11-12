@@ -97,6 +97,11 @@ pub enum PendingWrite {
     /// translation lives in `vm::indicator_light_wire`, never here and
     /// never in a frontend.
     Light(u8),
+    /// A mic-recognition write is in flight: the byte is the WIRE value
+    /// being written (OFF = 0, ON = 1 — checklist §3 Identify-beep row,
+    /// identity on both sides). The identity translation lives in
+    /// `vm::mic_recognition_wire`, never here.
+    MicRecognition(u8),
 }
 
 /// Commands the UI/frontend may send.
@@ -158,6 +163,13 @@ pub enum Command {
     /// (`indicator_light_wire`), never in a frontend. Coalesces to the
     /// latest like every other SET (one SET per batch, newest intent).
     SetIndicatorLight(u8),
+    /// Request a Mic-recognition write, `value` in the WIRE value space
+    /// {0, 1} (OFF = 0, ON = 1 — checklist §3 Identify-beep row: write
+    /// space == read space, identity). The identity translation lives in
+    /// the VM (`mic_recognition_wire`), never in a frontend. Coalesces to
+    /// the latest like every other SET (one SET per batch, newest
+    /// intent).
+    SetMicRecognition(u8),
     /// Force one fresh poll/reconnect attempt now.
     Refresh,
 }
@@ -285,6 +297,14 @@ impl DeviceHandle {
         let _ = self.tx.send(Command::SetIndicatorLight(value));
     }
 
+    /// Request a Mic-recognition write (WIRE value {0, 1}, identity —
+    /// OFF = 0, ON = 1; the translation is the VM's
+    /// `mic_recognition_wire`). Fire-and-forget like every other send:
+    /// the snapshot stream reports "pending" then the device verdict.
+    pub fn set_mic_recognition(&self, value: u8) {
+        let _ = self.tx.send(Command::SetMicRecognition(value));
+    }
+
     pub fn refresh(&self) {
         let _ = self.tx.send(Command::Refresh);
     }
@@ -405,6 +425,9 @@ impl Core {
                 }
                 Command::SetSchedulePowerOff(value) => write = Some(PendingWrite::Shutdown(value)),
                 Command::SetIndicatorLight(value) => write = Some(PendingWrite::Light(value)),
+                Command::SetMicRecognition(value) => {
+                    write = Some(PendingWrite::MicRecognition(value))
+                }
             }
         }
         if self.device.is_none() {
@@ -527,6 +550,9 @@ impl Core {
             PendingWrite::TxMute { tx, muted } => source.set_tx_mute(tx, muted).map(|_previous| ()),
             PendingWrite::Shutdown(value) => source.set_shutdown_time(value).map(|_previous| ()),
             PendingWrite::Light(value) => source.set_indicator_light(value).map(|_previous| ()),
+            PendingWrite::MicRecognition(value) => {
+                source.set_mic_recognition(value).map(|_previous| ())
+            }
         };
         match result {
             Ok(()) => {

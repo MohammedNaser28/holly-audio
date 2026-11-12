@@ -100,9 +100,9 @@ use holly_app::demo::DemoScenario;
 use holly_app::vm::{
     Banner, ChannelModeVm, DEVICE_NAME, EqVm, GainVm, LightVm, NcVm, ReverbVm, ScheduleVm, TxVm,
     VID_PID, ViewModel, WRITABLE, battery_segment_count, channel_mode_pad_wire, conn_status_word,
-    eq_pad_wire, indicator_light_wire, mic_status, mute_label, nc_level_label, nc_status,
-    reverb_gear_wire, reverb_selection, reverb_toggle_wire, shutdown_pad_wire, tx_mute_wire,
-    view_model, volume_pad_wire,
+    eq_pad_wire, indicator_light_wire, mic_recognition_allowed, mic_recognition_wire, mic_status,
+    mute_label, nc_level_label, nc_status, reverb_gear_wire, reverb_selection, reverb_toggle_wire,
+    shutdown_pad_wire, tx_mute_wire, view_model, volume_pad_wire,
 };
 
 actions!(
@@ -124,6 +124,7 @@ actions!(
         SchedulePrev,
         ScheduleNext,
         ToggleLight,
+        ToggleMicRecognition,
         Refresh,
         Quit
     ]
@@ -564,6 +565,24 @@ fn light_toggle_accepted(light: &LightVm) -> bool {
     WRITABLE.indicator_light && !light.applying && light.on.is_some()
 }
 
+/// May THIS mic-recognition toggle go out right now? Guard for the switch
+/// flip: the family gate (`WRITABLE.mic_recognition` — true only since the
+/// 2026-11-12 round trip), nothing in flight, a VERIFIED switch state, and
+/// BOTH transmitters verified connected — the APK's own precondition for
+/// this toggle ([`mic_recognition_allowed`], the
+/// HLDevice6302Activity.java:805-812 rule the VM carries). The gate reads
+/// the whole [`ViewModel`] because that precondition spans the mic cards,
+/// not the toggle's own slice.
+fn mic_toggle_accepted(vm: &ViewModel) -> bool {
+    WRITABLE.mic_recognition
+        && !vm.mic_recognition.applying
+        && vm.mic_recognition.on.is_some()
+        && mic_recognition_allowed(
+            vm.tx1.is_some_and(|t| t.connected),
+            vm.tx2.is_some_and(|t| t.connected),
+        )
+}
+
 /// Decision for ONE reverb gear pick — parallel to [`EqPick`]: blocked (the
 /// family is read-only, a reverb write is in flight, or the switch state is
 /// unverified), noop (that gear is already the device's verified selection
@@ -766,6 +785,10 @@ struct AppModel {
     /// "light_toggle" key context (Space/Enter flip while the switch
     /// wrapper holds focus), the same rule as the reverb switch.
     light_toggle_focus: FocusHandle,
+    /// The Mic-recognition switch's keyboard handle — its own
+    /// "mic_toggle" key context (Space/Enter flip while the switch
+    /// wrapper holds focus), the same rule as the light switch.
+    mic_toggle_focus: FocusHandle,
     vm: ViewModel,
     device: DeviceHandle,
     demo: Option<DemoScenario>,
@@ -929,6 +952,31 @@ impl AppModel {
 
     fn on_toggle_light(&mut self, _: &ToggleLight, _: &mut Window, _: &mut Context<Self>) {
         self.flip_light();
+    }
+
+    /// The mic-recognition toggle's single flip path (Space/Enter via the
+    /// action, click via the switch wrapper); [`mic_toggle_accepted`] is
+    /// the whole gate. The flip target is computed from the VERIFIED
+    /// state; the WIRE byte comes from the VM's tested identity
+    /// translation ([`mic_recognition_wire`]) — this file never names a
+    /// device value (the space is OFF = 0 / ON = 1 on both sides,
+    /// checklist §3).
+    fn flip_mic_recognition(&mut self) {
+        if mic_toggle_accepted(&self.vm)
+            && let Some(on) = self.vm.mic_recognition.on
+        {
+            let wire = mic_recognition_wire(!on);
+            self.device.set_mic_recognition(wire);
+        }
+    }
+
+    fn on_toggle_mic_recognition(
+        &mut self,
+        _: &ToggleMicRecognition,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.flip_mic_recognition();
     }
 
     /// One reverb gear pick for mouse AND keyboard — [`reverb_pick`] is the
@@ -1321,16 +1369,19 @@ impl AppModel {
                                         self.led_toggle_panel(
                                             "Mic recognition",
                                             // §5 offset 15 read (`vm.mic_recognition`), not
-                                            // a hardcoded false; unknown => off like
-                                            // the light's unknown state below.
-                                            toggle_switch(self.vm.mic_recognition.unwrap_or(false))
-                                                .into_any_element(),
+                                            // a hardcoded false — INTERACTIVE since the
+                                            // 2026-11-12 round trip; the switch arrives
+                                            // prebuilt from [`Self::mic_toggle`].
+                                            self.mic_toggle(cx).into_any_element(),
                                         )
                                         .flex_1(),
                                     )
                                     .child(
-                                        self.led_toggle_panel("Indicator light", self.light_toggle(cx).into_any_element())
-                                            .flex_1(),
+                                        self.led_toggle_panel(
+                                            "Indicator light",
+                                            self.light_toggle(cx).into_any_element(),
+                                        )
+                                        .flex_1(),
                                     ),
                             ),
                     ),
@@ -1385,7 +1436,11 @@ impl AppModel {
         // click listener, the reverb-toggle shape: the listener attaches
         // ONLY while the whole gate passes, so a read-only family or an
         // in-flight write leaves the chip inert without new visuals.
-        let chip_id: &'static str = if slot == 0 { "mic-1-mute" } else { "mic-2-mute" };
+        let chip_id: &'static str = if slot == 0 {
+            "mic-1-mute"
+        } else {
+            "mic-2-mute"
+        };
         let applying = tx.is_some_and(|tx| tx.applying);
         let mut chip = div()
             .id(chip_id)
@@ -1408,9 +1463,8 @@ impl AppModel {
         if let Some(tx) = tx
             && mic_mute_write_accepted(tx)
         {
-            chip = chip.on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
-                this.flip_mic_mute(slot)
-            }));
+            chip = chip
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, _| this.flip_mic_mute(slot)));
         }
         div()
             .flex()
@@ -2288,13 +2342,15 @@ impl AppModel {
 
     /// Mic recognition / Indicator light panels (the 120px row halves): the
     /// reference's one-row layout (`align-items:center;
-    /// justify-content:space-between`, index.html:158). Mic recognition has
-    /// NO wire read → renders the OFF switch at full opacity (an unknown
-    /// state shows, it never greys out) and stays READ-ONLY (`WRITABLE`,
-    /// no listeners); the indicator light is the wire-read `light` byte
-    /// (§5 offset 11, inverted) and is INTERACTIVE since the light round
-    /// trip (2026-11-12) — its switch arrives prebuilt from
-    /// [`Self::light_toggle`].
+    /// justify-content:space-between`, index.html:158). BOTH switches
+    /// arrive prebuilt from their keyboard shells ([`Self::mic_toggle`] /
+    /// [`Self::light_toggle`]): the indicator light is the wire-read
+    /// `light` byte (§5 offset 11, inverted) and is INTERACTIVE since the
+    /// light round trip (2026-11-12); mic recognition is the wire-read
+    /// identify byte (§5 offset 15) and is INTERACTIVE since its own
+    /// round trip (2026-11-12) — additionally gated on BOTH transmitters
+    /// being verified connected (the APK's own precondition,
+    /// HLDevice6302Activity.java:805-812).
     fn led_toggle_panel(&self, title: &'static str, switch: gpui::AnyElement) -> gpui::Div {
         panel()
             .flex_row()
@@ -2329,6 +2385,32 @@ impl AppModel {
             .child(toggle_switch(light.on == Some(true)));
         if light_toggle_accepted(light) {
             shell = shell.on_click(cx.listener(|this, _: &ClickEvent, _, _| this.flip_light()));
+        }
+        shell
+    }
+
+    /// The Mic-recognition panel's switch: the read-only `toggle_switch`
+    /// pill wrapped in the keyboard shell (track_focus + "mic_toggle"
+    /// context + the rocker's 2px tungsten focus outline) and — ONLY while
+    /// the flip may go out ([`mic_toggle_accepted`], the family gate plus
+    /// BOTH mics connected) — a click listener. The wrapper adds NO
+    /// padding: it is the pill's own footprint, so the row's space-between
+    /// keeps the toggle exactly where the read-only render had it (same
+    /// recipe as [`Self::light_toggle`]); the established 0.5 dim rides
+    /// while `MicRecognitionVm.applying`.
+    fn mic_toggle(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let mic = &self.vm.mic_recognition;
+        let mut shell = div()
+            .id("mic-toggle")
+            .rounded(px(theme::metrics::TOGGLE_RADIUS))
+            .track_focus(&self.mic_toggle_focus)
+            .key_context("mic_toggle")
+            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
+            .when(mic.applying, |t| t.opacity(0.5))
+            .child(toggle_switch(mic.on == Some(true)));
+        if mic_toggle_accepted(&self.vm) {
+            shell = shell
+                .on_click(cx.listener(|this, _: &ClickEvent, _, _| this.flip_mic_recognition()));
         }
         shell
     }
@@ -2515,6 +2597,7 @@ impl Render for AppModel {
             .on_action(cx.listener(Self::on_schedule_prev))
             .on_action(cx.listener(Self::on_schedule_next))
             .on_action(cx.listener(Self::on_toggle_light))
+            .on_action(cx.listener(Self::on_toggle_mic_recognition))
             .on_action(cx.listener(Self::on_refresh))
             .child(self.render_titlebar())
             .children(self.render_banner(cx))
@@ -2618,6 +2701,12 @@ fn main() {
                 // invented global bindings.
                 KeyBinding::new("space", ToggleLight, Some("light_toggle")),
                 KeyBinding::new("enter", ToggleLight, Some("light_toggle")),
+                // Space/Enter flip the Mic-recognition switch ONLY while
+                // the switch wrapper is focused ("mic_toggle" context) —
+                // the same rule as the light switch, still disjoint, no
+                // invented global bindings.
+                KeyBinding::new("space", ToggleMicRecognition, Some("mic_toggle")),
+                KeyBinding::new("enter", ToggleMicRecognition, Some("mic_toggle")),
                 KeyBinding::new("1", NcLow, None),
                 KeyBinding::new("2", NcMedium, None),
                 KeyBinding::new("3", NcStrong, None),
@@ -2694,6 +2783,7 @@ fn main() {
                             let channel_focus = cx.focus_handle();
                             let schedule_focus = cx.focus_handle();
                             let light_toggle_focus = cx.focus_handle();
+                            let mic_toggle_focus = cx.focus_handle();
                             AppModel {
                                 focus,
                                 eq_focus,
@@ -2703,6 +2793,7 @@ fn main() {
                                 channel_focus,
                                 schedule_focus,
                                 light_toggle_focus,
+                                mic_toggle_focus,
                                 vm: ViewModel::default(),
                                 device,
                                 demo,
@@ -2761,8 +2852,8 @@ mod tests {
     };
     use holly_app::NoiseWrite;
     use holly_app::vm::{
-        Banner, ChannelModeVm, EqVm, GainVm, LightVm, NcVm, ScheduleVm, TxVm, ViewModel,
-        battery_class,
+        Banner, ChannelModeVm, EqVm, GainVm, LightVm, MicRecognitionVm, NcVm, ScheduleVm, TxVm,
+        ViewModel, battery_class,
     };
 
     /// A rocker/VM shape straight from the VM fields.
@@ -2808,7 +2899,10 @@ mod tests {
                 applying: false,
             },
             eq: eq(None, false),
-            mic_recognition: None,
+            mic_recognition: MicRecognitionVm {
+                on: None,
+                applying: false,
+            },
             channel_mode: ChannelModeVm {
                 selected: None,
                 stereo_ok: false,

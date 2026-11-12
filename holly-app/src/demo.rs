@@ -238,6 +238,21 @@ impl StatusSource for DemoDevice {
         heart.light_on = value == 0;
         Ok(previous)
     }
+
+    fn set_mic_recognition(&mut self, value: u8) -> Result<u8, Error> {
+        // Same shape as holly-usb's set_tx_identify: the RETURN is the
+        // identify byte the heart held BEFORE the write (the fresh GET's
+        // payload[15] verbatim — restore-flow datum); the write mutates
+        // only the §5-offset-15 byte (0 = off, 1 = on — identity),
+        // everything else stays scripted. Pending scenario: stall BEFORE
+        // mutation, so the pending snapshot is always observable first
+        // (same shape as set_gain).
+        let mut heart = self.heart.lock().unwrap();
+        let previous = u8::from(heart.tx_identify);
+        std::thread::sleep(self.stall);
+        heart.tx_identify = value == 1;
+        Ok(previous)
+    }
 }
 
 /// The OS busy condition, byte-for-byte the real claim failure shape

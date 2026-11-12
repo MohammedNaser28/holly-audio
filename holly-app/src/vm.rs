@@ -109,7 +109,21 @@ pub const VID_PID: &str = "3547:0407";
 ///   (captures/raw/set_light_roundtrip.pcap + captures/
 ///   set_light_roundtrip.jsonl; roadmap §1 route (b), checklist §3
 ///   Indicator-light row)
-/// - everything else is [code] at best (mic recognition …)
+/// - `mic_recognition` — SET_TX_IDENTIFY (cmd 35) [wire] PC-originated
+///   guarded round trip 2026-11-12: frames `05 03 AA DD 23 00 01 {01,00}
+///   EF` → acks `00` tail `0x45` (the checksum rule's 9th shape, cmd
+///   0x23 ⊕ 0x66) → hearts settled on the written identify byte (§5
+///   offset 15, the ONLY heart byte that moved; residues 0x6F constant —
+///   the heart fold excludes this byte, protocol.md §2). IDENTITY value
+///   space OFF = 0 / ON = 1 on both sides, translated only in
+///   [`mic_recognition_wire`], never in a view. The toggle additionally
+///   gates on BOTH transmitters verified connected — the APK's own
+///   precondition (`HLDevice6302Activity.java:805-812`), carried by
+///   [`mic_recognition_allowed`], never by a view
+///   (captures/raw/set_tx_identify_roundtrip.pcap + captures/
+///   set_tx_identify_roundtrip.jsonl; roadmap §1 route (b), checklist §3
+///   Identify-beep row)
+/// - everything else is [code] at best (speaker …)
 ///   and has never been captured, so it stays read-only today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Writable {
@@ -134,7 +148,11 @@ pub const WRITABLE: Writable = Writable {
     channel_mode: true,
     eq: true,
     reverb: true,
-    mic_recognition: false,
+    // Certified on the 2026-11-12 mic-recognition round trip — both
+    // documented values {off, on} exercised; IDENTITY space, and the
+    // toggle's BOTH-mics precondition lives in `mic_recognition_allowed`
+    // (the APK's own UI check), never in a view.
+    mic_recognition: true,
     schedule_power_off: true,
     // Certified on the 2026-11-12 indicator-light round trip — both
     // documented values {on, off} exercised; the INVERTED space is
@@ -283,6 +301,31 @@ pub fn shutdown_pad_wire(index: usize) -> Option<u8> {
 /// duplicated in a view.
 pub fn indicator_light_wire(on: bool) -> u8 {
     u8::from(!on)
+}
+
+/// The Mic-recognition toggle's identity translation: the UI's switch
+/// boolean -> the WIRE byte `set_tx_identify` writes. OFF = 0, ON = 1 on
+/// BOTH sides — write caller `FAIL_CLOSE(1)`/`SUC_OPEN(0)`
+/// (HLDevice6302Activity.java:819-824 + DeviceConnectVariable.java:
+/// 652-654 [code]), read parser `== 1` (ProGetHearInfo.java:88 [code]) —
+/// no inversion anywhere (checklist §3). Pure function like
+/// [`indicator_light_wire`] so frontends never hardcode device values;
+/// tested once here, never duplicated in a view.
+pub fn mic_recognition_wire(on: bool) -> u8 {
+    u8::from(on)
+}
+
+/// The Mic-recognition toggle's link gate: BOTH transmitters must be
+/// verified connected — the APK's own precondition for THIS toggle
+/// (toast, then return before any SET is built,
+/// `HLDevice6302Activity.java:805-812`), unlike Stereo where the APK
+/// gates on ANY mic. The guarded hardware run carries the same rule as
+/// a hard start gate, and the certified round trip ran with both mics
+/// connected all run (2026-11-12). Pure function like
+/// [`stereo_allowed`] so the VM carries the rule and frontends never
+/// restate it.
+pub fn mic_recognition_allowed(tx1_connected: bool, tx2_connected: bool) -> bool {
+    tx1_connected && tx2_connected
 }
 
 /// The EQ panel's selected pad, in the design's display order
@@ -519,6 +562,22 @@ pub struct LightVm {
     pub applying: bool,
 }
 
+/// Mic-recognition state: the DEVICE's current identify switch (§5
+/// offset 15, `== 1` → on [code ProGetHearInfo.java:88]), plus whether a
+/// mic-recognition write is in flight. `on` is None for any
+/// non-connected snapshot; the byte space is IDENTITY (OFF = 0, ON = 1 —
+/// no inversion anywhere, checklist §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MicRecognitionVm {
+    /// The device's current identify state (the ONLY value the toggle may
+    /// display as actual state; changes only via snapshots).
+    pub on: Option<bool>,
+    /// A mic-recognition SET (only ever [`PendingWrite::MicRecognition`])
+    /// is in flight — the toggle dims (the existing 0.5 look) and ignores
+    /// input until the device's verdict.
+    pub applying: bool,
+}
+
 /// Reverb state: the DEVICE's current switch and gear bytes, plus whether
 /// a reverb write is in flight. `enabled` is the verified switch byte
 /// (§5 offset 13) — None only where no heart exists, so a toggle never
@@ -569,11 +628,14 @@ pub struct ViewModel {
     /// DeviceConnectVariable.EQ]), plus the in-flight flag for its own
     /// panel only.
     pub eq: EqVm,
-    /// Identify-beep state (§5 offset 15, `== 1` semantics [code
-    /// ProGetHearInfo.java:88]). The Mic-recognition panel's switch reads
-    /// THIS — it used to be hardcoded `false` in the view, which could
-    /// contradict the device when the phone-side identify was on.
-    pub mic_recognition: Option<bool>,
+    /// Mic recognition ([`MicRecognitionVm`]): the device's identify
+    /// state (§5 offset 15, `== 1` semantics [code
+    /// ProGetHearInfo.java:88] — the byte `holly-cli -- status` prints as
+    /// "identify beep"), plus the in-flight flag for its own panel only.
+    /// INTERACTIVE since the 2026-11-12 round trip; the BOTH-mics
+    /// precondition lives in [`mic_recognition_allowed`] (the APK's own
+    /// UI check, HLDevice6302Activity.java:805-812).
+    pub mic_recognition: MicRecognitionVm,
     /// Channel-mode pads ([`ChannelModeVm`]): display-order selection
     /// from the device's `voiceMode` byte (§5 offset 9; 0 = Mono, 1 =
     /// Stereo [code HLDevice6302Activity.java:1803-1805]), plus the
@@ -623,7 +685,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                 selected: None,
                 applying: false,
             },
-            mic_recognition: None,
+            mic_recognition: MicRecognitionVm {
+                on: None,
+                applying: false,
+            },
             channel_mode: ChannelModeVm {
                 selected: None,
                 stereo_ok: false,
@@ -724,6 +789,7 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                         | Some(PendingWrite::TxMute { .. })
                         | Some(PendingWrite::Shutdown(_))
                         | Some(PendingWrite::Light(_))
+                        | Some(PendingWrite::MicRecognition(_))
                         | None => None,
                     },
                     last_error: None,
@@ -740,7 +806,10 @@ pub fn view_model(s: &Snapshot) -> ViewModel {
                     selected: eq_selection(heart.eq_level),
                     applying: matches!(s.pending_set, Some(PendingWrite::Eq(_))),
                 },
-                mic_recognition: Some(heart.tx_identify),
+                mic_recognition: MicRecognitionVm {
+                    on: Some(heart.tx_identify),
+                    applying: matches!(s.pending_set, Some(PendingWrite::MicRecognition(_))),
+                },
                 channel_mode: ChannelModeVm {
                     selected: channel_mode_selection(heart.voice_mode),
                     stereo_ok: stereo_allowed(heart.tx1_status, heart.tx2_status),
@@ -792,7 +861,10 @@ fn disconnected_core() -> ViewModel {
             selected: None,
             applying: false,
         },
-        mic_recognition: None,
+        mic_recognition: MicRecognitionVm {
+            on: None,
+            applying: false,
+        },
         channel_mode: ChannelModeVm {
             selected: None,
             stereo_ok: false,
@@ -1057,7 +1129,13 @@ mod tests {
             })
         );
         // The formerly-dropped fields: E1's own bytes (cite §5 offsets).
-        assert_eq!(vm.mic_recognition, Some(false), "txIdentify off [15]");
+        assert_eq!(
+            vm.mic_recognition,
+            MicRecognitionVm {
+                on: Some(false), // txIdentify off [15]
+                applying: false
+            }
+        );
         assert_eq!(
             vm.channel_mode,
             ChannelModeVm {
@@ -1376,6 +1454,44 @@ mod tests {
         assert!(!vm.channel_mode.stereo_ok, "but a new write stays gated");
     }
 
+    /// The Mic-recognition identity translation: OFF = 0, ON = 1 on both
+    /// sides — the write caller (`FAIL_CLOSE`/`SUC_OPEN`,
+    /// HLDevice6302Activity.java:819-824 + DeviceConnectVariable.java:
+    /// 652-654) and the read parser (`== 1`, ProGetHearInfo.java:88) carry
+    /// the SAME bytes, no inversion anywhere (checklist §3; wire round
+    /// trip 2026-11-12, captures/set_tx_identify_roundtrip.jsonl). Unlike
+    /// the light, there is no inversion to translate — the whole point of
+    /// this function is that the byte choice lives in the VM once, never
+    /// in a view.
+    #[test]
+    fn mic_recognition_wire_is_identity() {
+        assert_eq!(mic_recognition_wire(false), 0, "off = 0, identity");
+        assert_eq!(mic_recognition_wire(true), 1, "on = 1, identity");
+        // The toggle path stays identity end to end: the wire byte of a
+        // flip target IS that target's bool.
+        for on in [false, true] {
+            assert_eq!(mic_recognition_wire(!on), u8::from(!on), "flip of {on}");
+        }
+    }
+
+    /// The Mic-recognition link gate: BOTH transmitters verified connected
+    /// — the APK's own precondition for THIS toggle (toast + return before
+    /// any SET is built, HLDevice6302Activity.java:805-812; heart offsets
+    /// 0/1), the same rule the guarded run carries as its hard start gate.
+    /// Exactly [`stereo_allowed`]'s shape, but this one IS the APK's rule
+    /// (the Stereo one is the owner's stricter-than-APK product rule) —
+    /// separate functions so each rule's evidence note stays its own.
+    #[test]
+    fn mic_recognition_allowed_needs_both_verified_links() {
+        assert!(
+            mic_recognition_allowed(true, true),
+            "both verified: the toggle may write"
+        );
+        assert!(!mic_recognition_allowed(false, true), "TX1 off: gated");
+        assert!(!mic_recognition_allowed(true, false), "TX2 off: gated");
+        assert!(!mic_recognition_allowed(false, false), "both off: gated");
+    }
+
     /// The click path's inverse for Reverb gears: display pads 0..=2 map to
     /// the wire bytes 0..=2 — IDENTITY, because the checklist §3 Reverb
     /// row's write space is the §5.2 read space (identity write-verified
@@ -1608,21 +1724,12 @@ mod tests {
     /// values ONLY per the AGENTS.md lift, never an immediate
     /// power-off); Indicator light on 2026-11-12
     /// (captures/set_light_roundtrip.jsonl — both inverted values {on,
-    /// off} exercised).
+    /// off} exercised); Mic recognition on 2026-11-12
+    /// (captures/set_tx_identify_roundtrip.jsonl — both identity values
+    /// {off, on} exercised; the BOTH-mics gate is
+    /// `mic_recognition_allowed`'s, not the table's).
     #[test]
     fn writable_table_matches_the_certified_chain() {
-        let all_read_only = Writable {
-            nc_toggle: false,
-            nc_level: false,
-            mic_mute: false,
-            volume: false,
-            channel_mode: false,
-            eq: false,
-            reverb: false,
-            mic_recognition: false,
-            schedule_power_off: false,
-            indicator_light: false,
-        };
         assert_eq!(
             WRITABLE,
             Writable {
@@ -1646,7 +1753,12 @@ mod tests {
                 // INVERTED wire space is translated only in
                 // `indicator_light_wire`, never in a view.
                 indicator_light: true,
-                ..all_read_only
+                // Certified on the 2026-11-12 mic-recognition round trip —
+                // both documented values {off, on} exercised; IDENTITY
+                // space, translated only in `mic_recognition_wire`, and
+                // the BOTH-mics link gate lives in
+                // `mic_recognition_allowed` (never in this table).
+                mic_recognition: true,
             }
         );
     }
