@@ -53,6 +53,53 @@ hardcode device rules or strings.
 - Reuse the existing 0.5 dim for in-flight writes; never add a new look.
 - If a requirement seems to need a visual change, stop and ask the owner.
 
+## Repo map
+
+Workspace: root = holly-proto, holly-usb, holly-cli, holly-app (`frontends/`
+is its OWN workspace, excluded so root `cargo test` never compiles gpui).
+
+- Build/test (root): `cargo fmt --check` · `cargo clippy --all-targets --
+  -D warnings` · `cargo test` (150 pass, 12 ignored hardware).
+- Build/test (gpui): in `frontends/gpui` — `cargo build` · `cargo clippy
+  --all-targets -- -D warnings` · `cargo test` (13 unit) ·
+  `cargo run -- --demo [connected|pending|busy]`.
+- CLI: `cargo run -p holly-cli -- status|nc|watch` — exactly 3 commands, by rule.
+
+Crates (layering: proto -> usb -> app -> cli/frontends):
+- `holly-proto/` — HID framing only, zero deps: Frame, xor_checksum
+  (tests/frames.rs, 20).
+- `holly-usb/` — nusb transport + certified SET/GET ops: device.rs
+  (HollyControl), transport.rs (NusbTransport + MockTransport), heart.rs
+  (HeartInfo). tests/mock.rs (56, the guarded-round-trip replays) +
+  tests/hardware.rs (12, ignored without a dongle).
+- `holly-app/` — std-only actor + ViewModel: actor.rs (Core/DeviceHandle/Hub,
+  one coalescing write bucket), vm.rs (ViewModel, WRITABLE table, *_wire
+  translations + labels), demo.rs (DemoDevice, --demo scenarios).
+  tests/actor.rs (19).
+- `holly-cli/` — clap shell over holly-usb (status / nc / watch).
+- `frontends/gpui/` — gpui 0.2.2 window over holly-app only (no nusb):
+  src/main.rs (entry, AppModel, all panels), theme.rs (tokens),
+  fonts.rs (bundled Hanken Grotesk); assets/fonts (sfnt); patches/
+  (vendored nusb + xattr, sha256-pinned version-conflict fixes); README.md
+  (token map + unfinished reproductions).
+
+Evidence:
+- docs/protocol.md — the byte table, every row [code]/[wire]-tagged;
+  set-gate-checklist.md — per-control SET gates; capture.md — capture
+  workflow + route-(a) rig end state (FROZEN); device.md, gui-roadmap.md,
+  set-capture-plan.md; design/ — index.html px mock + tokens + screens.
+- captures/: `2026-11-05-*.txt` raw text exports; `set_<control>_roundtrip
+  .jsonl` exported guarded round trips (tracked, cited by docs AND tests —
+  paths must not move); `captures/raw/*.pcap` local originals (ignored).
+- inputs/ (lsusb -v, HID descriptor), packaging/70-hollyland.rules (udev).
+
+Local-only, NEVER commit: `re/` (decompiled APK), `*.xapk`,
+`android-x86-9.0-r2.iso`, `tools/*.qcow2`, `captures/raw/`, `target/`,
+`frontends/gpui/target/`, `.build/`. Untracked owner files (not ignored
+yet): `features/`, `holly-design-ref.zip`, `holly-feature-prompts.zip`,
+`Holly theme.html`, `tools/capture_read_map.py`,
+`captures/set_shutdown_time_roundtrip.jsonl`.
+
 ## Git
 
 - Do not commit anything under `docs/` without owner approval (this file is
