@@ -366,6 +366,7 @@ mod tests {
             battery,
             battery_class: battery_class(battery),
             muted: false,
+            level: None,
             applying: false,
         }
     }

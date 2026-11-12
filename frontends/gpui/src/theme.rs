@@ -98,14 +98,11 @@ pub mod metrics {
     pub const TOGGLE_THUMB: f32 = 20.0;
     pub const METER_SEGMENTS: usize = 20; // live mic level
     pub const METER_SEGMENT_HEIGHT: f32 = 14.0;
-    // Peak segment threshold: the meter renders ALWAYS-UNLIT because
-    // HeartInfo exposes no decoded per-mic level (README: unfinished
-    // reproductions); the tungsten-from-here recipe stays as designed data.
-    #[allow(
-        dead_code,
-        reason = "meter always unlit: no wire source for segment levels"
-    )]
-    pub const METER_PEAK_FROM: usize = 17; // segments from here up use TUNGSTEN
+    /// Peak segment threshold: lit segments from here up take TUNGSTEN —
+    /// the APK's distortion-report zone (its meter flags 18..=20 as
+    /// AUDIO_DISTORTION [code BleSingleVolumeView.java:setVolume]),
+    /// matching the mock's `seg(.., 17, '#FFB547')` (index.html:230).
+    pub const METER_PEAK_FROM: usize = 17;
     pub const SELECTOR_HEIGHT: f32 = 36.0; // NC level selector segment
     pub const SELECTOR_PADDING: f32 = 4.0;
     pub const SELECTOR_GAP: f32 = 2.0;

@@ -15,7 +15,7 @@ use gpui::{
 
 use holly_app::vm::{
     Banner, BatteryClass, DEVICE_NAME, TxVm, VID_PID, battery_segment_count, conn_status_word,
-    mic_status, mute_label, nc_level_label, nc_status, reverb_selection,
+    meter_lit_for, mic_status, mute_label, nc_level_label, nc_status, reverb_selection,
 };
 
 use crate::AppModel;
@@ -315,8 +315,10 @@ impl AppModel {
     /// [`mic_mute_write_accepted`] passes — family gate + connectedness —
     /// and dims to the existing 0.5 while ITS write is in flight), the
     /// 64px battery readout (LIGHT, "--" when unavailable), 5 battery
-    /// segments, and an UNLIT 20-segment level meter (no wire source for
-    /// the meter: always unlit, per the writability/evidence rules).
+    /// segments, and the 20-segment level meter lit from the VM's level
+    /// ([`meter_lit_for`] — the mock's lit recipe; disconnected/muted/
+    /// no-source cards all show zero, so a real link stays unlit until the
+    /// OS-audio tap lands and the demo scripts its values).
     /// Battery and level are SEPARATE card children (the card's own 18px
     /// gap separates them — index.html:52; the battery column's internal
     /// 10px gap lives in [`battery_block`], index.html:64).
@@ -449,7 +451,7 @@ impl AppModel {
                 lit,
                 tx.map(|tx| tx.battery_class),
             ))
-            .child(level_meter_block())
+            .child(level_meter_block(tx.map(meter_lit_for).unwrap_or(0)))
     }
 
     /// NC panel: title + LED/status row, then the rocker well + the level
@@ -1133,12 +1135,15 @@ pub(crate) fn battery_block(
 }
 
 /// The reference level meter: a "Level" caption (13px TEXT_2) above a row of
-/// 20 segments (row gap 3, height 14, radius 2; index.html:74-78). The VM
-/// carries NO per-mic level field (HeartInfo exposes none we have decoded),
-/// so every segment renders the unlit RAISED fill — always. This is the one
-/// unfinished reproduction in the mock (README: deviations); a live meter
-/// REQUIREMENT, not an invented device reading.
-pub(crate) fn level_meter_block() -> gpui::Div {
+/// 20 segments (row gap 3, height 14, radius 2; index.html:74-78), lit per
+/// the mock's own `seg()` rule (index.html:190-192): the first `lit`
+/// segments take TEXT_2, indices from [`theme::metrics::METER_PEAK_FROM`]
+/// (the APK's 18..=20 distortion zone) take TUNGSTEN, the rest stay the
+/// unlit RAISED fill. `lit` comes from the VM's [`meter_lit_for`] — the
+/// dB→segments curve lives there (APK-faithful), never here. The mock
+/// demo-data values are 11/7 lit; a real link stays unlit until the
+/// OS-audio tap lands (README: unfinished reproductions).
+pub(crate) fn level_meter_block(lit: usize) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -1153,12 +1158,20 @@ pub(crate) fn level_meter_block() -> gpui::Div {
             div()
                 .flex()
                 .gap(px(3.)) // [code index.html:76]
-                .children((0..theme::metrics::METER_SEGMENTS).map(|_| {
+                .children((0..theme::metrics::METER_SEGMENTS).map(|segment| {
                     div()
                         .flex_1()
                         .h(px(theme::metrics::METER_SEGMENT_HEIGHT))
                         .rounded(px(theme::metrics::METER_SEGMENT_RADIUS))
-                        .bg(solid(theme::color::RAISED))
+                        .bg(solid(if segment < lit {
+                            if segment >= theme::metrics::METER_PEAK_FROM {
+                                theme::color::TUNGSTEN
+                            } else {
+                                theme::color::TEXT_2
+                            }
+                        } else {
+                            theme::color::RAISED
+                        }))
                         .into_any_element()
                 })),
         )
