@@ -9,7 +9,7 @@
 //! nothing here names a wire value.
 
 use gpui::{
-    BoxShadow, ClickEvent, Context, ElementId, FontWeight, MouseButton, div, linear_color_stop,
+    BoxShadow, ClickEvent, Context, FontWeight, MouseButton, div, linear_color_stop,
     linear_gradient, point, prelude::*, px,
 };
 
@@ -27,8 +27,8 @@ use crate::controls::{
 };
 use crate::theme;
 use crate::widgets::{
-    ICON_CHARGER, ICON_CLOSE, ICON_MIC, LedLit, led_dot, matte_under_edge, panel, solid, svg_glyph,
-    titled_with_led, toggle_switch, well,
+    ICON_CHARGER, ICON_CLOSE, ICON_MIC, LedLit, SelectorSpec, led_dot, matte_under_edge, panel,
+    segmented_selector, solid, svg_glyph, titled_with_led, toggle_switch, well,
 };
 
 impl AppModel {
@@ -598,80 +598,30 @@ impl AppModel {
     /// non-interactive (level-while-off was never sent/observed).
     fn nc_selector(&self, pending: bool, cx: &Context<Self>) -> gpui::Div {
         let nc = &self.vm.nc;
-        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
-            .flex_1()
-            .min_w(px(0.))
-            .p(px(theme::metrics::SELECTOR_PADDING))
-            .gap(px(theme::metrics::SELECTOR_GAP))
-            .when(pending, |g| g.opacity(0.5));
-        for level in 0u8..=2 {
-            let selected = nc.state == Some(true) && nc.level == Some(level);
-            let pick = level_pick(level, nc);
-            let mut option = div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
-                .text_size(px(theme::text::BODY_SIZE))
-                .when(selected, |o| {
-                    o.bg(linear_gradient(
-                        180.,
-                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
-                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
-                    ))
-                    .text_color(solid(theme::color::TEXT))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .shadow(matte_under_edge(1.))
-                })
-                .when(!selected, |o| {
-                    o.text_color(solid(theme::color::TEXT_2))
-                        .font_weight(FontWeight::MEDIUM)
-                })
-                .child(nc_level_label(level))
-                .relative();
-            if selected {
-                // 14×2 tungsten bar under the selected row, 5px up from the
-                // bottom (index.html:100); glow `0 0 6px rgba(255,181,71,.6)`.
-                option = option.child(
-                    div()
-                        .absolute()
-                        .left(px(0.))
-                        .right(px(0.))
-                        .bottom(px(5.))
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
-                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
-                                .rounded(px(1.))
-                                .bg(solid(theme::color::TUNGSTEN))
-                                .shadow(vec![BoxShadow {
-                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
-                                        .opacity(0.6),
-                                    offset: point(px(0.), px(0.)),
-                                    blur_radius: px(6.),
-                                    spread_radius: px(0.),
-                                }]),
-                        ),
-                );
-            }
-            let option = if pick != LevelPick::Blocked {
-                option
-                    .id(ElementId::named_usize("nc-level", usize::from(level)))
-                    .hover(|s| s.cursor_pointer())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.set_nc_level(level, cx);
-                    }))
-                    .into_any_element()
-            } else {
-                option.into_any_element()
-            };
-            group = group.child(option);
-        }
-        group
+        let labels: [&str; 3] = [nc_level_label(0), nc_level_label(1), nc_level_label(2)];
+        segmented_selector(
+            SelectorSpec {
+                id_prefix: "nc-level",
+                labels: &labels,
+                // The selected option = the device's VERIFIED level
+                // (`nc_state == on && nc.level`); no pending target is ever
+                // shown (the device hasn't confirmed it).
+                is_selected: &|index| nc.state == Some(true) && nc.level == Some(index as u8),
+                // [`level_pick`] is the whole decision (blocked while ANY
+                // SET is pending, blocked with the switch verified off —
+                // level-while-off was never sent/observed —, noop on the
+                // device's own level), shared by mouse AND the 1/2/3 keys.
+                is_pickable: &|index| level_pick(index as u8, nc) != LevelPick::Blocked,
+                on_pick: |this, index, cx| this.set_nc_level(index as u8, cx),
+                horizontal: false,
+                dim: pending,
+                // The NC level selector has NO keyboard scope of its own:
+                // the rocker well owns "nc_rocker" (Space/Enter) and the
+                // levels sit on the global 1/2/3 bindings.
+                focus: None,
+            },
+            cx,
+        )
     }
 
     /// EQ panel — the reference's title + selector row, now INTERACTIVE:
@@ -685,89 +635,30 @@ impl AppModel {
     /// DEVISION dim (busy → 0.6) intentionally NOT applied (README).
     fn eq_panel(&self, cx: &Context<Self>) -> gpui::Div {
         let eq = &self.vm.eq;
-        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
-            .flex_1()
-            .min_w(px(0.))
-            .p(px(theme::metrics::SELECTOR_PADDING))
-            .gap(px(theme::metrics::SELECTOR_GAP))
-            .track_focus(&self.eq_focus)
-            .key_context("eq_selector")
-            // focus-visible outline = the rocker's rule (2px tungsten).
-            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
-            .when(eq.applying, |g| g.opacity(0.5));
         // Display order = APK visual order [balance, overcast, bright] =
         // wire bytes [3,1,2] [code DeviceConnectVariable.EQ + reference
         // radio "Equalization/Low/Bright" (hldevice_6108.xml:156-166,
         // :1290-1292; index.html:262)] — translation is the VM's tested
         // `eq_pad_wire`, never a literal here.
         const EQ_LABELS: [&str; 3] = ["Equalization", "Low", "Bright"];
-        for (index, label) in EQ_LABELS.iter().enumerate() {
-            let selected = eq.selected == Some(index);
-            let pick = eq_pick(index, eq);
-            let mut option = div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
-                .text_size(px(theme::text::BODY_SIZE))
-                .when(selected, |o| {
-                    o.bg(linear_gradient(
-                        180.,
-                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
-                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
-                    ))
-                    .text_color(solid(theme::color::TEXT))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .shadow(matte_under_edge(1.))
-                })
-                .when(!selected, |o| {
-                    o.text_color(solid(theme::color::TEXT_2))
-                        .font_weight(FontWeight::MEDIUM)
-                })
-                .child(label.to_string())
-                .relative();
-            if selected {
-                // Same tungsten indicator bar as the NC level selector.
-                option = option.child(
-                    div()
-                        .absolute()
-                        .left(px(0.))
-                        .right(px(0.))
-                        .bottom(px(5.))
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
-                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
-                                .rounded(px(1.))
-                                .bg(solid(theme::color::TUNGSTEN))
-                                .shadow(vec![BoxShadow {
-                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
-                                        .opacity(0.6),
-                                    offset: point(px(0.), px(0.)),
-                                    blur_radius: px(6.),
-                                    spread_radius: px(0.),
-                                }]),
-                        ),
-                );
-            }
-            let option = if pick != EqPick::Blocked {
-                option
-                    .id(ElementId::named_usize("eq-pad", index))
-                    .hover(|s| s.cursor_pointer())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.set_eq_pad(index, cx);
-                    }))
-                    .into_any_element()
-            } else {
-                option.into_any_element()
-            };
-            group = group.child(option);
-        }
-        group
+        segmented_selector(
+            SelectorSpec {
+                id_prefix: "eq-pad",
+                labels: &EQ_LABELS,
+                // The device's verified selection — no pending target is
+                // ever shown (the snapshot's POST-SET poll moves it).
+                is_selected: &|index| eq.selected == Some(index),
+                // [`eq_pick`] is the whole decision (read-only family or an
+                // in-flight EQ write: blocked; already-selected: noop; else
+                // write), shared by mouse AND the Left/Right keys.
+                is_pickable: &|index| eq_pick(index, eq) != EqPick::Blocked,
+                on_pick: |this, index, cx| this.set_eq_pad(index, cx),
+                horizontal: false,
+                dim: eq.applying,
+                focus: Some((&self.eq_focus, "eq_selector")),
+            },
+            cx,
+        )
     }
 
     /// Volume panel — the reference's title + six-stop selector row, now
@@ -784,83 +675,26 @@ impl AppModel {
     /// dim (busy → 0.6) intentionally NOT applied (README).
     fn volume_panel(&self, cx: &Context<Self>) -> gpui::Div {
         let volume = &self.vm.volume;
-        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
-            .flex_1()
-            .min_w(px(0.))
-            .p(px(theme::metrics::SELECTOR_PADDING))
-            .gap(px(theme::metrics::SELECTOR_GAP))
-            .track_focus(&self.volume_focus)
-            .key_context("volume_selector")
-            // focus-visible outline = the rocker's rule (2px tungsten).
-            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
-            .when(volume.applying, |g| g.opacity(0.5));
         const VOLUME_STOPS: [&str; 6] = ["1", "2", "3", "4", "5", "6"];
-        for (index, label) in VOLUME_STOPS.iter().enumerate() {
-            let selected = volume.selected == Some(index);
-            let pick = volume_pick(index, volume);
-            let mut option = div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
-                .text_size(px(theme::text::BODY_SIZE))
-                .when(selected, |o| {
-                    o.bg(linear_gradient(
-                        180.,
-                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
-                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
-                    ))
-                    .text_color(solid(theme::color::TEXT))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .shadow(matte_under_edge(1.))
-                })
-                .when(!selected, |o| {
-                    o.text_color(solid(theme::color::TEXT_2))
-                        .font_weight(FontWeight::MEDIUM)
-                })
-                .child(label.to_string())
-                .relative();
-            if selected {
-                // Same tungsten indicator bar as the NC/EQ selectors.
-                option = option.child(
-                    div()
-                        .absolute()
-                        .left(px(0.))
-                        .right(px(0.))
-                        .bottom(px(5.))
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
-                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
-                                .rounded(px(1.))
-                                .bg(solid(theme::color::TUNGSTEN))
-                                .shadow(vec![BoxShadow {
-                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
-                                        .opacity(0.6),
-                                    offset: point(px(0.), px(0.)),
-                                    blur_radius: px(6.),
-                                    spread_radius: px(0.),
-                                }]),
-                        ),
-                );
-            }
-            let option = if pick != VolumePick::Blocked {
-                option
-                    .id(ElementId::named_usize("volume-stop", index))
-                    .hover(|s| s.cursor_pointer())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.set_gain_stop(index, cx);
-                    }))
-                    .into_any_element()
-            } else {
-                option.into_any_element()
-            };
-            group = group.child(option);
-        }
+        let group = segmented_selector(
+            SelectorSpec {
+                id_prefix: "volume-stop",
+                labels: &VOLUME_STOPS,
+                // The device's verified selection — no pending target is
+                // ever shown (the snapshot's POST-SET poll moves it).
+                is_selected: &|index| volume.selected == Some(index),
+                // [`volume_pick`] is the whole decision (read-only family
+                // or an in-flight volume write: blocked; already-selected:
+                // noop; else write), shared by mouse AND the Left/Right
+                // keys.
+                is_pickable: &|index| volume_pick(index, volume) != VolumePick::Blocked,
+                on_pick: |this, index, cx| this.set_gain_stop(index, cx),
+                horizontal: false,
+                dim: volume.applying,
+                focus: Some((&self.volume_focus, "volume_selector")),
+            },
+            cx,
+        );
         // The reference keeps the Volume panel's own titled shell around the
         // radiogroup (`index.html:106-108` — the radio group lives INSIDE
         // the panel with the "Volume adjustment" heading), so unlike the
@@ -900,83 +734,27 @@ impl AppModel {
     /// intentionally NOT applied (README).
     fn channel_panel(&self, cx: &Context<Self>) -> gpui::Div {
         let channel = &self.vm.channel_mode;
-        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
-            .flex_1()
-            .min_w(px(0.))
-            .p(px(theme::metrics::SELECTOR_PADDING))
-            .gap(px(theme::metrics::SELECTOR_GAP))
-            .track_focus(&self.channel_focus)
-            .key_context("channel_selector")
-            // focus-visible outline = the rocker's rule (2px tungsten).
-            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
-            .when(channel.applying, |g| g.opacity(0.5));
         const CHANNEL_MODES: [&str; 2] = ["Mono", "Stereo"]; // [code index.html:258]
-        for (index, label) in CHANNEL_MODES.iter().enumerate() {
-            let selected = channel.selected == Some(index);
-            let pick = channel_pick(index, channel);
-            let mut option = div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
-                .text_size(px(theme::text::BODY_SIZE))
-                .when(selected, |o| {
-                    o.bg(linear_gradient(
-                        180.,
-                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
-                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
-                    ))
-                    .text_color(solid(theme::color::TEXT))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .shadow(matte_under_edge(1.))
-                })
-                .when(!selected, |o| {
-                    o.text_color(solid(theme::color::TEXT_2))
-                        .font_weight(FontWeight::MEDIUM)
-                })
-                .child(label.to_string())
-                .relative();
-            if selected {
-                // Same tungsten indicator bar as the EQ/Volume selectors.
-                option = option.child(
-                    div()
-                        .absolute()
-                        .left(px(0.))
-                        .right(px(0.))
-                        .bottom(px(5.))
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
-                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
-                                .rounded(px(1.))
-                                .bg(solid(theme::color::TUNGSTEN))
-                                .shadow(vec![BoxShadow {
-                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
-                                        .opacity(0.6),
-                                    offset: point(px(0.), px(0.)),
-                                    blur_radius: px(6.),
-                                    spread_radius: px(0.),
-                                }]),
-                        ),
-                );
-            }
-            let option = if pick != ChannelPick::Blocked {
-                option
-                    .id(ElementId::named_usize("channel-mode", index))
-                    .hover(|s| s.cursor_pointer())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.set_channel_mode(index, cx);
-                    }))
-                    .into_any_element()
-            } else {
-                option.into_any_element()
-            };
-            group = group.child(option);
-        }
+        let group = segmented_selector(
+            SelectorSpec {
+                id_prefix: "channel-mode",
+                labels: &CHANNEL_MODES,
+                // The device's verified selection — no pending target is
+                // ever shown (the snapshot's POST-SET poll moves it).
+                is_selected: &|index| channel.selected == Some(index),
+                // [`channel_pick`] is the whole decision (read-only family
+                // or an in-flight channel write: blocked; the held mode: noop;
+                // STEREO additionally gated on BOTH transmitters verified
+                // connected — `stereo_allowed`, owner 2026-11-12), shared by
+                // mouse AND the Left/Right keys.
+                is_pickable: &|index| channel_pick(index, channel) != ChannelPick::Blocked,
+                on_pick: |this, index, cx| this.set_channel_mode(index, cx),
+                horizontal: false,
+                dim: channel.applying,
+                focus: Some((&self.channel_focus, "channel_selector")),
+            },
+            cx,
+        );
         // The read-only audio_panel rendered this same shell (panel +
         // title + selector); the interactivity wraps in it unchanged.
         panel()
@@ -1010,83 +788,27 @@ impl AppModel {
     /// DEVISION dim (busy → 0.6) intentionally NOT applied (README).
     fn schedule_panel(&self, cx: &Context<Self>) -> gpui::Div {
         let schedule = &self.vm.shutdown;
-        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
-            .flex_1()
-            .min_w(px(0.))
-            .p(px(theme::metrics::SELECTOR_PADDING))
-            .gap(px(theme::metrics::SELECTOR_GAP))
-            .track_focus(&self.schedule_focus)
-            .key_context("schedule_selector")
-            // focus-visible outline = the rocker's rule (2px tungsten).
-            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
-            .when(schedule.applying, |g| g.opacity(0.5));
         const SCHEDULE_VALUES: [&str; 2] = ["15min", "Never"]; // [code index.html:264]
-        for (index, label) in SCHEDULE_VALUES.iter().enumerate() {
-            let selected = schedule.selected == Some(index);
-            let pick = schedule_pick(index, schedule);
-            let mut option = div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
-                .text_size(px(theme::text::BODY_SIZE))
-                .when(selected, |o| {
-                    o.bg(linear_gradient(
-                        180.,
-                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
-                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
-                    ))
-                    .text_color(solid(theme::color::TEXT))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .shadow(matte_under_edge(1.))
-                })
-                .when(!selected, |o| {
-                    o.text_color(solid(theme::color::TEXT_2))
-                        .font_weight(FontWeight::MEDIUM)
-                })
-                .child(label.to_string())
-                .relative();
-            if selected {
-                // Same tungsten indicator bar as the other selectors.
-                option = option.child(
-                    div()
-                        .absolute()
-                        .left(px(0.))
-                        .right(px(0.))
-                        .bottom(px(5.))
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
-                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
-                                .rounded(px(1.))
-                                .bg(solid(theme::color::TUNGSTEN))
-                                .shadow(vec![BoxShadow {
-                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
-                                        .opacity(0.6),
-                                    offset: point(px(0.), px(0.)),
-                                    blur_radius: px(6.),
-                                    spread_radius: px(0.),
-                                }]),
-                        ),
-                );
-            }
-            let option = if pick != SchedulePick::Blocked {
-                option
-                    .id(ElementId::named_usize("schedule", index))
-                    .hover(|s| s.cursor_pointer())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.set_schedule_power_off(index, cx);
-                    }))
-                    .into_any_element()
-            } else {
-                option.into_any_element()
-            };
-            group = group.child(option);
-        }
+        let group = segmented_selector(
+            SelectorSpec {
+                id_prefix: "schedule",
+                labels: &SCHEDULE_VALUES,
+                // The device's verified selection (a byte outside the
+                // panel's certified set passes None → no-selection rule) —
+                // no pending target is ever shown (the snapshot's POST-SET
+                // poll moves it).
+                is_selected: &|index| schedule.selected == Some(index),
+                // [`schedule_pick`] is the whole decision (read-only family
+                // or an in-flight shutdown write: blocked; already-selected:
+                // noop; else write), shared by mouse AND the Left/Right keys.
+                is_pickable: &|index| schedule_pick(index, schedule) != SchedulePick::Blocked,
+                on_pick: |this, index, cx| this.set_schedule_power_off(index, cx),
+                horizontal: false,
+                dim: schedule.applying,
+                focus: Some((&self.schedule_focus, "schedule_selector")),
+            },
+            cx,
+        );
         // The read-only audio_panel rendered this same shell (panel +
         // title + selector); the interactivity wraps in it unchanged.
         panel()
@@ -1176,86 +898,30 @@ impl AppModel {
     /// verified ON (reference `sc-if reverbOn`, index.html:139).
     fn reverb_selector(&self, applying: bool, cx: &Context<Self>) -> gpui::Div {
         let reverb = self.vm.reverb.as_ref();
-        let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER)
-            .flex_row()
-            .p(px(theme::metrics::SELECTOR_PADDING))
-            .gap(px(theme::metrics::SELECTOR_GAP))
-            .track_focus(&self.reverb_focus)
-            .key_context("reverb_selector")
-            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)))
-            .when(applying, |g| g.opacity(0.5));
         const REVERB_GEARS: [&str; 3] = ["Small", "Medium", "Large"]; // [code index.html:140]
-        for (index, label) in REVERB_GEARS.iter().enumerate() {
-            // The device's verified gear drives the selection — no pending
-            // target is ever shown.
-            let selected = reverb.and_then(|r| r.gear).and_then(reverb_selection) == Some(index);
-            let pick = reverb.map(|r| reverb_pick(index, r));
-            let mut option = div()
-                .flex_1()
-                .min_w_0()
-                .h(px(theme::metrics::SELECTOR_HEIGHT))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
-                .text_size(px(theme::text::BODY_SIZE))
-                .when(selected, |o| {
-                    o.bg(linear_gradient(
-                        180.,
-                        linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
-                        linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
-                    ))
-                    .text_color(solid(theme::color::TEXT))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .shadow(matte_under_edge(1.))
-                })
-                .when(!selected, |o| {
-                    o.text_color(solid(theme::color::TEXT_2))
-                        .font_weight(FontWeight::MEDIUM)
-                })
-                .child(*label)
-                .relative();
-            if selected {
-                // the 14×2 tungsten indicator bar under the selected pad
-                // (index.html:111; glow `0 0 6px rgba(255,181,71,.6)`)
-                option = option.child(
-                    div()
-                        .absolute()
-                        .left(px(0.))
-                        .right(px(0.))
-                        .bottom(px(4.))
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
-                                .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
-                                .rounded(px(1.))
-                                .bg(solid(theme::color::TUNGSTEN))
-                                .shadow(vec![BoxShadow {
-                                    color: gpui::Hsla::from(solid(theme::color::TUNGSTEN))
-                                        .opacity(0.6),
-                                    offset: point(px(0.), px(0.)),
-                                    blur_radius: px(6.),
-                                    spread_radius: px(0.),
-                                }]),
-                        ),
-                );
-            }
-            let option = if pick.is_some_and(|p| p != ReverbPick::Blocked) {
-                option
-                    .id(ElementId::named_usize("reverb-gear", index))
-                    .hover(|s| s.cursor_pointer())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
-                        this.set_reverb_gear(index);
-                    }))
-                    .into_any_element()
-            } else {
-                option.into_any_element()
-            };
-            group = group.child(option);
-        }
-        group
+        segmented_selector(
+            SelectorSpec {
+                id_prefix: "reverb-gear",
+                labels: &REVERB_GEARS,
+                // The device's verified gear drives the selection — no
+                // pending target is ever shown.
+                is_selected: &|index| {
+                    reverb.and_then(|r| r.gear).and_then(reverb_selection) == Some(index)
+                },
+                // [`reverb_pick`] is the whole decision (switch not verified
+                // ON, the read-only family or an in-flight reverb write:
+                // blocked; the device's own gear: noop; else write), shared
+                // by mouse AND the Left/Right keys.
+                is_pickable: &|index| {
+                    reverb.is_some_and(|r| reverb_pick(index, r) != ReverbPick::Blocked)
+                },
+                on_pick: |this, index, _| this.set_reverb_gear(index),
+                horizontal: true,
+                dim: applying,
+                focus: Some((&self.reverb_focus, "reverb_selector")),
+            },
+            cx,
+        )
     }
 
     /// Mic recognition / Indicator light panels (the 120px row halves): the

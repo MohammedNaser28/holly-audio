@@ -11,10 +11,12 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, AssetSource, BoxShadow, FontWeight, SharedString, div,
-    linear_color_stop, linear_gradient, point, prelude::*, pulsating_between, px, rgb, svg,
+    Animation, AnimationExt, AssetSource, BoxShadow, ClickEvent, Context, ElementId, FocusHandle,
+    FontWeight, SharedString, div, linear_color_stop, linear_gradient, point, prelude::*,
+    pulsating_between, px, rgb, svg,
 };
 
+use crate::AppModel;
 use crate::theme;
 
 // ---- reference SVG markup (copied from docs/design/index.html) ---------------
@@ -309,4 +311,156 @@ pub(crate) fn toggle_switch(on: bool) -> gpui::Div {
                 theme::color::TEXT_2
             })),
     )
+}
+
+// ---- the segmented multi-choice selector ---------------------------------------
+
+/// One segmented selector's wiring, stated once per control (the only
+/// differences the six selectors really have — see the per-selector docs in
+/// panels.rs for their [code]/[wire] cites):
+/// - `labels`/`id_prefix` — the option row texts and the element-id prefix;
+/// - `is_selected` — the device's VERIFIED selection (VM fields only; no
+///   pending target is ever displayed);
+/// - `is_pickable` + `on_pick` — the caller's pick decision (its
+///   `controls::*_pick != Blocked`) and the write it sends;
+/// - `horizontal` — the reverb row shape (well `flex_row`, 36px pads,
+///   indicator bar 4px up) vs the NC-shaped vertical stack (well column,
+///   `flex_1`/`min_h(0)` pads, bar 5px up). TODAY: NC/EQ/Volume/Channel/
+///   Schedule render vertical, reverb horizontal;
+/// - `dim` — the family's 0.5 dim while ITS write is in flight;
+/// - `focus` — the well's keyboard scope (`track_focus` + `key_context` +\
+///   the rocker's 2px tungsten focus outline); None for the NC level
+///   selector, whose keys are the global 1/2/3 (its rocker owns its own
+///   context).
+///
+/// The predicates borrow the panel's VM refs and are consumed during THIS
+/// render, so they stay closures; `on_pick` is a plain `fn` pointer because
+/// the click listener is stored in the element tree and must be 'static
+/// (gpui `Context::listener` bound, context.rs:252) — a closure borrowing
+/// `&self.vm.*` would not be. Non-capturing closures at the call sites
+/// coerce to the pointer.
+pub(crate) struct SelectorSpec<'a> {
+    pub id_prefix: &'static str,
+    pub labels: &'a [&'static str],
+    pub is_selected: &'a dyn Fn(usize) -> bool,
+    pub is_pickable: &'a dyn Fn(usize) -> bool,
+    pub on_pick: fn(&mut AppModel, usize, &mut Context<AppModel>),
+    pub horizontal: bool,
+    pub dim: bool,
+    pub focus: Option<(&'a FocusHandle, &'static str)>,
+}
+
+/// The shared segmented selector: the WELL container (12 radius, 4 padding,
+/// 2 gap), one 36px/matte option per label with the selected option's
+/// RAISED gradient + SEMIBOLD + matte under-edge, and the 14×2 tungsten
+/// indicator bar under it — NC selector recipe (index.html:100, bar 5px up)
+/// vertically, the read-only radio_group recipe (index.html:111, bar 4px
+/// up) horizontally. While `dim` holds the group renders at the established
+/// 0.5 and a blocked pick's option carries NO click affordance (mouse AND
+/// keyboard noop — the decisions live in the caller's pick fn). This is the
+/// ONE place the option loop, selected style and bar exist; the six panel
+/// selectors in panels.rs all route through it.
+pub(crate) fn segmented_selector(spec: SelectorSpec, cx: &Context<AppModel>) -> gpui::Div {
+    let mut group = well(theme::metrics::SELECTOR_RADIUS_OUTER);
+    group = if spec.horizontal {
+        group
+            .flex_row()
+            .p(px(theme::metrics::SELECTOR_PADDING))
+            .gap(px(theme::metrics::SELECTOR_GAP))
+    } else {
+        group
+            .flex_1()
+            .min_w(px(0.))
+            .p(px(theme::metrics::SELECTOR_PADDING))
+            .gap(px(theme::metrics::SELECTOR_GAP))
+    };
+    if let Some((focus, context)) = spec.focus {
+        group = group
+            .track_focus(focus)
+            .key_context(context)
+            // focus-visible outline = the rocker's rule (2px tungsten).
+            .focus(|s| s.border_2().border_color(solid(theme::color::TUNGSTEN)));
+    }
+    if spec.dim {
+        group = group.opacity(0.5);
+    }
+    // The indicator bar rides 5px above the pad bottom in the vertical
+    // family (index.html:100) and 4px in the horizontal one (index.html:111);
+    // glow `0 0 6px rgba(255,181,71,.6)` (index.html:100/111).
+    let bar_bottom = if spec.horizontal { 4. } else { 5. };
+    // `on_pick` is a fn pointer ('static): the click listener below outlives
+    // this render, so only Copy 'static values may be moved into it.
+    let on_pick = spec.on_pick;
+    for (index, label) in spec.labels.iter().enumerate() {
+        let selected = (spec.is_selected)(index);
+        let base = div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(theme::metrics::SELECTOR_RADIUS_INNER))
+            .text_size(px(theme::text::BODY_SIZE))
+            .when(selected, |o| {
+                o.bg(linear_gradient(
+                    180.,
+                    linear_color_stop(solid(theme::color::RAISED_TOP), 0.),
+                    linear_color_stop(solid(theme::color::RAISED_BOTTOM), 1.),
+                ))
+                .text_color(solid(theme::color::TEXT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .shadow(matte_under_edge(1.))
+            })
+            .when(!selected, |o| {
+                o.text_color(solid(theme::color::TEXT_2))
+                    .font_weight(FontWeight::MEDIUM)
+            })
+            .child((*label).to_string())
+            .relative();
+        // The two shapes' option sizing, verbatim from today's code: the
+        // vertical family grows by flex_1/min_h(0) (nc_selector), the
+        // horizontal reverb recipe pins min_w(0) + the 36px SELECTOR_HEIGHT
+        // (reverb_selector, index.html:111).
+        let mut option = if spec.horizontal {
+            base.min_w(px(0.)).h(px(theme::metrics::SELECTOR_HEIGHT))
+        } else {
+            base.min_h(px(0.))
+        };
+        if selected {
+            option = option.child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .right(px(0.))
+                    .bottom(px(bar_bottom))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(theme::metrics::LEVEL_INDICATOR_WIDTH))
+                            .h(px(theme::metrics::LEVEL_INDICATOR_HEIGHT))
+                            .rounded(px(1.))
+                            .bg(solid(theme::color::TUNGSTEN))
+                            .shadow(vec![BoxShadow {
+                                color: gpui::Hsla::from(solid(theme::color::TUNGSTEN)).opacity(0.6),
+                                offset: point(px(0.), px(0.)),
+                                blur_radius: px(6.),
+                                spread_radius: px(0.),
+                            }]),
+                    ),
+            );
+        }
+        let option = if (spec.is_pickable)(index) {
+            option
+                .id(ElementId::named_usize(spec.id_prefix, index))
+                .hover(|s| s.cursor_pointer())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    on_pick(this, index, cx);
+                }))
+                .into_any_element()
+        } else {
+            option.into_any_element()
+        };
+        group = group.child(option);
+    }
+    group
 }
