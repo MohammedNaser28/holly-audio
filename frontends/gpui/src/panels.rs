@@ -624,14 +624,18 @@ impl AppModel {
         )
     }
 
-    /// EQ panel — the reference's title + selector row, now INTERACTIVE:
-    /// picks send `set_eq` (wire pads via `eq_pad_wire`) through the same
-    /// actor path as the NC controls, gated by `eq_pick`. While an EQ write
-    /// is in flight (`EqVm.applying`) the selector dims to 0.5 and both
-    /// mouse and keyboard picks are ignored — the snapshot's POST-SET poll
-    /// moves the selection (no pending target is ever shown; same rule as
-    /// the NC level selector). Left/Right step the pads while the well is
-    /// focused ("eq_selector" key context — bindings in main); the
+    /// EQ panel — the reference's titled panel + selector row, now
+    /// INTERACTIVE and in the mock's HORIZONTAL orientation (options 36px
+    /// tall, indicator bar 4px up — index.html:125-131; the interactive
+    /// rewrite had dropped the panel shell + "EQ adjustment" heading AND
+    /// copied the NC rocker's vertical bare-well stack, commit H restores
+    /// both): picks send `set_eq` (wire pads via `eq_pad_wire`) through the
+    /// same actor path as the NC controls, gated by `eq_pick`. While an EQ
+    /// write is in flight (`EqVm.applying`) the selector dims to 0.5 and
+    /// both mouse and keyboard picks are ignored — the snapshot's POST-SET
+    /// poll moves the selection (no pending target is ever shown; same rule
+    /// as the NC level selector). Left/Right step the pads while the well
+    /// is focused ("eq_selector" key context — bindings in main); the
     /// DEVISION dim (busy → 0.6) intentionally NOT applied (README).
     fn eq_panel(&self, cx: &Context<Self>) -> gpui::Div {
         let eq = &self.vm.eq;
@@ -641,7 +645,7 @@ impl AppModel {
         // :1290-1292; index.html:262)] — translation is the VM's tested
         // `eq_pad_wire`, never a literal here.
         const EQ_LABELS: [&str; 3] = ["Equalization", "Low", "Bright"];
-        segmented_selector(
+        let group = segmented_selector(
             SelectorSpec {
                 id_prefix: "eq-pad",
                 labels: &EQ_LABELS,
@@ -653,12 +657,27 @@ impl AppModel {
                 // write), shared by mouse AND the Left/Right keys.
                 is_pickable: &|index| eq_pick(index, eq) != EqPick::Blocked,
                 on_pick: |this, index, cx| this.set_eq_pad(index, cx),
-                horizontal: false,
+                horizontal: true,
                 dim: eq.applying,
                 focus: Some((&self.eq_focus, "eq_selector")),
             },
             cx,
-        )
+        );
+        // The mock keeps the EQ panel's own titled shell around the
+        // radiogroup (index.html:125-127 — same recipe as the Volume/
+        // Channel/Schedule panels; unlike those the panel itself carries no
+        // `flex:1`, so the grow comes from the grid cell).
+        panel()
+            .justify_center()
+            .gap(px(theme::metrics::SPACE_3))
+            .child(
+                div()
+                    .text_size(px(theme::text::TITLE_SIZE))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    // [code index.html:126]
+                    .child("EQ adjustment"),
+            )
+            .child(group)
     }
 
     /// Volume panel — the reference's title + six-stop selector row, now
@@ -702,9 +721,8 @@ impl AppModel {
         );
         // The reference keeps the Volume panel's own titled shell around the
         // radiogroup (`index.html:106-108` — the radio group lives INSIDE
-        // the panel with the "Volume adjustment" heading), so unlike the
-        // EQ graduation's bare well the interactivity wraps in the same
-        // shell the read-only panel had.
+        // the panel with the "Volume adjustment" heading), the same recipe
+        // as the Channel/EQ/Schedule panels.
         panel()
             .flex_1()
             .justify_center()
