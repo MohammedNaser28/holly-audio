@@ -3232,3 +3232,224 @@ fn set_light_roundtrip_replays_the_real_session() {
         "ack lineage pin (tail 0x47)"
     );
 }
+
+// ── Mic recognition — real usbmon session (owner run 2026-11-12) ────────────
+//
+// Route (b) closure, same as EQ/gain/reverb/channel-mode/mute/shutdown/light:
+// the doc vectors above stay RECOMPUTED (kept verbatim for lineage pinning)
+// and the REAL frames of the guarded run join as replay vectors below.
+// Source:
+//   captures/raw/set_tx_identify_roundtrip.pcap (gitignored, per policy)
+//   captures/set_tx_identify_roundtrip.jsonl   (16 rows, 8 round trips)
+// Session: bus 6 dev 2; BOTH TX connected all run (batteries 0x61/0x62 =
+// 97/98%) — the feature-file hard start gate passed on the first poll.
+// start = OFF (payload[15] = 00, the last-known state) → write ON (1)
+// first, settle-confirmed (§5 offset 15, the ONLY byte that moved), restore
+// OFF, settle-confirmed, exit guard found the byte already at original —
+// recognition never left on. Both ACK tails are 0x45 — the checksum rule's
+// prediction byte-matched on the first try (cmd 0x23 ⊕ 0x66; the rule's
+// next confirmed shape after light's 0x47).
+//
+// RESIDUE DISCOVERY [wire, this run]: the two ON hearts (export rows 8/10)
+// keep residue 0x6F although the documented heart fold
+// XOR(payload[0..16)) ⊕ 0x68 predicts 0x6E for them (payload[15] flipped
+// 0→1, fold 0x07 → 0x06). The fold that fits ALL SIX hearts of the run is
+// XOR(payload[0..15)) ⊕ 0x68: the identify byte (payload[15]) is NOT
+// folded, alongside signalMode (payload[16]). Every earlier certified
+// heart had payload[15] = 00, so the two readings coincided until now —
+// this is the first dataset that separates them. The crate ignores
+// residues (no code behaviour changes); docs/protocol.md §2 carries the
+// correction (uncommitted, owner approval pending).
+
+/// Real heart of the run at identify OFF (export rows 2/4/14/16 — the
+/// pre-run poll, the op's inner GET, the post-restore settle, the exit
+/// guard's GET): TX1 connected 97% (0x61), TX2 connected 98% (0x62), both
+/// unmuted, NC on level 0, gain 4, Stereo 1, shutdown 0, light on (0), EQ 1,
+/// reverb off gear 1, txIdentifyStatus 00 (the run's start), signalMode 00,
+/// residue 0x6F (fold 0x07 ⊕ 0x68 under BOTH the documented and the
+/// refined rule — they coincide at identify 0).
+const HEART_WIRE_IDENTIFY0: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x01, 0x61, 0x62, 0x00, 0x00, 0x01, 0x00, 0x04,
+    0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real heart of the run at identify ON (export rows 8/10 — the write
+/// leg's settle poll and the restore's inner GET): ONLY the identify byte
+/// moved 00 → 01 (§5 offset 15 = frame byte 22) across the session's
+/// hearts — state-change congruence on the write path; residue stays
+/// 0x6F, where the documented fold predicts 0x6E (see the RESIDUE
+/// DISCOVERY note above — the fold excludes the identify byte).
+const HEART_WIRE_IDENTIFY1: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x01, 0x01, 0x61, 0x62, 0x00, 0x00, 0x01, 0x00, 0x04,
+    0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00, 0x6F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_TX_IDENTIFY write frame of the run (export row 5) — value 01
+/// (on): the other documented value, written from OFF 0.
+const SET_TX_IDENTIFY_1_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x23, 0x00, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_TX_IDENTIFY RESTORE frame (export row 11) — value 00 (off):
+/// the starting state written back exactly.
+const SET_TX_IDENTIFY_0_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x23, 0x00, 0x01, 0x00, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Real SET_TX_IDENTIFY ack (export rows 6/12): 1-byte status 00 + tail
+/// 0x45 — equal to the doc-recomputed [`SET_TX_IDENTIFY_ACK`], which
+/// closes the residue question for this command shape (cmd 0x23 ⊕ 0x66 =
+/// 0x45; the pre-run prediction byte-matched on the first try).
+const SET_TX_IDENTIFY_ACK_WIRE: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x23, 0x00, 0x01, 0x00, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Full real-session replay (mic recognition's route (b) closure): the
+/// export's control frames replayed through the op end-to-end in the
+/// guarded test's leg shape (write 1 FIRST, settle, restore 0, settle,
+/// exit guard). TX side asserts byte-exact equality with the captured SET
+/// frames; hearts move ONLY §5 offset 15.
+#[test]
+fn set_tx_identify_roundtrip_replays_the_real_session() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_WIRE_IDENTIFY0); // inner GET of set_tx_identify(1): device at off 0
+    mock.push_reply(SET_TX_IDENTIFY_ACK_WIRE); // ack of row 5's SET [01]
+    mock.push_reply(HEART_WIRE_IDENTIFY1); // post-SET fresh GET: delta = 1 (on)
+    mock.push_reply(HEART_WIRE_IDENTIFY1); // inner GET of the restore: device at 1
+    mock.push_reply(SET_TX_IDENTIFY_ACK_WIRE); // ack of row 11's SET [00]
+    mock.push_reply(HEART_WIRE_IDENTIFY0); // test's final GET (rows 14/16)
+
+    let mut c = control(mock);
+    let previous = c
+        .set_tx_identify(1)
+        .expect("real ack [00]+45 must be accepted (residue ignored)");
+    assert_eq!(
+        previous, 0,
+        "rows 2/4 rest at identify OFF 0 (the last-known state)"
+    );
+    let after = c.get_heart_info().expect("real heart (residue 6F) parses");
+    assert!(
+        after.tx_identify,
+        "heart delta = ON (rows 8/10, identity parse)"
+    );
+    assert!(
+        after.tx1_status && after.tx2_status,
+        "BOTH TX connected through the run (batteries 0x61/0x62 = 97/98) — the hard start gate's state"
+    );
+    assert_eq!(
+        after.tx1_battery, 0x61,
+        "run's TX1 battery byte (owner status output 97%)"
+    );
+    assert_eq!(
+        after.tx2_battery, 0x62,
+        "run's TX2 battery byte (owner status output 98%)"
+    );
+    assert_eq!(
+        after.voice_level, 4,
+        "run's gain byte (owner status output)"
+    );
+    assert_eq!(
+        after.voice_mode, 1,
+        "run's mode byte (owner status output 'mode 1')"
+    );
+    assert_eq!(after.eq_level, 1, "run's EQ byte (owner status output)");
+    assert_eq!(
+        (after.reverb_switch, after.reverb_level),
+        (false, 1),
+        "run's reverb pair (owner status output 'off (level 1)')"
+    );
+    assert_eq!(
+        after.shutdown_time, 0,
+        "run's timer byte (owner status output 'shutdown timer value 0')"
+    );
+    assert!(
+        after.light_on,
+        "run's light byte 0 = on (owner status output 'Light: on')"
+    );
+    assert_eq!(
+        after.signal_mode, 0,
+        "signalMode 0 in this run (owner status output)"
+    );
+    let restore_previous = c
+        .set_tx_identify(previous)
+        .expect("real restore must be accepted");
+    assert_eq!(
+        restore_previous, 1,
+        "the restore's fresh GET saw the write leg's effect (rows 8/10)"
+    );
+    let restored = c.get_heart_info().expect("heart back at the start state");
+    assert!(
+        !restored.tx_identify,
+        "restore delta verified — OFF restored (rows 14/16); recognition never left on"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(
+        &written[1], &SET_TX_IDENTIFY_1_WIRE,
+        "SET TX byte-exact row 5"
+    );
+    assert_eq!(
+        &written[4], &SET_TX_IDENTIFY_0_WIRE,
+        "restore TX byte-exact row 11"
+    );
+    // Lineage pins (roadmap §1(b)): the doc-recomputed layout and the
+    // hardware-observed frames are the SAME bytes — the run started at the
+    // same identify value the doc vectors assumed (0), so the write-leg pin
+    // is byte-equal as-is and the restore pin recomputes only the value
+    // byte; the ack tail 0x45 the checksum rule predicted pre-run (cmd
+    // 0x23 ⊕ 0x66) is byte-equal as-is (n=9 for cmd ⊕ 0x66).
+    assert_eq!(
+        SET_TX_IDENTIFY_1_WIRE, SET_TX_IDENTIFY_1_TX,
+        "doc layout == observed wire (write leg)"
+    );
+    let mut doc_0 = SET_TX_IDENTIFY_1_TX;
+    doc_0[7] = 0x00;
+    assert_eq!(
+        SET_TX_IDENTIFY_0_WIRE, doc_0,
+        "doc layout == observed wire (restore leg)"
+    );
+    assert_eq!(
+        SET_TX_IDENTIFY_ACK, SET_TX_IDENTIFY_ACK_WIRE,
+        "ack lineage pin (tail 0x45)"
+    );
+
+    // Residue-discovery pin: the documented fold XOR(payload[0..16)) ⊕
+    // 0x68 predicts 0x6E for the ON heart; the refined fold
+    // XOR(payload[0..15)) ⊕ 0x68 (identify byte NOT folded) predicts the
+    // observed 0x6F on every heart of the run, both states.
+    let documented_fold: u8 = HEART_WIRE_IDENTIFY1[7..23].iter().fold(0u8, |a, b| a ^ b);
+    let refined_fold: u8 = HEART_WIRE_IDENTIFY1[7..22].iter().fold(0u8, |a, b| a ^ b);
+    assert_eq!(
+        documented_fold ^ 0x68,
+        0x6E,
+        "documented rule predicts 0x6E for the ON heart — refuted by the run"
+    );
+    assert_eq!(
+        refined_fold ^ 0x68,
+        0x6F,
+        "refined rule (payload[15] NOT folded) matches the observation"
+    );
+    assert_eq!(
+        HEART_WIRE_IDENTIFY1[24], 0x6F,
+        "observed residue of the ON hearts (export rows 8/10)"
+    );
+    let off_fold: u8 = HEART_WIRE_IDENTIFY0[7..22].iter().fold(0u8, |a, b| a ^ b);
+    assert_eq!(
+        off_fold ^ 0x68,
+        HEART_WIRE_IDENTIFY0[24],
+        "refined rule also fits the OFF hearts (both rules coincide at identify 0)"
+    );
+}
