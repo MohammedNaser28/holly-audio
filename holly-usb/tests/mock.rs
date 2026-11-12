@@ -2810,6 +2810,255 @@ fn set_light_rejects_abnormal_acks() {
     assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
 }
 
+// ── Mic recognition (cmd 35 SET_TX_IDENTIFY) — doc-recomputed vectors ────────
+//
+// Owner lift 2026-11-12 ("35 lifted for mic recognition", AGENTS.md): the
+// recomputed-until-the-run rule shared with EQ/gain/reverb/channel-mode/
+// mute/shutdown/light. Every frame below is computed from docs only:
+//   frame template       docs/protocol.md §2 (ProtocolV2.getData [code])
+//   cmd 35, payload      docs/set-gate-checklist.md §3 Identify-beep row
+//                        ([{value}] — UsbMessengerV2.java:221-224; cmd from
+//                        ProSetTxIdentify.getCmd() → the decompiler folds the
+//                        constant to GET_NOISE_REDUCTION = 35
+//                        [code PostProtocol.java:28])
+//   value space 0/1      IDENTITY, no inversion: toggle ON → FAIL_CLOSE(1),
+//                        OFF → SUC_OPEN(0) [code HLDevice6302Activity.java:
+//                        819-824 + DeviceConnectVariable.java:652-654]; read
+//                        side heart txIdentifyStatus §5 offset 15,
+//                        `toInt(data[15]) == 1` [code ProGetHearInfo.java:88;
+//                        protocol.md §5.2]. The op takes the WIRE byte.
+//   APK precondition     the toggle is gated on BOTH transmitters connected
+//                        [code HLDevice6302Activity.java:805-812] — a
+//                        UI-level check the op does not re-enforce (the
+//                        guarded test's hard start gate + the app VM carry
+//                        it; the device-side behaviour with a mic missing is
+//                        out of scope by the feature file).
+// The heart reply is the wire-certified E1 heart (captures/
+// 2026-11-05-hearinfo-first-wire.txt, which already rests at txIdentify 0 =
+// off [wire] — every certified heart has) with only the value byte moved —
+// the 17-byte heart layout is [wire]. ACK tail prediction: the wire cmd byte
+// is decimal 35 = hex 0x23, so 0x23 ⊕ 0x66 = 0x45 (the same byte the prefix
+// rule gives: XOR(05 03 BB DD 23 00 01 00) ⊕ 0x07 = 0x42 ⊕ 0x07 = 0x45 —
+// docs/protocol.md §2; the run settles it as one more command shape).
+
+/// SET_TX_IDENTIFY of on (wire 1) recomputed from the docs:
+/// `05 03 AA DD 23 00 01 01 EF` + zero padding to 64 (big-endian len 00 01).
+/// Wire 1 = recognition ON — IDENTITY: a UI-on toggle writes this byte
+/// (HLDevice6302Activity.java:819-820 `FAIL_CLOSE` = 1).
+const SET_TX_IDENTIFY_1_TX: [u8; 64] = [
+    0x05, 0x03, 0xAA, 0xDD, 0x23, 0x00, 0x01, 0x01, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// SET_TX_IDENTIFY ack recomputed from the docs: reply header `05 03 BB DD`
+/// with cmd echo 23, len 00 01, status `00` (checklist §3 ACK rule: one
+/// status byte, `data[0] == 0` = success — `ProSetTxIdentify.receiveData`
+/// reads `toInt(data[0]) == 0` [code :26-29]). The byte behind the payload
+/// follows the reply checksum rule XOR(frame[0..7+len)) ⊕ 0x07 — for cmd 23
+/// the prefix folds to 0x42, 0x42 ⊕ 0x07 = 0x45 (the same byte the
+/// cmd ⊕ 0x66 shortcut predicts: 0x23 ⊕ 0x66 = 0x45). The byte stays
+/// UNENFORCED by the crate — it must ignore everything past `7+len`, so the
+/// vector still doubles as an ignore-the-residue regression.
+const SET_TX_IDENTIFY_ACK: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x23, 0x00, 0x01, 0x00, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The certified E1 heart with txIdentifyStatus (payload offset 15 = frame
+/// byte 22) moved 0 → 1 (off → on): layout stays [wire] (E1); the flipped
+/// value byte is the doc-recomputed delta side of route (b), and the residue
+/// drops to 0x36 per the heart reply checksum rule (XOR(payload[0..16)) ⊕
+/// 0x68 — the LAST payload byte, signalMode, is NOT in the fold; identify
+/// 00^01 flips that fold, 0x5F⊕0x68=0x37 → 0x5E⊕0x68=0x36 — the same
+/// residue the light-1 and shutdown-1 hearts carry, all being one 0→1 flip).
+/// Every OTHER field stays put — tx1 stays offline, tx2 stays connected
+/// (battery 0x5D), NC stays on (level 0), gain stays 3, mode stays 0, light
+/// stays 0 (on), EQ stays 3, reverb stays (off, gear 2), shutdown stays 0.
+const HEART_RX_IDENTIFY1: [u8; 64] = [
+    0x05, 0x03, 0xBB, 0xDD, 0x1F, 0x00, 0x11, 0x00, 0x01, 0x00, 0x5D, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x01, 0x00, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// set_tx_identify(1) (on — the other documented value; the E1 heart rests
+/// at txIdentify 0 = off [wire, every certified heart]): the op must issue
+/// its own fresh GET first (uniform SET discipline), then the byte-exact
+/// doc-recomputed SET frame, and hand back the fresh GET's txIdentifyStatus
+/// byte as the pre-write state — 0, the identity byte for "off".
+#[test]
+fn set_tx_identify_tx_frame_is_the_apk_layout() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner fresh GET (device rests at identify OFF 0)
+    mock.push_reply(SET_TX_IDENTIFY_ACK);
+    let mut c = control(mock);
+
+    let previous = c.set_tx_identify(1).expect("ack 00 must be accepted");
+    assert_eq!(
+        previous, 0,
+        "fresh GET inside set_tx_identify = the txIdentifyStatus byte before write (0 = off, identity space)"
+    );
+
+    let written = c.transport().written();
+    assert_eq!(&written[0], &HEART_TX, "op must issue its own GET first");
+    assert_eq!(
+        &written[1], &SET_TX_IDENTIFY_1_TX,
+        "SET identify must be the doc-recomputed on frame"
+    );
+    assert_eq!(
+        written[1][4],
+        cmd::SET_TX_IDENTIFY,
+        "cmd echo = 35 = 0x23 [code ProSetTxIdentify.getCmd → GET_NOISE_REDUCTION]"
+    );
+}
+
+/// The documented value space is exactly two values (0 = OFF, 1 = ON —
+/// IDENTITY on both the write caller `HLDevice6302Activity.java:819-824`
+/// and the read parser `ProGetHearInfo.java:88`): each SET differs from the
+/// on frame in the value byte only (cmd stays 23; no second payload byte).
+#[test]
+fn set_tx_identify_value_space_changes_only_the_value_byte() {
+    for value in [0u8, 1] {
+        let mut mock = MockTransport::new();
+        // The fresh GET inside set_tx_identify reports the PRE-write state,
+        // so each leg serves the OPPOSITE heart: writing on (1) from off
+        // (E1 heart), writing off (0) from on (IDENTIFY1 heart) — proving
+        // the returned byte is the fresh GET's txIdentifyStatus, never the
+        // written value echoed back.
+        mock.push_reply(if value == 1 {
+            HEART_RX_E1
+        } else {
+            HEART_RX_IDENTIFY1
+        });
+        mock.push_reply(SET_TX_IDENTIFY_ACK);
+        let mut c = control(mock);
+
+        let previous = c.set_tx_identify(value).expect("ack 00 must be accepted");
+        assert_eq!(
+            previous,
+            value ^ 1,
+            "fresh GET must report the PRE-write byte (identity space: 0 = off, 1 = on), not the written value"
+        );
+        let mut want = SET_TX_IDENTIFY_1_TX;
+        want[7] = value; // value byte sits at frame offset 7 (tail EF at 8)
+        assert_eq!(&c.transport().written()[1], &want, "identify {value}");
+    }
+}
+
+/// Full doc-vector round trip (route (b), Mock half) in the shape the
+/// guarded hardware test rehearses: device rests at txIdentifyStatus 0 =
+/// off (E1 IS that state [wire]), write the other documented value (on =
+/// 1), ack `00`, heart settles txIdentify → 1 (§5 offset 15) with every
+/// neighbouring field untouched (tx1 offline, tx2 connected battery 0x5D,
+/// NC on level 0, gain 3, mode 0, light on 0, EQ 3, reverb (off, gear 2),
+/// shutdown 0 — the identify byte is the ONLY delta); restore 0, heart
+/// settles back. Frames asserted both ways round trip; the restore TARGET
+/// comes from set_tx_identify's own return (the fresh GET inside the
+/// write), not a caller-side poll.
+#[test]
+fn set_tx_identify_roundtrip_doc_vectors() {
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1); // inner GET of set_tx_identify(1): device at off 0
+    mock.push_reply(SET_TX_IDENTIFY_ACK); // ack for SET_TX_IDENTIFY [01]
+    mock.push_reply(HEART_RX_IDENTIFY1); // post-SET fresh GET: delta = 1 (on)
+    mock.push_reply(HEART_RX_IDENTIFY1); // inner GET of the restore: device at 1
+    mock.push_reply(SET_TX_IDENTIFY_ACK); // ack for SET_TX_IDENTIFY [00]
+    mock.push_reply(HEART_RX_E1); // post-restore fresh GET: delta = 0 (off)
+
+    let mut c = control(mock);
+    let previous = c
+        .set_tx_identify(1)
+        .expect("mic-recognition write must be accepted");
+    assert_eq!(previous, 0, "pre-write txIdentifyStatus byte (0 = off)");
+    let after = c.get_heart_info().expect("post-SET GET");
+    assert!(
+        after.tx_identify,
+        "heart delta must equal the written state (1 = on — identity parse)"
+    );
+    assert!(
+        !after.tx1_status && after.tx2_status,
+        "TX connectivity (§5 offsets 0/1) must never move"
+    );
+    assert_eq!(
+        after.voice_mode, 0,
+        "voiceMode (§5 offset 9, the neighbouring mode field) must never move"
+    );
+    assert_eq!(
+        after.voice_level, 3,
+        "voiceLevel (§5 offset 8, the neighbouring gain field) must never move"
+    );
+    assert_eq!(after.eq_level, 3, "eqLevel (§5 offset 12) must never move");
+    assert_eq!(
+        (after.reverb_switch, after.reverb_level),
+        (false, 2),
+        "reverb fields (§5 offsets 13/14) must never move"
+    );
+    assert_eq!(
+        after.shutdown_time, 0,
+        "shutdownTime (§5 offset 10) must never move"
+    );
+    assert!(
+        after.light_on,
+        "lightStatus (§5 offset 11, 0 = on) must never move"
+    );
+    let restore_previous = c
+        .set_tx_identify(previous)
+        .expect("restore must be accepted");
+    assert_eq!(
+        restore_previous, 1,
+        "fresh GET before restore saw identify 1"
+    );
+    let restored = c.get_heart_info().expect("post-restore GET");
+    assert!(
+        !restored.tx_identify,
+        "heart must be back at the start state (0 = off)"
+    );
+    assert_eq!(restored.voice_mode, 0, "voiceMode still untouched");
+
+    let written = c.transport().written();
+    let mut set0 = SET_TX_IDENTIFY_1_TX;
+    set0[7] = previous; // value byte at frame offset 7 (tail EF at 8)
+    assert_eq!(&written[1], &SET_TX_IDENTIFY_1_TX, "write leg is on 1");
+    assert_eq!(&written[4], &set0, "restore leg is the op's OWN return");
+}
+
+/// Ack gates shared with the SET_NOISE/SET_EQ/SET_GAIN/SET_REVERB/
+/// SET_VOICE_MODE/SET_TX_MUTE/SET_SHUTDOWN_TIME/SET_LIGHT families
+/// (checklist §3: uniform `data[0] == 0` success across all `ProSet*`
+/// classes — `ProSetTxIdentify.receiveData` [code :26-29]): nonzero status
+/// = [`Error::Rejected`], wrong ack length = [`Error::BadAck`]. Reason same
+/// as the other families: the ack shape has only ever been seen as `[00]`
+/// [wire E2/E4].
+#[test]
+fn set_tx_identify_rejects_abnormal_acks() {
+    // nonzero status
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_TX_IDENTIFY_ACK;
+    ack[7] = 0x03; // status byte != 0
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_tx_identify(1).expect_err("nonzero ack must fail");
+    assert!(
+        matches!(err, Error::Rejected { status: 0x03, .. }),
+        "{err:?}"
+    );
+
+    // two-byte ack (echo shape) must not be accepted
+    let mut mock = MockTransport::new();
+    mock.push_reply(HEART_RX_E1);
+    let mut ack = SET_TX_IDENTIFY_ACK;
+    ack[6] = 0x02; // payload len 2
+    mock.push_reply(ack);
+    let mut c = control(mock);
+    let err = c.set_tx_identify(1).expect_err("2-byte ack must fail");
+    assert!(matches!(err, Error::BadAck { .. }), "{err:?}");
+}
+
 // ── Indicator light — real usbmon session (owner run 2026-11-12) ────────────
 //
 // Route (b) closure, same as EQ/gain/reverb/channel-mode/mute/shutdown: the

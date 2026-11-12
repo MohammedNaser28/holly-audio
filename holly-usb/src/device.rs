@@ -607,6 +607,73 @@ impl<T: Transport> HollyControl<T> {
             }),
         }
     }
+
+    /// Mic recognition on/off (cmd 35 SET_TX_IDENTIFY). "Mic recognition"
+    /// and the `status` line "identify beep" are ONE control: the APK's
+    /// own UI string for the 6108 toggle row is `title_tx_identify` =
+    /// "Mic Recognition" [code `res/values/strings.xml:2075`, bound next
+    /// to `tx_identify_switch` in the 6108 layout
+    /// `hldevice_6108.xml:229-238`], the SET producer is `ProSetTxIdentify`
+    /// with cmd 35 [code `:16-18` — the decompiler folds the constant to
+    /// `PostProtocol.Command.GET_NOISE_REDUCTION` = 35,
+    /// `PostProtocol.java:28`; checklist §5 footnote], and the read side
+    /// is heart `txIdentifyStatus` [code `ProGetHearInfo.java:88` — §5
+    /// offset 15], the byte `holly-cli -- status` prints as "identify
+    /// beep" (heart.rs `b(15) == 1`).
+    ///
+    /// IDENTITY control (no inversion, unlike light/speaker): toggle ON →
+    /// `FAIL_CLOSE(1)`, OFF → `SUC_OPEN(0)` [code
+    /// `HLDevice6302Activity.java:819-824` +
+    /// `DeviceConnectVariable.java:652-654`]; the heart parses `== 1` →
+    /// on, so write space == read space {0, 1}. The op takes the WIRE
+    /// byte; any UI-bool translation lives upstream (holly-app's vm.rs),
+    /// never here (family convention).
+    ///
+    /// The APK gates the same toggle on BOTH transmitters connected [code
+    /// `HLDevice6302Activity.java:805-812` — toast + return before any
+    /// SET is built]. That precondition is deliberately NOT re-enforced
+    /// at transport layer: the guarded test carries it as a hard start
+    /// gate (feature 03 rule) and the app VM as its writable flag;
+    /// observing the device-side behaviour with a mic missing is out of
+    /// scope by the feature file.
+    ///
+    /// Returns the pre-write `txIdentifyStatus` byte from THIS call's
+    /// fresh `get_heart_info()` (§5 offset 15, `u8::from(tx_identify)` —
+    /// payload[15] verbatim; no parse inversion to undo). The heart's
+    /// typed `tx_identify` already applied the documented `== 1` parse
+    /// [code :88]; the returned byte is that same field in its own wire
+    /// space — no second rule is created here.
+    ///
+    /// Ack gating is identical to [`HollyControl::set_light`]
+    /// (`ProSetTxIdentify.receiveData` reads `toInt(data[0]) == 0` [code
+    /// `:26-29`]): `[00]` = success; anything else surfaces as
+    /// [`Error::Rejected`]/[`Error::BadAck`] — no retry. ACK-tail
+    /// prediction for cmd 0x23: 0x23 ⊕ 0x66 = 0x45 (settles as one more
+    /// confirmed shape when the run byte-matches; unenforced either way —
+    /// docs/protocol.md §2). Values outside the documented space {0, 1}
+    /// have no certified meaning and are the caller's responsibility,
+    /// not assumed here (family convention).
+    pub fn set_tx_identify(&mut self, value: u8) -> Result<u8, Error> {
+        // Fresh GET inside every SET (crate rule). The identify payload
+        // has no preserved byte (§3 Identify-beep row); the snapshot's
+        // txIdentifyStatus byte is returned to the caller as the
+        // pre-write state (payload[15] verbatim — see the return doc
+        // above).
+        let state = self.get_heart_info()?;
+        let request = Frame::new(cmd::SET_TX_IDENTIFY, vec![value]);
+        let (reply, raw) = self.exchange(request)?;
+        match reply.payload.as_slice() {
+            [0x00] => Ok(u8::from(state.tx_identify)),
+            [status] => Err(Error::Rejected {
+                status: *status,
+                raw,
+            }),
+            other => Err(Error::BadAck {
+                len: other.len(),
+                raw,
+            }),
+        }
+    }
 }
 
 impl HollyControl<NusbTransport> {

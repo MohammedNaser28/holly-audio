@@ -35,6 +35,14 @@
 //! no re-enumeration — so the owner's only extra duty is confirming
 //! VISUALLY that the LED changes during the brief off phase and comes
 //! back (a manual observation, reported as such, never evidence).
+//! `set_tx_identify_roundtrip_guarded` applies them to mic recognition
+//! (cmd 35 SET_TX_IDENTIFY, IDENTITY value space OFF=0/ON=1 — owner lift
+//! 2026-11-12, AGENTS.md): the one control in the batch with a hard START
+//! gate of its own — the run refuses to begin unless BOTH transmitters
+//! report connected (heart offsets 0/1; the APK gates the same toggle on
+//! both mics, `HLDevice6302Activity.java:805-812`). The owner's physical
+//! confirmation is the transmitter LEDs changing colour during the brief
+//! on phase (a manual observation, reported as such, never evidence).
 
 use holly_usb::{HollyControl, NusbTransport};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -2126,6 +2134,259 @@ fn set_light_roundtrip_guarded() {
         Ok(()) => eprintln!(
             "restore confirmed: light byte={start} ({})",
             if start == 0 { "on" } else { "off" }
+        ),
+        Err(last) => panic!(
+            "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
+        ),
+    }
+}
+
+// ── Mic recognition (cmd 35 SET_TX_IDENTIFY) — the both-mics-gated toggle ───
+
+/// Bounded read-only settle poll for the identify byte — same shape as
+/// [`settle_light`] (route (b) owner rule): a FIXED number of fresh GETs
+/// spanning about 2 s run before any heart mismatch is declared — a slow
+/// heart is not a dropped write. GET-only; the SET behind this poll is
+/// never retried. The comparison is in the IDENTITY wire space
+/// (`u8::from(tx_identify)`: 0 = off / 1 = on — the documented parse
+/// `txIdentifyStatus == 1` [code `ProGetHearInfo.java:88`], §5 offset 15),
+/// which equals payload[15] verbatim on the documented space {0, 1};
+/// abnormal bytes are refused by the run's precondition, never polled.
+/// `Ok(())` = a fresh GET reported the written byte; `Err(Some(last))` =
+/// the fixed budget ran out (`last` = the final byte seen); `Err(None)` =
+/// no parseable heart within the budget.
+fn settle_tx_identify(ctl: &mut HollyControl<NusbTransport>, want: u8) -> Result<(), Option<u8>> {
+    /// Fixed settle budget: 4 fresh GETs ≈ 2 s — deterministic, not
+    /// adaptive; nothing beyond this count.
+    const POLLS: u32 = 4;
+    let mut last = None;
+    for poll in 0..POLLS {
+        if poll > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        match ctl.get_heart_info() {
+            Ok(info) => {
+                let wire = u8::from(info.tx_identify);
+                if wire == want {
+                    return Ok(());
+                }
+                last = Some(wire);
+            }
+            Err(e) => eprintln!("settle poll {poll:>2}/{POLLS}: GET failed: {e:?}"),
+        }
+    }
+    Err(last)
+}
+
+/// Drop guard for the mic-recognition test: mirrors [`LightRestoreGuard`]
+/// (no re-enumeration tolerance — an identify toggle does not re-present
+/// the audio path). On any exit path (normal return, failed assert, panic
+/// unwind): one fresh GET decides; IF the identify byte differs from the
+/// run's starting byte, ONE verified restore attempt via
+/// `set_tx_identify(original)`. The feature file's rule is absolute:
+/// recognition is never left on after the test — starting off ends off,
+/// starting on ends on. Errors are logged, never raised from `drop`.
+struct IdentifyRestoreGuard {
+    ctl: Option<HollyControl<NusbTransport>>,
+    original: u8,
+}
+
+impl IdentifyRestoreGuard {
+    fn ctl(&mut self) -> &mut HollyControl<NusbTransport> {
+        self.ctl
+            .as_mut()
+            .expect("guard.ctl() may be called only while Some")
+    }
+}
+
+impl Drop for IdentifyRestoreGuard {
+    fn drop(&mut self) {
+        let Some(ctl) = self.ctl.as_mut() else {
+            return;
+        };
+        // Restore decisions come only from a fresh GET, never cached state.
+        match ctl.get_heart_info() {
+            Err(e) => eprintln!("guard: state poll failed, cannot verify restore: {e:?}"),
+            Ok(info) => {
+                let wire = u8::from(info.tx_identify);
+                if wire == self.original {
+                    eprintln!(
+                        "guard: identify already at original ({}), nothing to do",
+                        self.original
+                    );
+                } else {
+                    eprintln!(
+                        "guard: identify at {}, original {} — sending ONE restore SET",
+                        wire, self.original
+                    );
+                    if let Err(e) = ctl.set_tx_identify(self.original) {
+                        eprintln!(
+                            "guard: RESTORE FAILED ({e:?}) — device left with identify byte {} while original was {}",
+                            wire, self.original
+                        );
+                    }
+                    // Verify what the single restore attempt actually did.
+                    match ctl.get_heart_info() {
+                        Ok(post) => eprintln!(
+                            "guard: post-restore identify byte = {} ({})",
+                            u8::from(post.tx_identify),
+                            if post.tx_identify { "on" } else { "off" }
+                        ),
+                        Err(e) => eprintln!("guard: post-restore GET failed: {e:?}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mic recognition round trip, guarded (route (b), owner lift 2026-11-12 —
+/// AGENTS.md: identify (35) lifted for mic recognition on/off only).
+///
+/// HARD START GATE (feature 03 rule): the run refuses to begin unless BOTH
+/// transmitters report connected (heart offsets 0/1) — the same
+/// precondition the APK applies at UI level
+/// (`HLDevice6302Activity.java:805-812`). The device-side behaviour with a
+/// mic missing is never probed: no test here deliberately sends the
+/// command with one TX down.
+///
+/// Preconditions: both TX connected, state off/on (either start is fine —
+/// the direction used is printed). Write the OTHER documented value
+/// (toggle), confirm via the settle poll that §5 offset 15 equals the
+/// written byte, restore the start, verify. Never leaves recognition on:
+/// starting off writes on (LED colour change = the owner's physical
+/// confirmation) and restores off; starting on writes off and restores on.
+///
+/// ```text
+/// cargo test -p holly-usb --test hardware -- set_tx_identify_roundtrip_guarded --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "mutates device state; owner-gated run with usbmon capture active — watch the transmitter LEDs during the brief on phase (colour change = the physical confirmation); REFUSES to run unless both mics are connected"]
+fn set_tx_identify_roundtrip_guarded() {
+    let _dev = device_lock();
+    let mut ctl = HollyControl::open().expect("open + claim IF0");
+    let original = ctl.get_heart_info().expect("state poll failed");
+    assert_eq!(original.raw.len(), 17, "certified 17-byte payload shape");
+
+    // The hard start gate, BEFORE anything is sent (feature 03 rule —
+    // mirrors HLDevice6302Activity.java:805-812 at UI level). Refusal is
+    // loud and names the fix.
+    assert!(
+        original.raw[0] == 1 && original.raw[1] == 1,
+        "BOTH transmitters must be connected for the identify run (heart offsets 0/1: tx1={}, tx2={}) — refusing; power both mics, let them connect, and rerun",
+        original.raw[0],
+        original.raw[1]
+    );
+
+    let original_byte = original.raw[15];
+    eprintln!(
+        "original mic recognition: byte={} ({}) — watch the transmitter LEDs; the colour change during the brief on phase is the physical confirmation",
+        original_byte,
+        if original.tx_identify { "on" } else { "off" }
+    );
+
+    // Direction from the fresh heart: write the OTHER documented value
+    // (toggle), restore the start. Recognition is NEVER left on after the
+    // test. Abnormal bytes refuse the run.
+    let target = match original_byte {
+        0 => {
+            eprintln!("start = OFF (0): writing ON (1), restoring OFF at the end");
+            1
+        }
+        1 => {
+            eprintln!("start = ON (1): writing OFF (0), restoring ON at the end");
+            0
+        }
+        other => panic!(
+            "txIdentifyStatus {other} is outside the documented space 0/1 (off/on, identity) — refusing the run"
+        ),
+    };
+
+    let mut guard = IdentifyRestoreGuard {
+        ctl: Some(ctl),
+        original: original_byte,
+    };
+
+    // WRITE leg: the other documented value. The op's own fresh GET happens
+    // inside set_tx_identify, and the byte it returns is the state in force
+    // JUST before the write (payload[15] verbatim — see set_tx_identify's
+    // return doc): the freshest restore memory the device has. It wins over
+    // the pre-run poll; if another client moved the byte between the two
+    // GETs, the difference is reported and the exit guard retargets.
+    let start = match guard.ctl().set_tx_identify(target) {
+        Ok(previous) => {
+            if previous != original_byte {
+                eprintln!(
+                    "DRIFT: pre-run GET said byte {}, op's fresh GET reported byte {} — restore retargeted",
+                    original_byte, previous
+                );
+                guard.original = previous;
+            }
+            previous
+        }
+        Err(e) => {
+            // Route (b) ACK ≠ 0 / transport-failure path: NO SET retry. One
+            // fresh GET decides; if the byte moved from the start, ONE
+            // verified restore attempt (the guard would do it too, but the
+            // probe result is logged here while the handle is alive).
+            eprintln!("SET failed: {e:?} — probing once before the single restore");
+            let now = guard
+                .ctl()
+                .get_heart_info()
+                .expect("post-reject GET failed");
+            let now_wire = u8::from(now.tx_identify);
+            eprintln!(
+                "identify after reject: byte={now_wire} ({})",
+                if now.tx_identify { "on" } else { "off" }
+            );
+            let wanted = guard.original;
+            if now_wire != wanted {
+                eprintln!(
+                    "identify byte moved ({} -> {}): ONE verified restore attempt",
+                    wanted, now_wire
+                );
+                if let Err(e) = guard.ctl().set_tx_identify(wanted) {
+                    eprintln!("reject-path restore SET failed: {e:?}");
+                }
+                match settle_tx_identify(guard.ctl(), wanted) {
+                    Ok(()) => eprintln!("reject-path restore verified: byte = {}", wanted),
+                    Err(last) => {
+                        eprintln!("reject-path restore NOT settled (last seen {last:?})")
+                    }
+                }
+            }
+            panic!("SET rejected (ack gate) — aborting with no retry per route (b)");
+        }
+    };
+
+    // Heart-delta verify through the bounded settle poll (route (b) rule,
+    // ~2 s — the on phase stays brief either direction).
+    match settle_tx_identify(guard.ctl(), target) {
+        Ok(()) => eprintln!(
+            "write leg confirmed: identify byte={target} ({})",
+            if target == 1 { "on" } else { "off" }
+        ),
+        Err(last) => panic!(
+            "heart never reported identify byte={target} within the fixed settle budget (last seen: {last:?}) — guard restores the original on the way out"
+        ),
+    }
+
+    // Restore leg = exactly the starting byte, immediately after the
+    // settle poll. The restore TARGET is the SET leg's own return (the
+    // freshest restore memory — see the write leg above), and the
+    // restore's fresh GET must report the byte the write leg left.
+    let restore_previous = guard
+        .ctl()
+        .set_tx_identify(start)
+        .expect("restore SET failed");
+    assert_eq!(
+        restore_previous, target,
+        "restore leg's fresh GET must report the byte the write leg left"
+    );
+    match settle_tx_identify(guard.ctl(), start) {
+        Ok(()) => eprintln!(
+            "restore confirmed: identify byte={start} ({}) — recognition back at the start state, never left on",
+            if start == 1 { "on" } else { "off" }
         ),
         Err(last) => panic!(
             "restore not settled within budget (last seen: {last:?}) — guard tries once more on exit"
