@@ -828,7 +828,9 @@ impl AppModel {
                 // noop; else write), shared by mouse AND the Left/Right keys.
                 is_pickable: &|index| schedule_pick(index, schedule) != SchedulePick::Blocked,
                 on_pick: |this, index, cx| this.set_schedule_power_off(index, cx),
-                horizontal: false,
+                // The mock renders the two timer pads as one horizontal row
+                // (index.html:151-153), NOT the NC rocker's vertical stack.
+                horizontal: true,
                 dim: schedule.applying,
                 focus: Some((&self.schedule_focus, "schedule_selector")),
             },
