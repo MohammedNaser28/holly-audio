@@ -306,7 +306,10 @@ impl AppModel {
             )
     }
 
-    /// One mic card (336px column, halves): reference recipe — icon in a
+    /// One mic card (336px column, halves): reference recipe — the PANEL
+    /// shell itself (20px padding, 14px radius, border + faceplate gradient
+    /// — index.html:52; the interactive rewrite had rendered the card as a
+    /// bare column, commit J restores the shell), icon in a
     /// WELL circle, name 15/600, LED + status (`mic_status`), mute chip
     /// (state read `[wire read]`; the chip is click-interactive only while
     /// [`mic_mute_write_accepted`] passes — family gate + connectedness —
@@ -314,6 +317,9 @@ impl AppModel {
     /// 64px battery readout (LIGHT, "--" when unavailable), 5 battery
     /// segments, and an UNLIT 20-segment level meter (no wire source for
     /// the meter: always unlit, per the writability/evidence rules).
+    /// Battery and level are SEPARATE card children (the card's own 18px
+    /// gap separates them — index.html:52; the battery column's internal
+    /// 10px gap lives in [`battery_block`], index.html:64).
     fn mic_card(
         &self,
         id: &'static str,
@@ -384,9 +390,11 @@ impl AppModel {
             chip = chip
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, _| this.flip_mic_mute(slot)));
         }
-        div()
-            .flex()
-            .flex_col()
+        // The card = the panel recipe itself (padding 20, radius 14,
+        // border + gradient — index.html:52), `min-height:0` riding with
+        // the call site's flex_1; gap 18 between header / battery / level.
+        panel()
+            .min_h(px(0.))
             .gap(px(18.))
             .child(
                 div()
@@ -435,16 +443,8 @@ impl AppModel {
                     .child(div().flex_1())
                     .child(chip),
             )
-            .child(
-                // battery part + meter part in ONE 10px-gap column
-                // [code index.html:64]
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .child(battery_block(&digits, live, lit))
-                    .child(level_meter_block()),
-            )
+            .child(battery_block(&digits, live, lit))
+            .child(level_meter_block())
     }
 
     /// NC panel: title + LED/status row, then the rocker well + the level
