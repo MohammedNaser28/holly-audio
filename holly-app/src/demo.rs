@@ -72,6 +72,9 @@ impl DemoScenario {
 #[derive(Debug)]
 pub struct DemoDevice {
     heart: Mutex<HeartInfo>,
+    /// Poll tick counter for the scripted meter level ([`Self::tx_levels`]
+    /// — the one fabricated read; the heart itself stays wire-faithful).
+    tick: u32,
     /// ONE-SET stall ([`DemoScenario::Pending`] only): lets a UI be
     /// photographed with an in-flight write. `Duration::ZERO` for every
     /// other session — `thread::sleep(ZERO)` returns immediately, so
@@ -83,6 +86,7 @@ impl DemoDevice {
     pub fn new() -> Result<Self, Error> {
         Ok(Self {
             heart: Mutex::new(HeartInfo::from_payload(&DEMO_PAYLOAD)?),
+            tick: 0,
             stall: Duration::ZERO,
         })
     }
@@ -93,14 +97,33 @@ impl DemoDevice {
     pub fn stalled(stall: Duration) -> Result<Self, Error> {
         Ok(Self {
             heart: Mutex::new(HeartInfo::from_payload(&DEMO_PAYLOAD)?),
+            tick: 0,
             stall,
         })
     }
 }
 
+/// Scripted Mic 2 level (dBFS): a triangle from the mock's at-rest −16 dB
+/// (7 of 20 segments lit — index.html:221/:230 demo data) up to full scale
+/// and back, 1 dB per poll tick, 32 s cycle, so the meter walks every band
+/// of the APK curve including the 18..=20 hot zone (tungsten peak).
+/// FABRICATED display data under the DEMO marker rule — the wire has no
+/// level field (frontends/gpui/README).
+fn scripted_level(tick: u32) -> i16 {
+    let phase = (tick % 32) as i16;
+    -16 + if phase <= 16 { phase } else { 32 - phase }
+}
+
 impl StatusSource for DemoDevice {
     fn poll(&mut self) -> Result<HeartInfo, Error> {
+        self.tick += 1; // the meter's step; the heart itself never moves here
         Ok(self.heart.lock().unwrap().clone())
+    }
+
+    /// Out-of-band host data (wire has none): TX1 is offline in the demo
+    /// payload — no channel to measure; TX2 rides [`scripted_level`].
+    fn tx_levels(&mut self) -> [Option<i16>; 2] {
+        [None, Some(scripted_level(self.tick))]
     }
 
     fn set_noise(&mut self, on: bool) -> Result<(), Error> {
