@@ -103,6 +103,15 @@ impl Drop for TapHandle {
     }
 }
 
+/// The source NAME from one `pactl list sources short` line — the format
+/// is `<index> <TAB> <name> <TAB> <driver> <TAB> <spec> <TAB> <state>`:
+/// a numeric index comes FIRST and the node name is the SECOND column
+/// [wire host observation 2026-11-13: the dongle's own line starts
+/// `2607<TAB>alsa_input.usb-Shenzhen_Hollyland_…`].
+fn source_name(line: &str) -> Option<&str> {
+    line.split('\t').nth(1)
+}
+
 /// The dongle's UAC capture node name, or `None` when it is not on the
 /// bus (no child is spawned then — the tap stays fully dormant).
 /// Matches the device's OWN USB strings from inputs/lsusb-v.txt; the
@@ -125,7 +134,7 @@ fn discover_target() -> Option<String> {
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines()
-        .map(|line| line.split('\t').next().unwrap_or(""))
+        .filter_map(source_name)
         .filter(|name| name.starts_with("alsa_input.usb-"))
         .find(|name| {
             let lower = name.to_ascii_lowercase();
@@ -400,12 +409,34 @@ mod tests {
         assert_eq!(state.level_interval(), None);
     }
 
+    /// The discovery parser against the REAL pactl output shape — the
+    /// dongle's own line [wire host observation 2026-11-13]:
+    /// `<index>\t<name>\t<driver>\t<spec>\t<state>`. The first cut took
+    /// the INDEX column and never matched, leaving the tap dormant (the
+    /// meter stayed unlit on real hardware). This pins the column.
+    #[test]
+    fn discovery_parses_the_real_pactl_line() {
+        let line = "2607\talsa_input.usb-Shenzhen_Hollyland_Technology_Co._Ltd_Wireless_Microphone_Wireless_Microphone-01.analog-stereo\tPipeWire\ts24le 2ch 48000Hz\tSUSPENDED";
+        let name = source_name(line).expect("the name column exists");
+        assert!(name.starts_with("alsa_input.usb-"), "{name}");
+        assert!(name.to_ascii_lowercase().contains("hollyland"), "{name}");
+        // A name-less line parses to nothing.
+        assert!(source_name("").is_none());
+    }
+
     /// A dormant tap (no dongle node → no child) is a pure pass-through:
     /// levels and cadence both come from the inner source — exactly a
-    /// bare `HollyControl`.
+    /// bare `HollyControl`. Constructed with `tap: None` EXPLICITLY —
+    /// `TappedSource::new` performs real discovery, so on a machine with
+    /// the dongle on the bus it attaches a live tap (and this test would
+    /// be asserting the wrong thing, which is exactly how the first cut
+    /// passed with a broken discovery parser).
     #[test]
     fn dormant_tap_defers_to_inner() {
-        let mut tapped = TappedSource::new(InnerMock);
+        let mut tapped = TappedSource {
+            inner: InnerMock,
+            tap: None,
+        };
         assert_eq!(tapped.tx_levels(), [None, None]);
         assert_eq!(tapped.level_interval(), None);
         assert!(matches!(tapped.poll(), Err(Error::NotFound)));
