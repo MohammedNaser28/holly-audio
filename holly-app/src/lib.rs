@@ -214,6 +214,17 @@ pub trait StatusSource {
     fn tx_levels(&mut self) -> [Option<i16>; 2] {
         [None, None]
     }
+    /// Cadence the ACTOR should re-read [`Self::tx_levels`] at between
+    /// device GETs while connected. `None` (default) = levels only move
+    /// with the poll — real `HollyControl` has no level source, and the
+    /// demo drives its sweep through its own fast loop window instead
+    /// (demo.rs). The OS-audio tap answers its 50 ms capture cadence
+    /// [code `AudioRecordUtils.java` mLock.wait(50L)], so a real meter
+    /// can walk at APK speed while the device GET keeps
+    /// [`POLL_INTERVAL`].
+    fn level_interval(&self) -> Option<Duration> {
+        None
+    }
 }
 
 impl<T: Transport> StatusSource for HollyControl<T> {

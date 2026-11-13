@@ -15,7 +15,7 @@
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use holly_usb::HollyControl;
 
@@ -408,6 +408,28 @@ impl Core {
         }
     }
 
+    /// The claimed source's own level cadence, re-read every loop pass —
+    /// derived from the source rather than stored, so a dead tap (or a
+    /// dropped claim) reverts the loop's window automatically.
+    fn level_cadence(&self) -> Option<Duration> {
+        self.device.as_ref().and_then(|d| d.level_interval())
+    }
+
+    /// One idle tick BETWEEN device GETs while a fast-level source is
+    /// claimed (the OS-audio tap): re-read ONLY the out-of-band
+    /// [`StatusSource::tx_levels`] and emit. The full-snapshot dedup
+    /// drops no-change ticks; the heart, the pending set and the footer
+    /// stamp (`updated`) are untouched — a level tick never pretends a
+    /// device GET happened.
+    pub fn level_tick(&mut self) {
+        let Some(source) = self.device.as_mut() else {
+            return;
+        };
+        let levels = source.tx_levels();
+        self.tx_levels = levels;
+        self.emit();
+    }
+
     /// Process ONE batch of queued commands with coalescing (latest-wins:
     /// within the batch, any SET command — NC switch, NC level, EQ pad,
     /// Volume stop, or reverb write — replaces its predecessor; only the
@@ -672,20 +694,44 @@ pub fn start_with_factory_at(factory: OpenFn, connected_interval: Duration) -> D
     handle
 }
 
+/// Receive window for ONE run-loop pass: disconnected it IS the reconnect
+/// backoff (unchanged for every caller); connected it is the caller's
+/// poll window, shortened to the source's own level cadence when that is
+/// faster — the OS-audio tap runs its meter at APK speed while the device
+/// GET keeps its interval ([`POLL_INTERVAL`] for real hardware). A
+/// slower cadence never lengthens the window: commands must stay
+/// responsive at the caller's pace.
+fn window_for(
+    connected: bool,
+    level_cadence: Option<Duration>,
+    connected_interval: Duration,
+) -> Duration {
+    match (connected, level_cadence) {
+        (false, _) => RECONNECT_BACKOFF,
+        (true, Some(cadence)) => cadence.min(connected_interval),
+        (true, None) => connected_interval,
+    }
+}
+
 fn run_loop(factory: OpenFn, hub: Arc<Hub>, rx: Receiver<Command>, connected_interval: Duration) {
     let mut core = Core::new(factory, hub);
+    // Wall clock of the last DEVICE GET (idle poll, post-SET fresh poll,
+    // or the connect-time one) — the pacing clock for the idle split
+    // below. Stamped only when device traffic actually ran (checked via
+    // device presence after tick/pump), so idle LEVEL ticks can never
+    // starve the spec's GET interval.
+    let mut last_get: Option<Instant> = None;
     loop {
         // Batch window: everything that queued while the previous device
         // operation ran arrives together and coalesces here. The window
-        // splits by link state: disconnected it IS the reconnect backoff
-        // (RECONNECT_BACKOFF, unchanged for every caller); connected it is
-        // the caller's poll window (POLL_INTERVAL for real hardware, the
-        // demo's 50 ms level cadence).
-        let wait = if core.device.is_some() {
-            connected_interval
-        } else {
-            RECONNECT_BACKOFF
-        };
+        // splits by link state and level cadence ([`window_for`] — the
+        // 1 s reconnect backoff while disconnected, unchanged for every
+        // caller).
+        let wait = window_for(
+            core.device.is_some(),
+            core.level_cadence(),
+            connected_interval,
+        );
         let mut batch: Vec<Command> = Vec::with_capacity(4);
         match rx.recv_timeout(wait) {
             Ok(cmd) => {
@@ -701,11 +747,69 @@ fn run_loop(factory: OpenFn, hub: Arc<Hub>, rx: Receiver<Command>, connected_int
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if batch.is_empty() {
-            core.tick();
+            // Idle split with a fast-level source: the device GET keeps
+            // its interval (`get_interval` — POLL_INTERVAL for real
+            // hardware; the demo's whole loop is its own faster window),
+            // and every idle tick BETWEEN GETs is a level-only read —
+            // the meter walks at APK speed without touching the heart.
+            // Without a fast cadence every idle tick is a full poll,
+            // exactly as before.
+            let get_interval = POLL_INTERVAL.min(connected_interval);
+            if core.level_cadence().is_none()
+                || last_get.map_or(true, |t| t.elapsed() >= get_interval)
+            {
+                core.tick();
+            } else {
+                core.level_tick();
+            }
+            if core.device.is_some() {
+                last_get = Some(Instant::now());
+            }
         } else {
             core.pump(batch);
+            if core.device.is_some() {
+                last_get = Some(Instant::now());
+            }
         }
     }
     // Actor exits here: Core (and its claimed dongle) drops, restoring
     // interface state via holly-usb's Drop path.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The receive window: disconnected = reconnect backoff for every
+    /// caller; connected without a fast cadence = the caller's poll
+    /// window; a FASTER level cadence shortens it (the tap's meter
+    /// pace), a slower one never lengthens it.
+    #[test]
+    fn window_for_splits_by_state_and_cadence() {
+        assert_eq!(
+            window_for(false, Some(Duration::from_millis(20)), POLL_INTERVAL),
+            RECONNECT_BACKOFF
+        );
+        assert_eq!(window_for(false, None, POLL_INTERVAL), RECONNECT_BACKOFF);
+        assert_eq!(window_for(true, None, POLL_INTERVAL), POLL_INTERVAL);
+        // Faster cadence wins the min(); slower cadence never stalls the
+        // command loop at the caller's pace.
+        assert_eq!(
+            window_for(true, Some(Duration::from_millis(50)), POLL_INTERVAL),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            window_for(true, Some(Duration::from_secs(2)), POLL_INTERVAL),
+            POLL_INTERVAL
+        );
+        // The demo's fast loop window stays fast with a cadence.
+        assert_eq!(
+            window_for(
+                true,
+                Some(Duration::from_millis(50)),
+                Duration::from_millis(50)
+            ),
+            Duration::from_millis(50)
+        );
+    }
 }
