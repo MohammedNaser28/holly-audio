@@ -1135,14 +1135,16 @@ pub(crate) fn battery_block(
 }
 
 /// The reference level meter: a "Level" caption (13px TEXT_2) above a row of
-/// 20 segments (row gap 3, height 14, radius 2; index.html:74-78), lit per
-/// the mock's own `seg()` rule (index.html:190-192): the first `lit`
-/// segments take TEXT_2, indices from [`theme::metrics::METER_PEAK_FROM`]
-/// (the APK's 18..=20 distortion zone) take TUNGSTEN, the rest stay the
-/// unlit RAISED fill. `lit` comes from the VM's [`meter_lit_for`] — the
-/// dB→segments curve lives there (APK-faithful), never here. The mock
-/// demo-data values are 11/7 lit; a real link stays unlit until the
-/// OS-audio tap lands (README: unfinished reproductions).
+/// 20 segments (row gap 3, height 14, radius 2; index.html:74-78), lit
+/// TUNGSTEN throughout per the owner's recipe call (2026-11-13) — a
+/// DEVIATION from the mock's grey-lit + amber-peak split
+/// (`seg(20, on, '#A3AAB4', 17, '#FFB547')`, index.html:190-192/:230):
+/// amber is the design's engagement colour and the owner wanted the meter
+/// to read as colored; the mock keeps its recipe as the reference, this
+/// deviation rides the README's list. `lit` comes from the VM's
+/// [`meter_lit_for`] — the dB→segments curve lives there (APK-faithful),
+/// never here. The mock demo-data values are 11/7 lit; a real link stays
+/// unlit until the OS-audio tap lands (README: unfinished reproductions).
 pub(crate) fn level_meter_block(lit: usize) -> gpui::Div {
     div()
         .flex()
@@ -1164,11 +1166,7 @@ pub(crate) fn level_meter_block(lit: usize) -> gpui::Div {
                         .h(px(theme::metrics::METER_SEGMENT_HEIGHT))
                         .rounded(px(theme::metrics::METER_SEGMENT_RADIUS))
                         .bg(solid(if segment < lit {
-                            if segment >= theme::metrics::METER_PEAK_FROM {
-                                theme::color::TUNGSTEN
-                            } else {
-                                theme::color::TEXT_2
-                            }
+                            theme::color::TUNGSTEN
                         } else {
                             theme::color::RAISED
                         }))

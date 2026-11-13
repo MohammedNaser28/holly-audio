@@ -98,11 +98,6 @@ pub mod metrics {
     pub const TOGGLE_THUMB: f32 = 20.0;
     pub const METER_SEGMENTS: usize = 20; // live mic level
     pub const METER_SEGMENT_HEIGHT: f32 = 14.0;
-    /// Peak segment threshold: lit segments from here up take TUNGSTEN —
-    /// the APK's distortion-report zone (its meter flags 18..=20 as
-    /// AUDIO_DISTORTION [code BleSingleVolumeView.java:setVolume]),
-    /// matching the mock's `seg(.., 17, '#FFB547')` (index.html:230).
-    pub const METER_PEAK_FROM: usize = 17;
     pub const SELECTOR_HEIGHT: f32 = 36.0; // NC level selector segment
     pub const SELECTOR_PADDING: f32 = 4.0;
     pub const SELECTOR_GAP: f32 = 2.0;
@@ -210,6 +205,6 @@ mod tests {
         at_least(TUNGSTEN, PANEL_BOTTOM, 3.0, "tungsten LED on panel");
         at_least(LIVE, PANEL_BOTTOM, 3.0, "live LED on panel");
         at_least(ALERT, PANEL_BOTTOM, 3.0, "alert on panel");
-        at_least(TEXT_2, RAISED, 3.0, "lit level segment vs unlit segment");
+        at_least(TUNGSTEN, RAISED, 3.0, "lit meter segment vs unlit segment");
     }
 }

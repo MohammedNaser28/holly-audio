@@ -139,17 +139,21 @@ All deferred with a reason; none invented:
   gpui counterpart (outset `BoxShadow` only). Wells render as flat fills;
   theme.rs keeps the `HIGHLIGHT_*` numbers as designed data with a
   `dead_code` allow carrying that reason.
-- **Meter segments (source).** The meter now RENDERS the mock's lit recipe
-  (TEXT_2 segments, TUNGSTEN from 0-based index 17 — the APK's own
-  18..=20 distortion-report zone [code BleSingleVolumeView.java:setVolume]
-  matching index.html:230) from the VM's per-mic dBFS level. The dB→segments
-  curve is the APK's exact `getVolumeProgress2` [code], never a frontend
-  constant (vm.rs `meter_lit`/`meter_lit_for`; offline/muted/no-source
-  cards show zero). What stays unfinished is the LEVEL SOURCE: the wire
-  has no level field, so real hardware reads `None` and the meter stays
-  unlit; `--demo` scripts a −16..0 dBFS sweep (DEMO marker rule). The real
-  source is the OS-audio tap — PipeWire/ALSA capture of the dongle's UAC
-  input, the desktop twin of the APK's own path
+- **Meter segments (source + recipe).** The meter renders from the VM's
+  per-mic dBFS level; the dB→segments curve is the APK's exact
+  `getVolumeProgress2` [code], never a frontend constant (vm.rs
+  `meter_lit`/`meter_lit_for`; offline/muted/no-source cards show zero).
+  RECIPE DEVIATION (owner 2026-11-13): lit segments render TUNGSTEN
+  throughout — the mock's grey-lit + amber-peak split (`seg(…, '#A3AAB4',
+  17, '#FFB547')`, index.html:190-192/:230) is not reproduced;
+  `METER_PEAK_FROM` is gone from the token set. What stays unfinished is
+  the LEVEL SOURCE: the wire has no level field, so real hardware reads
+  `None` and the meter stays unlit; `--demo` scripts both mics (the mock's
+  demo data: TX1 100 %/TX2 93 %, at-rest −12/−16 dB = 11/7 lit, a
+  −12..0/−16..0 dBFS triangle at the demo's 50 ms tick — the APK's own
+  cadence [code AudioRecordUtils.java mLock.wait(50L)]). The real source
+  is the OS-audio tap — PipeWire/ALSA capture of the dongle's UAC input,
+  the desktop twin of the APK's own path
   [code HLDevice6302Activity.java:476 → AudioRecordUtils] — parked until
   the owner authorizes it (`pw-record` subprocess design agreed
   2026-11-12).
