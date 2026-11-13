@@ -146,17 +146,20 @@ All deferred with a reason; none invented:
   RECIPE DEVIATION (owner 2026-11-13): lit segments render TUNGSTEN
   throughout — the mock's grey-lit + amber-peak split (`seg(…, '#A3AAB4',
   17, '#FFB547')`, index.html:190-192/:230) is not reproduced;
-  `METER_PEAK_FROM` is gone from the token set. What stays unfinished is
-  the LEVEL SOURCE: the wire has no level field, so real hardware reads
-  `None` and the meter stays unlit; `--demo` scripts both mics (the mock's
-  demo data: TX1 100 %/TX2 93 %, at-rest −12/−16 dB = 11/7 lit, a
-  −12..0/−16..0 dBFS triangle at the demo's 50 ms tick — the APK's own
-  cadence [code AudioRecordUtils.java mLock.wait(50L)]). The real source
-  is the OS-audio tap — PipeWire/ALSA capture of the dongle's UAC input,
-  the desktop twin of the APK's own path
-  [code HLDevice6302Activity.java:476 → AudioRecordUtils] — parked until
-  the owner authorizes it (`pw-record` subprocess design agreed
-  2026-11-12).
+  `METER_PEAK_FROM` is gone from the token set. `--demo` scripts both
+  mics (the mock's demo data: TX1 100 %/TX2 93 %, at-rest −12/−16 dB =
+  11/7 lit, a −12..0/−16..0 dBFS triangle at the demo's 50 ms tick). The
+  real source is now implemented (owner cadence call (b), 2026-11-13):
+  `holly-app`'s OS-audio tap (`pw-record` on the dongle's UAC input —
+  the desktop twin of the APK's own path [code
+  HLDevice6302Activity.java:476 → AudioRecordUtils]) feeds
+  `StatusSource::tx_levels` with RMS dBFS from 50 ms windows, and the
+  actor walks level-only ticks between the spec's 1 s device GETs, so a
+  real meter moves at APK speed. Dormant (unlit) until the dongle's
+  capture node is on the bus; `HOLLY_MIC_TARGET` overrides node
+  discovery. Pending the [wire] hardware session: node-name match
+  against the real pactl output, the channel→TX-slot mapping, and level
+  fidelity against the Lark app's own meter.
 - **Battery segments.** The mock lights ALL five battery segments whenever
   the link is live, regardless of the percent shown next to it
   (index.html:229). The desktop bar lights `battery_segment_count(pct)`
