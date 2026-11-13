@@ -29,6 +29,7 @@ pub mod vm;
 
 pub use actor::{
     Command, Core, DeviceHandle, Hub, NoiseWrite, PendingWrite, start, start_with_factory,
+    start_with_factory_at,
 };
 
 /// Default poll interval for the connected state (1 s, per spec).

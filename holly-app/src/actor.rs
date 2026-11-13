@@ -15,15 +15,15 @@
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use holly_usb::HollyControl;
 
 use serde::Serialize;
 
 use crate::{
-    ConnStatus, HeartInfo, OpenFn, POLL_INTERVAL, Snapshot, StatusSource, classify_claim,
-    device_gone,
+    ConnStatus, HeartInfo, OpenFn, POLL_INTERVAL, RECONNECT_BACKOFF, Snapshot, StatusSource,
+    classify_claim, device_gone,
 };
 
 /// Wall-clock stamp for [`Snapshot::received_at`] — integer UNIX seconds.
@@ -647,6 +647,16 @@ pub fn start() -> DeviceHandle {
 /// Same runtime loop, explicit factory — used for UI binaries built on
 /// scripted factories and by tests driving the real thread.
 pub fn start_with_factory(factory: OpenFn) -> DeviceHandle {
+    start_with_factory_at(factory, POLL_INTERVAL)
+}
+
+/// Variant with a caller-chosen CONNECTED-state tick window: the demo's
+/// meter sweep needs the APK's 50 ms cadence [code
+/// `AudioRecordUtils.java` mLock.wait(50L)] while real hardware keeps
+/// [`POLL_INTERVAL`] (the spec's 1 s poll). The DISCONNECTED window stays
+/// [`RECONNECT_BACKOFF`] for both — a demo never shortens reconnect
+/// pacing ( [`run_loop`]).
+pub fn start_with_factory_at(factory: OpenFn, connected_interval: Duration) -> DeviceHandle {
     let (tx, rx) = std::sync::mpsc::channel::<Command>();
     let hub = Arc::new(Hub::default());
     let handle = DeviceHandle {
@@ -656,19 +666,28 @@ pub fn start_with_factory(factory: OpenFn) -> DeviceHandle {
 
     std::thread::Builder::new()
         .name("holly-app-device".to_string())
-        .spawn(move || run_loop(factory, hub, rx))
+        .spawn(move || run_loop(factory, hub, rx, connected_interval))
         .expect("actor thread: spawn");
 
     handle
 }
 
-fn run_loop(factory: OpenFn, hub: Arc<Hub>, rx: Receiver<Command>) {
+fn run_loop(factory: OpenFn, hub: Arc<Hub>, rx: Receiver<Command>, connected_interval: Duration) {
     let mut core = Core::new(factory, hub);
     loop {
         // Batch window: everything that queued while the previous device
-        // operation ran arrives together and coalesces here.
+        // operation ran arrives together and coalesces here. The window
+        // splits by link state: disconnected it IS the reconnect backoff
+        // (RECONNECT_BACKOFF, unchanged for every caller); connected it is
+        // the caller's poll window (POLL_INTERVAL for real hardware, the
+        // demo's 50 ms level cadence).
+        let wait = if core.device.is_some() {
+            connected_interval
+        } else {
+            RECONNECT_BACKOFF
+        };
         let mut batch: Vec<Command> = Vec::with_capacity(4);
-        match rx.recv_timeout(POLL_INTERVAL) {
+        match rx.recv_timeout(wait) {
             Ok(cmd) => {
                 batch.push(cmd);
                 while batch.len() < PUMP_MAX {
@@ -686,9 +705,6 @@ fn run_loop(factory: OpenFn, hub: Arc<Hub>, rx: Receiver<Command>) {
         } else {
             core.pump(batch);
         }
-        // While disconnected this 1 s idle window IS the reconnect
-        // backoff (RECONNECT_BACKOFF == POLL_INTERVAL by value, documented
-        // in lib.rs so both knobs stay findable).
     }
     // Actor exits here: Core (and its claimed dongle) drops, restoring
     // interface state via holly-usb's Drop path.
