@@ -7,6 +7,7 @@
 //! (abort on malformed, no retry loops, Rejected/BadAck surfaced).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,7 +16,7 @@ use holly_app::vm::view_model;
 use holly_app::{
     Command, ConnStatus, Core, Hub, NoiseWrite, OpenFn, PendingWrite, Snapshot, StatusSource, vm,
 };
-use holly_usb::{Error, HollyControl, Transport};
+use holly_usb::{Error, HeartInfo, HollyControl, Transport};
 
 const REPORT: usize = 64;
 
@@ -537,6 +538,99 @@ fn thread_loop_end_to_end() {
         }
     }
     assert!(saw_gone, "device-gone never surfaced as NotFound");
+}
+
+/// REGRESSION (2026-11-13, real hardware): with a fast-level source
+/// claimed, idle LEVEL ticks re-stamped the GET clock, so the device GET
+/// was pushed away forever — the heart froze at its connect-time state
+/// and a second mic connecting later stayed invisible until Refresh or
+/// a SET (mute/unmute) forced a poll. The mock counts GETs and level
+/// reads: past the connect-time poll, GETs must keep advancing at their
+/// own interval while level reads accumulate in between.
+#[derive(Debug)]
+struct TapLikeMock {
+    polls: Arc<AtomicUsize>,
+    level_reads: Arc<AtomicUsize>,
+    heart: HeartInfo,
+}
+
+impl StatusSource for TapLikeMock {
+    fn poll(&mut self) -> Result<HeartInfo, Error> {
+        self.polls.fetch_add(1, Ordering::Relaxed);
+        Ok(self.heart.clone())
+    }
+    fn set_noise(&mut self, _: bool) -> Result<(), Error> {
+        Err(Error::NotFound)
+    }
+    fn set_noise_level(&mut self, _: u8) -> Result<(), Error> {
+        Err(Error::NotFound)
+    }
+    fn set_eq(&mut self, _: u8) -> Result<u8, Error> {
+        Err(Error::NotFound)
+    }
+    fn set_gain(&mut self, _: u8) -> Result<u8, Error> {
+        Err(Error::NotFound)
+    }
+    fn set_reverb(&mut self, _: bool, _: u8) -> Result<(bool, u8), Error> {
+        Err(Error::NotFound)
+    }
+    fn set_channel_mode(&mut self, _: u8) -> Result<u8, Error> {
+        Err(Error::NotFound)
+    }
+    fn set_tx_mute(&mut self, _: u8, _: bool) -> Result<Option<bool>, Error> {
+        Err(Error::NotFound)
+    }
+    fn set_shutdown_time(&mut self, _: u8) -> Result<u8, Error> {
+        Err(Error::NotFound)
+    }
+    fn set_indicator_light(&mut self, _: u8) -> Result<u8, Error> {
+        Err(Error::NotFound)
+    }
+    fn set_mic_recognition(&mut self, _: u8) -> Result<u8, Error> {
+        Err(Error::NotFound)
+    }
+    fn tx_levels(&mut self) -> [Option<i16>; 2] {
+        self.level_reads.fetch_add(1, Ordering::Relaxed);
+        [Some(-12), Some(-16)]
+    }
+    fn level_interval(&self) -> Option<Duration> {
+        Some(Duration::from_millis(20))
+    }
+}
+
+#[test]
+fn level_ticks_never_starve_the_device_get() {
+    // E1 payload (17 bytes) — content is irrelevant here; only the GET
+    // count matters.
+    let heart = HeartInfo::from_payload(&[0, 1, 0, 93, 0, 0, 1, 0, 3, 0, 0, 0, 3, 0, 2, 0, 0])
+        .expect("E1 payload parses");
+    let polls = Arc::new(AtomicUsize::new(0));
+    let level_reads = Arc::new(AtomicUsize::new(0));
+    let polls2 = Arc::clone(&polls);
+    let level_reads2 = Arc::clone(&level_reads);
+    let factory: OpenFn = Box::new(move || {
+        Ok(Box::new(TapLikeMock {
+            polls: Arc::clone(&polls2),
+            level_reads: Arc::clone(&level_reads2),
+            heart: heart.clone(),
+        }) as Box<dyn StatusSource + Send>)
+    });
+
+    let handle = holly_app::start_with_factory_at(factory, Duration::from_secs(1));
+    handle.refresh(); // immediate connect: the connect-time poll (GET #1)
+    std::thread::sleep(Duration::from_millis(1400));
+
+    // GETs at 1 Hz while the meter walks at 50 Hz: a GET count frozen at
+    // the connect poll is exactly the starved-loop regression.
+    let poll_count = polls.load(Ordering::Relaxed);
+    assert!(
+        poll_count >= 2,
+        "device GETs stopped after {poll_count} (idle level ticks starved the heart)"
+    );
+    assert!(
+        level_reads.load(Ordering::Relaxed) >= 20,
+        "levels did not tick between GETs"
+    );
 }
 
 /// JSON shape of the machine-readable snapshot — the published contract any

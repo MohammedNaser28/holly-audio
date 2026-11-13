@@ -763,11 +763,16 @@ fn run_loop(factory: OpenFn, hub: Arc<Hub>, rx: Receiver<Command>, connected_int
                 || last_get.is_none_or(|t| t.elapsed() >= get_interval)
             {
                 core.tick();
+                // Stamp ONLY here — a real GET ran. A stamp after idle
+                // LEVEL ticks too would let them push the next GET away
+                // forever: the heart froze at its connect-time state, so
+                // a second mic connecting was invisible until Refresh or
+                // a SET (mute/unmute) forced a poll.
+                if core.device.is_some() {
+                    last_get = Some(Instant::now());
+                }
             } else {
                 core.level_tick();
-            }
-            if core.device.is_some() {
-                last_get = Some(Instant::now());
             }
         } else {
             core.pump(batch);
