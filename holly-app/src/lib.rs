@@ -25,6 +25,7 @@ use holly_usb::{Error, HeartInfo, HollyControl, Transport};
 
 pub mod actor;
 pub mod demo;
+pub mod tap;
 pub mod vm;
 
 pub use actor::{

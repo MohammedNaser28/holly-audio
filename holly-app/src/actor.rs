@@ -657,12 +657,16 @@ impl Core {
     }
 }
 
-/// Production wiring: real factory (`HollyControl::open`), 1 s poll, 1 s
-/// reconnect backoff (the actor's idle receive window while disconnected;
-/// see [`run_loop`]). Stopping: drop every handle clone.
+/// Production wiring: real factory (`HollyControl::open`) with the
+/// OS-audio level tap attached (`tap::TappedSource` — dormant until the
+/// dongle's UAC capture node exists on the bus), 1 s poll, 1 s
+/// reconnect backoff (the actor's idle receive window while
+/// disconnected; see [`run_loop`]). Stopping: drop every handle clone.
 pub fn start() -> DeviceHandle {
-    let factory: OpenFn =
-        Box::new(|| HollyControl::open().map(|ctl| Box::new(ctl) as Box<dyn StatusSource + Send>));
+    let factory: OpenFn = Box::new(|| {
+        let ctl = HollyControl::open()?;
+        Ok(Box::new(crate::tap::TappedSource::new(ctl)) as Box<dyn StatusSource + Send>)
+    });
     start_with_factory(factory)
 }
 
@@ -756,7 +760,7 @@ fn run_loop(factory: OpenFn, hub: Arc<Hub>, rx: Receiver<Command>, connected_int
             // exactly as before.
             let get_interval = POLL_INTERVAL.min(connected_interval);
             if core.level_cadence().is_none()
-                || last_get.map_or(true, |t| t.elapsed() >= get_interval)
+                || last_get.is_none_or(|t| t.elapsed() >= get_interval)
             {
                 core.tick();
             } else {
