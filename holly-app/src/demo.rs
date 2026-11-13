@@ -9,8 +9,10 @@
 //! sessions 1-3 of `captures/2026-11-05-noise-level-medium.txt` +
 //! `holly-usb`'s ops): the SET path behaves like `HollyControl::set_noise*`
 //! — a switch flip preserves the level byte, a level write preserves the
-//! switch byte — and `poll()` answers with the current state. Values are
-//! the certified session-3 frame (ON, level 1, tx2 online at 93 %).
+//! switch byte — and `poll()` answers with the current state. CONTROL
+//! values are the certified session-3 frame (ON, level 1); the MIC lines
+//! carry the MOCK's demo data (TX1 100 % / TX2 93 %, meter levels scripted
+//! — index.html:220-230) so a UI shows the mock's both-mics-live state.
 //!
 //! This is intentionally dumb: no disconnects, no protocol-level error
 //! injection. Broken transport / busy / permission / malformed branches are
@@ -25,10 +27,13 @@ use std::time::Duration;
 use crate::{DeviceHandle, OpenFn, StatusSource};
 use holly_usb::{Error, HeartInfo};
 
-/// Certified session-3 heart payload (17 bytes): nc ON, level 1 (medium),
-/// tx1 off / tx2 connected, battery 0x5D = 93, gain 3, eq 3, reverb
-/// off (level 2). Same vector the actor/vm tests parse.
-const DEMO_PAYLOAD: [u8; 17] = [0, 1, 0, 93, 0, 0, 1, 1, 3, 0, 0, 0, 3, 0, 2, 0, 0];
+/// Demo heart payload (17 bytes): nc ON, level 1 (medium), BOTH mics
+/// online — TX1 at 100 % / TX2 at 93 % per the MOCK's demo data (README:
+/// "Mic 1 battery 100, level lit 11 and 7", index.html:220-230); the
+/// meter levels it names are NOT wire bytes — they ride
+/// [`scripted_level`]. The control bytes (nc/gain/eq/reverb/…) stay the
+/// certified session-3 frame.
+const DEMO_PAYLOAD: [u8; 17] = [1, 1, 100, 93, 0, 0, 1, 1, 3, 0, 0, 0, 3, 0, 2, 0, 0];
 
 /// How long a SET stalls in the [`DemoScenario::Pending`] scenario. The
 /// actor publishes the pending snapshot BEFORE the blocking SET (actor.rs
@@ -103,30 +108,43 @@ impl DemoDevice {
     }
 }
 
-/// Scripted Mic 2 level (dBFS): a triangle from the mock's at-rest −16 dB
-/// (7 of 20 segments lit — index.html:221/:230 demo data) up to full scale
-/// and back, 1 dB per poll tick, 32 s cycle, so the meter walks every band
-/// of the APK curve including the 18..=20 hot zone (tungsten peak).
+/// Scripted per-slot meter level (dBFS): a triangle from the mock's
+/// at-rest value (Mic 1 −12 → 11 of 20 lit, Mic 2 −16 → 7 lit —
+/// index.html:221/:230 demo data) up to full scale (0 dB — all 20
+/// segments, the tungsten zone) and back, 1 dB per 2 ticks at the demo's
+/// 50 ms window (10 dB/s — the APK's ballpark [code AudioRecordUtils.java]).
+/// Different periods per slot so the two meters move independently.
 /// FABRICATED display data under the DEMO marker rule — the wire has no
 /// level field (frontends/gpui/README).
-fn scripted_level(tick: u32) -> i16 {
-    let phase = (tick % 32) as i16;
-    -16 + if phase <= 16 { phase } else { 32 - phase }
+fn scripted_level(tick: u32, rest: i16, span: u32, period: u32) -> i16 {
+    let phase = (tick % period) as i32;
+    let half = (period / 2) as i32;
+    let delta = span as i32 * phase.min(period as i32 - phase) / half;
+    rest + delta as i16
 }
+
+/// The demo's connected-state tick window: 50 ms — the APK's own meter
+/// cadence [code `AudioRecordUtils.java` mLock.wait(50L)]. Real hardware
+/// keeps the spec's 1 s [`crate::POLL_INTERVAL`]; a demo never claims USB,
+/// so the faster heart poll (a Mutex clone, deduped by `emit`) only walks
+/// the scripted level at APK speed. Disconnected, the 1 s reconnect
+/// backoff applies unchanged.
+const DEMO_TICK: Duration = Duration::from_millis(50);
 
 impl StatusSource for DemoDevice {
     fn poll(&mut self) -> Result<HeartInfo, Error> {
         Ok(self.heart.lock().unwrap().clone())
     }
 
-    /// Out-of-band host data (wire has none): TX1 is offline in the demo
-    /// payload — no channel to measure; TX2 rides [`scripted_level`]. The
-    /// sweep steps on LEVEL READS (the actor's once-per-successful-poll
-    /// read), with the FIRST read at the mock's at-rest −16 dB.
+    /// Out-of-band host data (wire has none): both slots sweep — Mic 1
+    /// from the mock's 11-lit rest (−12 dBFS), Mic 2 from its 7-lit rest
+    /// (−16 dBFS), the first read exactly the mock's at-rest frame.
     fn tx_levels(&mut self) -> [Option<i16>; 2] {
-        let level = scripted_level(self.tick);
-        self.tick += 1;
-        [None, Some(level)]
+        let t = self.tick;
+        [
+            Some(scripted_level(t, -12, 12, 48)),
+            Some(scripted_level(t, -16, 16, 64)),
+        ]
     }
 
     fn set_noise(&mut self, on: bool) -> Result<(), Error> {
@@ -300,7 +318,8 @@ pub fn start_demo() -> DeviceHandle {
 }
 
 /// Actor over a chosen [`DemoScenario`] — same [`DeviceHandle`] API for
-/// every one of them; only the scripted factory differs.
+/// every one of them; only the scripted factory differs. The connected
+/// tick runs at [`DEMO_TICK`] so the meter sweep moves at APK speed.
 pub fn start_demo_scenario(sc: DemoScenario) -> DeviceHandle {
     let factory: OpenFn = match sc {
         DemoScenario::Connected => {
@@ -312,7 +331,7 @@ pub fn start_demo_scenario(sc: DemoScenario) -> DeviceHandle {
         }),
         DemoScenario::Busy => Box::new(|| Err(busy_error())),
     };
-    crate::start_with_factory(factory)
+    crate::start_with_factory_at(factory, DEMO_TICK)
 }
 
 #[cfg(test)]
