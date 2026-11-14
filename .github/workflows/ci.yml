@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libfontconfig1-dev \
+            libgl1-mesa-dev \
+            libudev-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config \
+            shellcheck
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+      - name: Check installer shell syntax
+        run: bash -n install.sh
+
+      - name: Lint installer shell script
+        run: shellcheck install.sh
+
+      - name: Run workspace clippy
+        run: cargo +stable clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo +stable test --workspace --all-targets
+
+      - name: Build GPUI package
+        run: cargo +stable build --locked -p holly-gpui
