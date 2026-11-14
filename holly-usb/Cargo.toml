@@ -5,12 +5,12 @@ edition.workspace = true
 description = "Hollyland 6108 USB control transport (nusb) — certified SET/GET paths"
 
 [dependencies]
-holly-proto = { path = "../holly-proto" }
-nusb = "0.2.9"
-thiserror = "2"
+holly-proto.workspace = true
+nusb.workspace = true
+thiserror.workspace = true
 # Optional: only consumers that serialize device state (holly-app's
 # Snapshot) turn this on; the transport itself stays dependency-free.
-serde = { version = "1", features = ["derive"], optional = true }
+serde = { workspace = true, optional = true }
 
 [features]
 serde = ["dep:serde"]

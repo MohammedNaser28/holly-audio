@@ -9,10 +9,10 @@ name = "holly"
 path = "src/main.rs"
 
 [dependencies]
-holly-usb = { path = "../holly-usb" }
-clap = { version = "4", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ctrlc = "3.4"
+holly-usb.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ctrlc.workspace = true

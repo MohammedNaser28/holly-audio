@@ -1,43 +1,17 @@
-[workspace] # deliberately isolated: root Cargo.toml excludes frontends/
-
 [package]
 name = "holly-gpui"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Hollyland 6108 control app — gpui frontend over holly-app (thin shell, no device knowledge)"
 
 [dependencies]
 # Device logic ONLY through holly-app: gpui never touches holly-usb
 # directly, so this tree stays movable (path dep → git dep later).
-holly-app = { path = "../../holly-app" }
+holly-app.workspace = true
 # Bridge for holly-app's blocking std Receiver into gpui's main-thread
 # executor (AsyncApp is !Send — a pump thread forwards into an unbounded
 # futures channel; gpui 0.2.2 already depends on futures 0.3, same crate
 # version, no new dependency tree; docs.rs gpui/0.2.2 dependency list).
-futures = "0.3"
-# Pinned 0.2.2 (crates.io, published 2025-10-22, mikayla-maki) — the newest
-# stable release; default features include wayland+x11 (Linux backends)
-# and the render path is blade-graphics (Vulkan) on Linux.
-gpui = "0.2.2"
+futures.workspace = true
 
-# Resolution conflict, cited from both sources (fetched 2026-11-05):
-#   docs.rs/crate/nusb/0.2.9/source/Cargo.toml  -> [target.'cfg(macos)'] core-foundation = "0.10.1"
-#   docs.rs/crate/gpui/0.2.2/source/Cargo.toml  -> core-foundation = "=0.10.0"
-# nusb has no newer release (crates.io 2026-11-05) and gpui's "=" pin
-# exists in every published gpui version, so nothing upstream can fix it.
-# Cargo resolves versions target-independently → the graph fails BEFORE any
-# macOS code compiles. Patch the SMALLEST crate: nusb 0.2.9 vendored
-# verbatim (sha256 of the crates.io tarball in patches/nusb.crate-sha256)
-# with exactly one change — the macOS-only req "0.10.1" → "0.10" — letting
-# both sides resolve to core-foundation 0.10.0. No compiled effect here:
-# that dependency only exists under cfg(target_os = "macos").
-# Long-term fix to document in docs/gui-roadmap.md: whichever side publishes
-# first removes the conflict upstream; this patch is then deleted.
-# Second patch, same mechanics: xattr 0.2.3 (sha256 in patches/xattr.crate-sha256)
-# — the `platforms!` macro in src/sys/mod.rs references libc::ENOATTR on
-# linux/android where modern libc no longer defines it (the same errno is
-# ENODATA there). Pulled in via gpui 0.2.2 -> gpui_util -> zed-async-tar.
-# Upstream abandoned (last 0.2.x release 2020).
-[patch.crates-io]
-nusb = { path = "patches/nusb" }
-xattr = { path = "patches/xattr" }
+gpui.workspace = true

@@ -195,8 +195,10 @@ features = [
 # unified graph at resolution time — gpui 0.2.2 (crates.io) pins
 # core-foundation = "=0.10.0" (both Cargo.tomls cited in the parent
 # frontends/gpui/Cargo.toml), while nusb 0.2.9 requires ^0.10.1. Widening to
-# "0.10" lets both resolve to 0.10.0. Zero compiled effect on Linux/Windows:
-# the dependency only exists under [target.'cfg(target_os="macos")'].
+# "0.10" lets both resolve to 0.10.0. The incompatibility is documented in
+# the workspace root Cargo.toml and patches/README.md. Zero compiled effect on
+# Linux/Windows: the dependency only exists under
+# [target.'cfg(target_os="macos")'].
 [target.'cfg(target_os="macos")'.dependencies.core-foundation]
 version = "0.10"
 

@@ -3,17 +3,46 @@
 #   holly-usb    — device I/O (nusb): transport + certified SET/GET ops
 #   holly-cli    — clap CLI on top of holly-usb: status / nc / watch
 #   holly-app    — UI-agnostic device actor + Snapshot/ViewModel (std threads only)
-#   frontends/*  — UI shells ONLY, each in its own workspace (see Task 8 of the
-#                  current prompt); excluded below so root `cargo test` never
-#                  compiles their (large) toolkits.
+#   frontends/*  — UI shells over holly-app; included in this workspace but not
+#                  in default-members so core checks stay fast.
 [workspace]
 resolver = "2"
-members = ["holly-proto", "holly-usb", "holly-cli", "holly-app"]
-exclude = ["frontends"]
+members = [
+    "holly-proto",
+    "holly-usb",
+    "holly-app",
+    "holly-cli",
+    "frontends/gpui",
+]
+default-members = ["holly-proto", "holly-usb", "holly-app", "holly-cli"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+
+[workspace.dependencies]
+holly-proto = { path = "holly-proto" }
+holly-usb = { path = "holly-usb" }
+holly-app = { path = "holly-app" }
+
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3.4"
+futures = "0.3"
+gpui = "0.2.2"
+nusb = "0.2.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# GPUI 0.2.2 and nusb 0.2.9 have an unavoidable macOS
+# core-foundation requirement conflict, and GPUI's transitive xattr version
+# does not compile on modern Linux libc. Keep the two existing, checksum-pinned
+# source patches at workspace scope so every crate resolves the same sources.
+[patch.crates-io]
+nusb = { path = "patches/nusb" }
+xattr = { path = "patches/xattr" }
 
 [profile.release]
 # Desktop control-plane crate: small binaries, fast startup.
