@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Holly Audio
+GenericName=Wireless Microphone Control
+Comment=Control panel for the Hollyland Lark A1 / 6108 dongle
+Exec=holly-gpui
+Icon=holly-gpui
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=hollyland;lark;microphone;mic;gain;noise;
+StartupWMClass=holly-gpui
