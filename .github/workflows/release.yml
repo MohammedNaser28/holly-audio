@@ -76,3 +76,121 @@ jobs:
             dist/*.sha256 \
             --title "Holly Audio ${VERSION}" \
             --generate-notes
+
+  # Desktop single-file artifact, built separately from the tarball release so
+  # a packaging failure there still ships the tarball (and vice versa).
+  appimage:
+    name: AppImage
+    needs: release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            file \
+            libfontconfig1-dev \
+            libgl1-mesa-dev \
+            libudev-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            librsvg2-bin \
+            pkg-config
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Build release GPUI binary
+        run: cargo +stable build --locked --release -p holly-gpui
+
+      # linuxdeploy bundles the non-system shared libraries into the AppDir and
+      # calls appimagetool on it. APPIMAGE_EXTRACT_AND_RUN avoids needing FUSE
+      # on the runner (both the tool itself and the appimagetool it downloads
+      # are mounted through it).
+      - name: Build AppImage
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          export APPIMAGE_EXTRACT_AND_RUN=1
+
+          rsvg-convert -w 256 -h 256 packaging/holly-gpui.svg -o /tmp/holly-gpui.png
+
+          curl --fail --silent --show-error --location \
+            --output /tmp/linuxdeploy-x86_64.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x /tmp/linuxdeploy-x86_64.AppImage
+
+          rm -rf AppDir dist
+          /tmp/linuxdeploy-x86_64.AppImage --appimage-extract-and-run \
+            --appdir AppDir \
+            --executable target/release/holly-gpui \
+            --desktop-file packaging/holly-gpui.desktop \
+            --icon-file /tmp/holly-gpui.png \
+            --exclude-library 'libGL*' \
+            --exclude-library 'libEGL*' \
+            --exclude-library 'libGLX*' \
+            --exclude-library 'libOpenGL*' \
+            --exclude-library 'libGLdispatch*' \
+            --exclude-library 'libdrm*' \
+            --exclude-library 'libgbm*' \
+            --exclude-library 'libglapi*' \
+            --exclude-library 'libvulkan*' \
+            --output appimage
+
+          mkdir -p dist
+          appimage="dist/holly-audio-${VERSION}-x86_64.AppImage"
+          mv ./*.AppImage "${appimage}"
+          chmod 0755 "${appimage}"
+          sha256sum "${appimage}" > "${appimage}.sha256"
+
+      # Cheap smoke test: the squashfs must contain the launcher wrapper and the
+      # binary, so a silently broken bundle fails here instead of at download.
+      - name: Verify AppImage payload
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          appimage="dist/holly-audio-${VERSION}-x86_64.AppImage"
+          rm -rf squashfs-root
+          "${appimage}" --appimage-extract > /dev/null
+          test -x squashfs-root/AppRun
+          test -x squashfs-root/usr/bin/holly-gpui
+          test -e squashfs-root/holly-gpui.desktop
+          test -e squashfs-root/usr/share/applications/holly-gpui.desktop
+          file squashfs-root/usr/bin/holly-gpui | grep --quiet 'ELF 64-bit LSB pie executable, x86-64'
+
+      - name: Upload AppImage to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "${VERSION}" \
+            "dist/holly-audio-${VERSION}-x86_64.AppImage" \
+            "dist/holly-audio-${VERSION}-x86_64.AppImage.sha256" \
+            --clobber
