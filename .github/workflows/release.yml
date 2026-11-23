@@ -22,7 +22,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes \
+          sudo apt-get install --yes --no-install-recommends \
             libfontconfig1-dev \
             libgl1-mesa-dev \
             libudev-dev \
@@ -104,7 +104,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes \
+          sudo apt-get install --yes --no-install-recommends \
             file \
             libfontconfig1-dev \
             libgl1-mesa-dev \

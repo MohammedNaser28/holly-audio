@@ -19,7 +19,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes \
+          sudo apt-get install --yes --no-install-recommends \
             libfontconfig1-dev \
             libgl1-mesa-dev \
             libudev-dev \
@@ -33,7 +33,7 @@ jobs:
             shellcheck
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component clippy rustfmt
+        run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
 
       - name: Cache Cargo
         uses: actions/cache@v4
