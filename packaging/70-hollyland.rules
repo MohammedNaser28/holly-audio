@@ -1,0 +1,30 @@
+# Hollyland wireless-mic USB-C receiver dongle (3547:0407, model 6108).
+# Evidence: inputs/lsusb-v.txt [descriptor], docs/device.md.
+#
+# Grants the active seat user access to the usbfs device node (logind ACL)
+# so holly-usb (nusb) can claim IF0 (the HID control interface) without
+# sudo. IF1/IF2 (UAC audio) share the same node — but claiming is
+# per-interface, so this rule does not enable claiming them.
+#
+# FILE NAME MUST BE <= 73: the uaccess BUILTIN is invoked by systemd's
+# 73-seat-late.rules — verbatim from systemd main (2026-11-05):
+#     TAG=="uaccess|xaccess-*", ENV{MAJOR}!="", RUN{builtin}+="uaccess"
+# Rules run in lexical order, so a TAG+="uaccess" set in a 99- file is
+# assigned AFTER that runner has already skipped TAG=="uaccess" and gone
+# to its end label. Observed live 2026-11-05 (then-named 99-hollyland.rules):
+# TAGS in the udev database did gain ':uaccess:seat:' and MODE applied, but
+# the node never received the user's ACL — while the same builtin worked
+# for /dev/snd nodes (their uaccess tag comes from 70-uaccess.rules, a
+# runner-visible order). File renamed to 70- to make the tag runner-visible;
+# treat the live effect as CONFIRMED-in-source / NOT-YET-confirmed-on-device
+# until the replug getfacl check passes.
+#
+# Install (this also removes the earlier 99- name!):
+#   sudo rm -f /etc/udev/rules.d/99-hollyland.rules
+#   sudo cp packaging/70-hollyland.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger --action=add /sys/bus/usb/devices/<sysfs-node>
+#       (or unplug/replug — the trigger just avoids the replug)
+# Verify: getfacl /dev/bus/usb/<bus>/<dev>  → expect user:<you>:rw- + mask
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="3547", ATTR{idProduct}=="0407", TAG+="uaccess", MODE="0660"
